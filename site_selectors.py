@@ -90,14 +90,25 @@ HOLD_STEPS: list[tuple[str, str]] = [
     # CONFIRMED: the card is role="link" — clicking it opens
     #   /app#/jobDetail?jobId=JOB-US-0000018024
     ("open job", ":scope"),
-    # CONFIRMED: the detail page's primary action.
+    # CONFIRMED: the detail page's primary action. Opens the schedule flyout
+    # ([data-test-id='scheduleSelectorPanelFlyout']).
     ("select schedule", "[data-test-id='jobDetailSelectScheduleButton']"),
-    # NOT captured. Going past "Select schedule" means picking a real shift and
-    # starting a REAL application on a real account, so it was left alone.
-    # Fill these in against a job you actually want, with dry_run still true.
-    ("pick a shift", TODO),      # a row/card in the schedule list
+    # CONFIRMED live 2026-08-17: each schedule card in the flyout carries its
+    # own "Apply" button. Despite the name it is a <button>, not a link.
+    #
+    # ⚠️ This click OPENS A NEW TAB. hold_shift() follows it — see
+    # _wait_for_new_page(). Anything after this step runs in that tab.
+    ("pick a shift", "[data-test-id='ScheduleCardSelectScheduleLink']"),
+    # NOT captured: the new tab lands on auth.hiring.amazon.com/#/login unless
+    # the profile is logged into the hiring portal, and the steps past it can
+    # only be read from an account that can actually apply to the job. Capture
+    # these against a real CA posting once logged in.
     ("create application", TODO),
 ]
+
+# The schedule flyout, so "pick a shift" can be scoped to it rather than
+# matching a stray Apply button elsewhere on the page.
+SCHEDULE_FLYOUT = "[data-test-id='scheduleSelectorPanelFlyout']"
 
 # Marks a job detail page. Used to tell "we are on the results list" from
 # "we already navigated straight to the job", which matters because api mode
@@ -178,6 +189,41 @@ TOKEN_EXPIRED_MARKERS = (
 # counts. A visible CAPTCHA needs a human, and must never be mistaken for
 # "no shifts today".
 CAPTCHA_SELECTOR = "[data-test-id='captchaModal']"
+
+
+# The apply flow is gated by a separate login from ordinary browsing: job
+# search is public, so detection works perfectly while the account is signed
+# out, and the first sign of trouble is a login tab appearing mid-hold.
+# Confirmed live: clicking Apply opened auth.hiring.amazon.com/#/login.
+LOGIN_HOSTS = ("auth.hiring.amazon.", "/ap/signin", "/#/login")
+
+
+def is_login_page(page: Any) -> bool:
+    url = (page.url or "").lower()
+    return any(marker in url for marker in LOGIN_HOSTS)
+
+
+def _wait_for_new_page(context: Any, known: set, timeout_ms: int = 8000) -> Any | None:
+    """Return a tab that appeared since `known` was captured, or None.
+
+    "Apply" opens the application in a new tab. Without following it the hold
+    would keep clicking at the old page and time out with a misleading error
+    about a missing button.
+    """
+    if context is None:
+        return None
+    waited = 0
+    while waited < timeout_ms:
+        for candidate in context.pages:
+            if candidate not in known:
+                try:
+                    candidate.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+                except Exception as exc:  # noqa: BLE001 - a slow tab is still a tab
+                    log.debug("new tab did not settle: %s", exc)
+                return candidate
+        context.pages[0].wait_for_timeout(250)
+        waited += 250
+    return None
 
 
 def page_state(page: Any) -> tuple[str, str]:
@@ -476,7 +522,19 @@ def hold_shift(
         # whatever page/modal the flow navigated to.
         scope = card
 
+    # "pick a shift" must be scoped to the schedule flyout: an unscoped Apply
+    # selector could match a button elsewhere on a busy page.
+    steps = [
+        (label, f"{SCHEDULE_FLYOUT} {selector}")
+        if label == "pick a shift" and not selector.startswith(SCHEDULE_FLYOUT)
+        else (label, selector)
+        for label, selector in steps
+    ]
+
+    context = getattr(page, "context", None)
+
     for step_number, (label, selector) in enumerate(steps):
+        known_pages = set(context.pages) if context else set()
         try:
             target = scope.locator(selector).first
             target.wait_for(state="visible", timeout=timeout_ms)
@@ -484,6 +542,24 @@ def hold_shift(
             log.info("hold step %d/%d ok: %s", step_number + 1, len(steps), label)
         except Exception as exc:  # noqa: BLE001 - report which step died
             return False, f"hold failed at step {step_number + 1} ({label}): {exc}"
+
+        # "Apply" opens the application in a new tab. Follow it, or every
+        # later step would look for buttons on the page we just left.
+        popup = _wait_for_new_page(context, known_pages, timeout_ms=min(timeout_ms, 8000))
+        if popup is not None:
+            log.info("step %r opened a new tab: %s", label, popup.url[:80])
+            page = popup
+
+        # A login tab here means the hiring portal is signed out. Job search is
+        # public, so detection kept working and nothing warned us until now.
+        # Say so plainly instead of timing out on a button that will never come.
+        if is_login_page(page):
+            return False, (
+                f"the apply flow needs a login (opened {page.url[:70]}). "
+                "Detection works signed out, holding does not — "
+                "run `python save_session.py` and log in to the hiring portal."
+            )
+
         scope = page  # subsequent steps are page-wide
 
     if screenshot_path:

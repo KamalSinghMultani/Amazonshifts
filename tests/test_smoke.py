@@ -615,8 +615,10 @@ def test_remaining_placeholders_are_reported():
     capturing them would mean submitting a real application."""
     missing = site_selectors.unconfigured()
     assert "FINAL_SUBMIT" in missing
-    assert any("pick a shift" in m for m in missing)
     assert any("create application" in m for m in missing)
+    # "pick a shift" IS captured: the Apply button on a schedule card,
+    # confirmed live. What follows it sits behind the hiring-portal login.
+    assert not any("pick a shift" in m for m in missing)
     # ...but nothing needed for *detection* is still a placeholder.
     assert not any(m.startswith("card_") or m == "job_card" for m in missing)
     assert not site_selectors.selectors_ready()
@@ -1380,3 +1382,145 @@ def test_the_watcher_holds_the_top_ranked_shift_of_a_batch(tmp_path):
     w.poll_once()
     assert len(held) == 1
     assert held[0].location.startswith("Brampton")
+
+
+# ── the apply flow opens a new tab, and may hit a login wall ────────────────
+class FakeLocatorTarget:
+    def __init__(self, page, on_click=None):
+        self.page = page
+        self.on_click = on_click
+
+    @property
+    def first(self):
+        return self
+
+    def wait_for(self, **_kwargs):
+        pass
+
+    def click(self, **_kwargs):
+        if self.on_click:
+            self.on_click()
+
+
+class FakeTabContext:
+    def __init__(self):
+        self.pages = []
+
+
+class FakeFlowPage:
+    """A page that can spawn a popup into its context when clicked."""
+
+    def __init__(self, context, url="https://hiring.amazon.com/app#/jobDetail?jobId=J1",
+                 spawns=None):
+        self.context = context
+        self.url = url
+        self.spawns = spawns
+        context.pages.append(self)
+        self.clicks = []
+
+    def locator(self, selector):
+        self.clicks.append(selector)
+
+        def on_click():
+            if self.spawns is not None:
+                self.spawns()
+                self.spawns = None
+
+        return FakeLocatorTarget(self, on_click)
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+    def wait_for_load_state(self, *_a, **_kw):
+        pass
+
+    def screenshot(self, **_kwargs):
+        pass
+
+    def keyboard_press(self, _key):
+        pass
+
+
+def test_a_login_tab_is_reported_as_a_login_problem(monkeypatch):
+    """Confirmed live: clicking Apply opened auth.hiring.amazon.com/#/login.
+    Job search is public, so detection keeps working while signed out and
+    nothing warns you until a hold is attempted."""
+    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", "#submit")
+    # on_detail_page drops the leading "open job" step, so include it.
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
+        ("open job", ":scope"),
+        ("select schedule", "#sched"),
+    ])
+
+    ctx = FakeTabContext()
+    page = FakeFlowPage(ctx)
+    page.spawns = lambda: FakeFlowPage(ctx, url="https://auth.hiring.amazon.com/#/login")
+    monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
+    monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
+
+    ok, message = site_selectors.hold_shift(page, Shift(title="x"))
+    assert not ok
+    assert "login" in message.lower()
+    assert "save_session.py" in message
+
+
+def test_the_flow_follows_the_tab_that_apply_opens(monkeypatch):
+    """Without following it, later steps would hunt for buttons on the page we
+    already left and fail with a misleading 'button not found'."""
+    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", "#submit")
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
+        ("open job", ":scope"),
+        ("select schedule", "#sched"),
+        ("create application", "#create"),
+    ])
+    monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
+    monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
+
+    ctx = FakeTabContext()
+    first = FakeFlowPage(ctx)
+    application = []
+
+    def spawn():
+        application.append(
+            FakeFlowPage(ctx, url="https://hiring.amazon.com/application/#/consent")
+        )
+
+    first.spawns = spawn
+
+    ok, message = site_selectors.hold_shift(first, Shift(title="x"))
+    assert ok, message
+    # The second step ran on the NEW tab, not the original page.
+    assert application and "#create" in application[0].clicks
+    assert "#create" not in first.clicks
+
+
+def test_is_login_page_recognises_the_portal_and_ignores_job_pages():
+    class P:
+        def __init__(self, url):
+            self.url = url
+
+    assert site_selectors.is_login_page(P("https://auth.hiring.amazon.com/#/login"))
+    assert site_selectors.is_login_page(P("https://www.amazon.com/ap/signin?x=1"))
+    assert not site_selectors.is_login_page(
+        P("https://hiring.amazon.ca/app#/jobDetail?jobId=JOB-CA-1")
+    )
+
+
+def test_pick_a_shift_is_scoped_to_the_schedule_flyout(monkeypatch):
+    """An unscoped Apply selector could match a button elsewhere on the page."""
+    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", "#submit")
+    # The real steps, minus the one still behind the login wall.
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
+        ("open job", ":scope"),
+        ("select schedule", "[data-test-id='jobDetailSelectScheduleButton']"),
+        ("pick a shift", "[data-test-id='ScheduleCardSelectScheduleLink']"),
+    ])
+    monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
+    monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
+
+    ctx = FakeTabContext()
+    page = FakeFlowPage(ctx)
+    site_selectors.hold_shift(page, Shift(title="x"))
+    picked = [c for c in page.clicks if "ScheduleCardSelectScheduleLink" in c]
+    assert picked, page.clicks
+    assert picked[0].startswith(site_selectors.SCHEDULE_FLYOUT)
