@@ -13,6 +13,7 @@ it is logged out.
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -23,14 +24,25 @@ import browser_launch
 from config import load_config
 
 
-def main() -> int:
-    cfg = load_config()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="One-time manual login")
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument(
+        "--url",
+        default=None,
+        help="log in somewhere other than site.job_search_url — e.g. the US "
+             "site, which shares the same auth service",
+    )
+    args = parser.parse_args(argv)
+
+    cfg = load_config(args.config)
     site = cfg["site"]
     browser_cfg = cfg["browser"]
     out_path = Path(browser_cfg["storage_state"])
+    target = args.url or site["job_search_url"]
 
     print("Opening a browser window.")
-    print("Log in to hiring.amazon.ca by hand — password and OTP included.")
+    print(f"Log in at {target} by hand — password and OTP included.")
     print("This script does not read or store your credentials.\n")
     print(f"Browser: {browser_launch.describe(browser_cfg)}")
     if browser_cfg.get("channel"):
@@ -56,8 +68,18 @@ def main() -> int:
             return 1
 
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(site["job_search_url"], timeout=browser_cfg["nav_timeout_ms"])
+        page.goto(target, timeout=browser_cfg["nav_timeout_ms"])
 
+        # Browsing and applying are separate sessions on this site: job search
+        # is public, so a signed-out browser looks perfectly healthy right up
+        # until a hold fails. Checking the apply flow here is the only way to
+        # know the login that matters actually took.
+        print(
+            "\nBEFORE pressing Enter: open any job, click 'Select schedule',\n"
+            "then 'Apply' on a schedule. If you see the application rather than\n"
+            "a login page, the hiring-portal session is real — that is the part\n"
+            "that decides whether a slot can be held."
+        )
         try:
             input("\nPress Enter here once you are fully logged in… ")
         except (EOFError, KeyboardInterrupt):

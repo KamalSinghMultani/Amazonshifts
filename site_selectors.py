@@ -99,12 +99,21 @@ HOLD_STEPS: list[tuple[str, str]] = [
     # ⚠️ This click OPENS A NEW TAB. hold_shift() follows it — see
     # _wait_for_new_page(). Anything after this step runs in that tab.
     ("pick a shift", "[data-test-id='ScheduleCardSelectScheduleLink']"),
-    # NOT captured: the new tab lands on auth.hiring.amazon.com/#/login unless
-    # the profile is logged into the hiring portal, and the steps past it can
-    # only be read from an account that can actually apply to the job. Capture
-    # these against a real CA posting once logged in.
-    ("create application", TODO),
 ]
+
+# That is the whole click path, and it is deliberately short.
+#
+# CONFIRMED live 2026-08-17, signed in: clicking Apply opens
+#   /application/us/?country=us&jobId=JOB-…&locale=en-US&scheduleId=SCH-…
+# titled "Your journey to becoming an Amazon Associate starts here."
+#
+# The scheduleId in that URL is the point of the whole exercise: the specific
+# shift is now attached to an open application, which is what "holding" means
+# here. What follows is a multi-page application — consent, personal details,
+# background-check authorisation — that a human should be filling in, and that
+# no sane bot should be clicking through on someone's behalf.
+#
+# So the watcher stops here and hands over.
 
 # The schedule flyout, so "pick a shift" can be scoped to it rather than
 # matching a stray Apply button elsewhere on the page.
@@ -121,10 +130,19 @@ DETAIL_PAGE_MARKER = "[data-test-id='jobDetailSelectScheduleButton']"
 #   https://hiring.amazon.ca/app#/jobDetail?jobId={id}
 # and the watcher can jump straight to the job instead of hunting for a card.
 
-# The final button. This is NEVER clicked while hold.stop_before_submit is
-# true — we only confirm it is on screen, screenshot it, and hand over to the
-# human. Treat this constant as load-bearing safety, not decoration.
-FINAL_SUBMIT: str = TODO  # e.g. "button:has-text('Submit application')"
+# The first button of the application proper — "Next" on the pre-consent page.
+# NEVER clicked while hold.stop_before_submit is true: we confirm it is on
+# screen (which proves the application really opened against our scheduleId),
+# screenshot it, and hand over. Treat this as load-bearing safety.
+#
+# It has no data-test-id, so it is matched by text inside the application
+# layout. Scoped to [data-test-id='layout'] to avoid the nav and footer.
+FINAL_SUBMIT: str = "[data-test-id='layout'] button:has-text('Next')"
+
+# Marks the application page, so a hold can prove it landed where it meant to
+# rather than reporting success from whatever page it happens to be on.
+APPLICATION_PAGE_MARKER = "[data-test-id='text-pre-consent-page-title']"
+APPLICATION_URL_MARKER = "/application/"
 
 
 def unconfigured_detection() -> list[str]:
@@ -562,6 +580,16 @@ def hold_shift(
 
         scope = page  # subsequent steps are page-wide
 
+    # Wait for the application to actually render BEFORE capturing it. The tab
+    # opens blank and the app mounts a second or two later, so screenshotting
+    # immediately produced a plain white image — a Telegram alert carrying a
+    # blank photo is worse than no photo, because it looks like a failure.
+    ready_error = None
+    try:
+        page.locator(FINAL_SUBMIT).first.wait_for(state="visible", timeout=timeout_ms)
+    except Exception as exc:  # noqa: BLE001 - the URL check below still applies
+        ready_error = exc
+
     if screenshot_path:
         try:
             page.screenshot(path=screenshot_path, full_page=False)
@@ -569,11 +597,22 @@ def hold_shift(
             log.warning("screenshot failed: %s", exc)
 
     if stop_before_submit:
-        try:
-            page.locator(FINAL_SUBMIT).first.wait_for(state="visible", timeout=timeout_ms)
-            return True, "slot held — final submit is on screen, waiting for you"
-        except Exception as exc:  # noqa: BLE001
-            return True, f"steps completed but the submit button was not visible: {exc}"
+        landed = APPLICATION_URL_MARKER in (page.url or "")
+        if ready_error is not None:
+            exc = ready_error
+            if landed:
+                # The application is open, which is the part that matters, even
+                # if the button moved. Say exactly that rather than implying a
+                # failure or a clean success.
+                return True, (
+                    f"application open at {page.url} — could not confirm the "
+                    f"Next button ({exc})"
+                )
+            return False, (
+                f"clicked through but never reached the application page "
+                f"(still at {page.url}): {exc}"
+            )
+        return True, f"slot held — finish the application at {page.url}"
 
     try:
         page.locator(FINAL_SUBMIT).first.click(timeout=timeout_ms)

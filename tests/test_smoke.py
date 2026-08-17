@@ -610,18 +610,35 @@ def test_module_is_not_named_selectors():
     assert hasattr(stdlib_selectors, "DefaultSelector")
 
 
-def test_remaining_placeholders_are_reported():
-    """Detection selectors are captured; the final apply steps are not, because
-    capturing them would mean submitting a real application."""
-    missing = site_selectors.unconfigured()
-    assert "FINAL_SUBMIT" in missing
-    assert any("create application" in m for m in missing)
-    # "pick a shift" IS captured: the Apply button on a schedule card,
-    # confirmed live. What follows it sits behind the hiring-portal login.
-    assert not any("pick a shift" in m for m in missing)
-    # ...but nothing needed for *detection* is still a placeholder.
-    assert not any(m.startswith("card_") or m == "job_card" for m in missing)
+def test_every_selector_is_captured_from_the_live_site():
+    """All of them are confirmed against hiring.amazon.* now, including the
+    apply path: card -> Select schedule -> Apply -> the application page."""
+    assert site_selectors.unconfigured() == []
+    assert site_selectors.selectors_ready()
+    assert site_selectors.detection_ready()
+
+    labels = [label for label, _ in site_selectors.HOLD_STEPS]
+    assert labels == ["open job", "select schedule", "pick a shift"]
+    assert "ScheduleCardSelectScheduleLink" in dict(site_selectors.HOLD_STEPS)["pick a shift"]
+
+
+def test_the_flow_stops_at_the_application_rather_than_filling_it_in():
+    """What follows the application page is consent, personal details and
+    background-check authorisation. A human fills those in."""
+    assert "Next" in site_selectors.FINAL_SUBMIT
+    assert site_selectors.APPLICATION_URL_MARKER == "/application/"
+    labels = [label for label, _ in site_selectors.HOLD_STEPS]
+    assert not any("consent" in label or "submit" in label for label in labels)
+
+
+def test_detection_stays_ready_when_a_hold_selector_rots(monkeypatch):
+    """Amazon will change these eventually. When a hold selector goes stale,
+    detection and alerting must keep working — losing the clicks is bad,
+    losing the alerts too would be worse."""
+    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", site_selectors.TODO)
+    assert site_selectors.detection_ready()
     assert not site_selectors.selectors_ready()
+    assert "FINAL_SUBMIT" in site_selectors.unconfigured_hold()
 
 
 def test_detection_can_be_ready_while_holding_is_not():
@@ -630,8 +647,6 @@ def test_detection_can_be_ready_while_holding_is_not():
     captured by submitting a real application. That blocked the dry-run period
     you are supposed to do *first*."""
     assert site_selectors.detection_ready()
-    assert not site_selectors.selectors_ready()
-    assert site_selectors.unconfigured_hold()
     assert site_selectors.unconfigured() == (
         site_selectors.unconfigured_detection() + site_selectors.unconfigured_hold()
     )
@@ -770,7 +785,10 @@ def test_extract_shifts_refuses_to_run_on_placeholder_selectors(monkeypatch):
         site_selectors.extract_shifts(FakePage([]))
 
 
-def test_hold_shift_refuses_when_selectors_are_placeholders():
+def test_hold_shift_refuses_when_selectors_are_placeholders(monkeypatch):
+    """Load-bearing: a stale selector must stop the click path, not have it
+    guess at buttons on a real application form."""
+    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", site_selectors.TODO)
     ok, message = site_selectors.hold_shift(FakePage([]), Shift(title="x"))
     assert not ok
     assert "not configured" in message
@@ -1524,3 +1542,45 @@ def test_pick_a_shift_is_scoped_to_the_schedule_flyout(monkeypatch):
     picked = [c for c in page.clicks if "ScheduleCardSelectScheduleLink" in c]
     assert picked, page.clicks
     assert picked[0].startswith(site_selectors.SCHEDULE_FLYOUT)
+
+
+def test_the_screenshot_waits_for_the_application_to_render(monkeypatch, tmp_path):
+    """Regression: the tab Apply opens is blank for a second or two, so
+    capturing immediately produced a plain white image. A Telegram alert
+    carrying a blank photo reads as a failure even when the hold worked."""
+    events = []
+
+    class Target:
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, **_kwargs):
+            events.append("waited-for-application")
+
+        def click(self, **_kwargs):
+            pass
+
+    class Page:
+        url = "https://hiring.amazon.com/application/us/?scheduleId=SCH-1"
+        context = None
+
+        def locator(self, _selector):
+            return Target()
+
+        def screenshot(self, **_kwargs):
+            events.append("screenshot")
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [("open job", ":scope")])
+    monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
+    monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
+
+    ok, message = site_selectors.hold_shift(
+        Page(), Shift(title="x"), screenshot_path=str(tmp_path / "shot.png")
+    )
+    assert ok, message
+    assert events == ["waited-for-application", "screenshot"], events
+    assert "scheduleId=SCH-1" in message, "the alert must carry the link to finish"
