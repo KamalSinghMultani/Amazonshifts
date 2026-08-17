@@ -407,6 +407,45 @@ keeping:
 
 ---
 
+## Keeping it running
+
+The watcher is plain Python — no AI, no API keys beyond Telegram, nothing that
+costs per poll. But it is an ordinary process: close the terminal and it stops.
+Postings last about a minute, so a watcher that is not running catches nothing.
+
+**Windows, auto-start at logon:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install_autostart.ps1
+Start-ScheduledTask -TaskName AmazonShiftWatcher
+```
+
+That registers a Scheduled Task pointing at `run_watcher.bat`, which restarts
+the watcher if it ever exits (30s pause between attempts — a tight restart loop
+makes a block worse, not better). Remove it with `-Remove`.
+
+A Scheduled Task rather than a Windows service on purpose: the watcher drives a
+real Chrome profile belonging to your user account. A service running as SYSTEM
+would have a different profile and would not be logged in to Amazon.
+
+**Sleep is the thing that will actually catch you out.** A sleeping laptop
+detects nothing, and Windows sleeps by default even with a program running:
+
+```
+powercfg /change standby-timeout-ac 0
+powercfg /change hibernate-timeout-ac 0
+```
+
+**Elsewhere:** any always-on machine works — an old laptop, a Raspberry Pi
+(4GB+; use the system Chromium via `browser.executable_path` since Playwright
+ships no ARM build), or a VPS. One caveat for cloud: datacenter IPs are
+challenged harder by CloudFront than a residential connection, so a home box is
+genuinely the better host here.
+
+Wherever it runs, the login is per-machine — `save_session.py` there once.
+
+---
+
 ## Files
 
 | File | Purpose |
