@@ -196,6 +196,13 @@ Ctrl-C shuts down cleanly, saving state first. Logs go to `logs/watcher.log`
   once per poll. Entries expire after `state.ttl_hours` so a genuinely re-posted
   shift can alert again. A shift is marked seen *before* the hold is attempted —
   better to miss a retry than to spam the same alert every 20 seconds.
+- **Batches are capped.** One poll can match a hundred jobs. Matches are sorted
+  by pay, the top `notifications.max_alerts_per_poll` are sent individually, and
+  the rest become one summary line — Telegram rate-limits a single chat, so a
+  hundred pings would arrive slowly and bury the one that mattered. Every match
+  is still logged and deduped. When live, only `hold.max_per_poll` shifts are
+  actually held (default **1**): you need to win one, and each extra click is
+  another chance to be flagged.
 - **Circuit breaker**: after `max_consecutive_errors` failures in a row it sleeps
   for `cooldown_seconds` and tells you on Telegram.
 - **Notifications never take down the watcher.** Every send is wrapped; a dead

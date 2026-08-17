@@ -277,6 +277,7 @@ class Watcher:
             self.polls, len(shifts), fetch_ms, " [hot]" if hot else "",
         )
 
+        new_matches = []
         for shift in shifts:
             matched, reason = self.matcher.matches(shift)
             if not matched:
@@ -286,18 +287,33 @@ class Watcher:
                 log.debug("already alerted: %s", shift.summary())
                 continue
 
-            # Mark + persist BEFORE acting. If the hold crashes we would rather
-            # miss a retry than spam the same alert on every poll.
+            # Mark BEFORE acting. If the hold crashes we would rather miss a
+            # retry than spam the same alert on every poll.
             self.state.mark_seen(shift.stable_id, shift.summary())
-            self.state.save()
+            new_matches.append(shift)
+
+        if not new_matches:
+            return
+
+        self.state.save()
+        # A match means a batch is probably landing — speed up regardless of
+        # what happens with the alerts or the hold below.
+        self.go_hot()
+
+        # Best first. A whole batch can land in one poll, and both caps below
+        # keep only the front of this list, so the order decides which shift
+        # you hear about and which one gets held. Pay is the honest proxy for
+        # "the one you want"; unknown pay sorts last rather than first.
+        new_matches.sort(key=lambda s: (s.pay_rate is None, -(s.pay_rate or 0)))
+
+        alert_cap = self.cfg["notifications"].get("max_alerts_per_poll") or len(new_matches)
+        for index, shift in enumerate(new_matches):
             self.state.log_detection(shift.stable_id, shift.summary())
             self.alerts += 1
-
-            # A match means a batch is probably landing — speed up regardless
-            # of what happens with the alert or the hold below.
-            self.go_hot()
-
             log.info("MATCH: %s", shift.summary())
+
+            if index >= alert_cap:
+                continue
             # Alert first, always. In api mode nothing has touched the browser
             # yet, so this fires within milliseconds of the shift appearing.
             self.notifier.notify_shift(shift, dry_run=self.dry_run)
@@ -306,14 +322,34 @@ class Watcher:
                 (time.perf_counter() - started) * 1000,
             )
 
-            if self.dry_run:
-                log.info("dry run — not clicking")
-                continue
-            if not self.cfg["hold"]["enabled"]:
-                log.info("hold disabled — alert only")
-                continue
+        # One digest instead of a hundred pings. Telegram rate-limits a single
+        # chat, so an unfiltered batch would arrive slowly, out of order, and
+        # bury the one shift that mattered.
+        held_back = len(new_matches) - alert_cap
+        if held_back > 0:
+            log.info("%d further match(es) summarised rather than sent individually", held_back)
+            self.notifier.send_text(
+                f"➕ <b>{held_back} more match(es)</b> this poll — "
+                f"see the log, or tighten <code>filters</code> in config.yaml."
+            )
 
+        if self.dry_run:
+            log.info("dry run — not clicking")
+            return
+        if not self.cfg["hold"]["enabled"]:
+            log.info("hold disabled — alert only")
+            return
+
+        # You need to win ONE shift. Trying to hold a whole batch would race
+        # itself, and every extra click is another chance to be flagged.
+        hold_cap = max(1, int(self.cfg["hold"].get("max_per_poll", 1)))
+        for shift in new_matches[:hold_cap]:
             self._hold(shift)
+        if len(new_matches) > hold_cap:
+            log.info(
+                "%d other match(es) alerted but not held (hold.max_per_poll=%d)",
+                len(new_matches) - hold_cap, hold_cap,
+            )
 
     def _fetch_shifts(self):
         if self.mode == "api":

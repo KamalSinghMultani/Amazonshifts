@@ -75,8 +75,13 @@ DEFAULTS: dict[str, Any] = {
         "telegram": {"enabled": True, "screenshot": True},
         "notify_on_start": True,
         "notify_on_error": True,
+        # A whole batch can land in one poll. Telegram rate-limits a single
+        # chat, so past this many the rest become one summary line.
+        "max_alerts_per_poll": 8,
     },
-    "hold": {"enabled": True, "stop_before_submit": True},
+    # max_per_poll: you only need to win one shift; holding a whole batch
+    # would race itself and multiply the clicks.
+    "hold": {"enabled": True, "stop_before_submit": True, "max_per_poll": 1},
     "state": {
         "path": "state/seen_shifts.json",
         "ttl_hours": 72,

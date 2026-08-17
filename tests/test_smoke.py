@@ -1142,3 +1142,121 @@ def test_a_broken_request_event_cannot_disturb_polling():
 
     page.handlers["request"](Exploding())  # must not raise
     assert source.current() is None
+
+
+# ── batch safety: a hundred jobs can land in one poll ───────────────────────
+class RecordingNotifier:
+    def __init__(self):
+        self.shifts, self.texts = [], []
+
+    def notify_shift(self, shift, dry_run=True):
+        self.shifts.append(shift)
+        return True
+
+    def send_text(self, text):
+        self.texts.append(text)
+        return True
+
+    def notify_error(self, message):
+        self.texts.append(message)
+        return True
+
+    def notify_held(self, shift, stopped_before_submit=True):
+        return True
+
+    def send_photo(self, path, caption=""):
+        return True
+
+
+def _batch_watcher(tmp_path, shifts, **overrides):
+    import watcher as watcher_mod
+
+    cfg = config_mod._deep_merge(
+        config_mod.DEFAULTS,
+        {
+            "state": {
+                "path": str(tmp_path / "seen.json"),
+                "detections_path": str(tmp_path / "d.jsonl"),
+            },
+            **overrides,
+        },
+    )
+    config_mod.validate_config(cfg)
+    w = watcher_mod.Watcher(cfg)
+    w.notifier = RecordingNotifier()
+    w._fetch_shifts = lambda: shifts
+    return w
+
+
+def _many(count):
+    return [
+        Shift(id=f"JOB-{i}", title=f"Warehouse {i}", location="Brampton", pay_rate=15 + i)
+        for i in range(count)
+    ]
+
+
+def test_a_big_batch_is_capped_to_one_digest(tmp_path):
+    """Telegram rate-limits a single chat. 99 separate pings would arrive
+    slowly, out of order, and bury the shift that mattered."""
+    w = _batch_watcher(tmp_path, _many(30), notifications={"max_alerts_per_poll": 8})
+    w.poll_once()
+
+    assert len(w.notifier.shifts) == 8
+    assert len(w.notifier.texts) == 1
+    assert "22 more" in w.notifier.texts[0]
+    assert w.alerts == 30, "every match still counts and is logged"
+
+
+def test_the_best_paying_matches_are_the_ones_you_hear_about(tmp_path):
+    w = _batch_watcher(tmp_path, _many(20), notifications={"max_alerts_per_poll": 3})
+    w.poll_once()
+    alerted = [s.pay_rate for s in w.notifier.shifts]
+    assert alerted == sorted(alerted, reverse=True)
+    assert alerted[0] == 34  # the top payer of the batch, not the first seen
+
+
+def test_unknown_pay_sorts_last_rather_than_first(tmp_path):
+    shifts = [Shift(id="A", title="No pay listed"), Shift(id="B", title="Pays", pay_rate=19)]
+    w = _batch_watcher(tmp_path, shifts, notifications={"max_alerts_per_poll": 1})
+    w.poll_once()
+    assert w.notifier.shifts[0].id == "B"
+
+
+def test_only_one_shift_is_held_per_poll(tmp_path):
+    """You need to win ONE shift. Holding a whole batch would race itself and
+    multiply the clicks that get an account flagged."""
+    held = []
+    w = _batch_watcher(tmp_path, _many(10), dry_run=False)
+    w._hold = held.append
+    w.poll_once()
+    assert len(held) == 1
+    assert held[0].pay_rate == 24  # the best of the batch
+
+
+def test_hold_cap_is_configurable(tmp_path):
+    held = []
+    w = _batch_watcher(tmp_path, _many(10), dry_run=False, hold={"max_per_poll": 3})
+    w._hold = held.append
+    w.poll_once()
+    assert len(held) == 3
+
+
+def test_a_dry_run_batch_never_holds_anything(tmp_path):
+    held = []
+    w = _batch_watcher(tmp_path, _many(5))
+    w._hold = held.append
+    w.poll_once()
+    assert held == []
+
+
+def test_every_match_is_deduped_even_the_ones_only_summarised(tmp_path):
+    """The summarised tail is still marked seen — otherwise it would re-alert
+    on every single poll forever."""
+    shifts = _many(20)
+    w = _batch_watcher(tmp_path, shifts, notifications={"max_alerts_per_poll": 5})
+    w.poll_once()
+    w.notifier.shifts.clear()
+    w.notifier.texts.clear()
+    w.poll_once()
+    assert w.notifier.shifts == []
+    assert w.notifier.texts == []

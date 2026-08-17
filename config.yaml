@@ -227,10 +227,22 @@ notifications:
   notify_on_start: true
   notify_on_error: true
 
+  # An unfiltered poll can match a hundred jobs at once. Telegram rate-limits
+  # a single chat, so a hundred pings would arrive slowly, out of order, and
+  # bury the one that mattered. Past this many, the rest become one summary
+  # line. Matches are sorted by pay, so the ones you hear about are the best
+  # paying ones. Set to null to send every match.
+  max_alerts_per_poll: 8
+
 hold:
   # Click through to hold the slot once a match is found.
   # Ignored entirely when dry_run is true.
   enabled: true
+  # You only need to win ONE shift. If a batch lands in a single poll, hold
+  # this many (the best paying first) and merely alert on the rest — holding
+  # a whole batch would race itself and multiply the clicks.
+  max_per_poll: 1
+
   # NEVER click the final submit button. You finish the application by hand.
   # Setting this to false enables fully automated booking — only do that
   # deliberately, once you fully trust the selectors.
