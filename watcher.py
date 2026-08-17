@@ -30,6 +30,7 @@ import browser_launch
 import site_selectors
 from api_client import ApiClient
 from auth_token import TokenSource
+import doctor
 import drop_report
 from config import (
     in_hot_window,
@@ -501,6 +502,59 @@ def check_selectors() -> int:
     return 1 if detection else 0
 
 
+def run_doctor(cfg: dict) -> int:
+    """Check an environment end to end without needing a job to be posted."""
+    checks = list(doctor.check_selectors())
+    browser_cfg = cfg["browser"]
+    storage = Path(browser_cfg["storage_state"])
+    profile = browser_cfg.get("user_data_dir")
+    has_profile = bool(profile) and Path(profile).exists()
+    checks.append(doctor.Check(
+        "saved session",
+        doctor.OK if (storage.exists() or has_profile) else doctor.FAIL,
+        f"{storage if storage.exists() else ''} "
+        f"{profile if has_profile else ''}".strip() or "none found",
+        fix="python save_session.py",
+    ))
+
+    with sync_playwright() as playwright:
+        browser, context = browser_launch.launch_context(
+            playwright, browser_cfg,
+            storage_state=str(storage) if storage.exists() else None,
+        )
+        context.set_default_timeout(browser_cfg["action_timeout_ms"])
+        context.set_default_navigation_timeout(browser_cfg["nav_timeout_ms"])
+        page = context.pages[0] if context.pages else context.new_page()
+
+        try:
+            checks.append(doctor.check_job_search(page, cfg["site"]["job_search_url"]))
+
+            if cfg["polling"]["mode"] == "api":
+                token_source = TokenSource(
+                    page,
+                    endpoint_url=cfg["api"]["endpoint_url"],
+                    header=cfg["api"].get("auth_header", "authorization"),
+                    storage_key=cfg["api"].get("auth_storage_key"),
+                    reload_url=cfg["site"]["job_search_url"],
+                )
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_timeout(cfg["polling"].get("render_wait_ms", 5000))
+                client = ApiClient(
+                    context.request, cfg["api"],
+                    token_provider=token_source.current,
+                    on_unauthorized=token_source.refresh,
+                )
+                checks.extend(doctor.check_api(client, token_source))
+
+            # Last, because it navigates away from the job search page.
+            checks.append(doctor.check_portal_login(page, cfg["site"]["base_url"]))
+        finally:
+            browser_launch.close_context(browser, context)
+
+    print(doctor.render(checks, f"Environment check — {cfg['site']['base_url']}"))
+    return doctor.verdict(checks)[0]
+
+
 def print_drop_report(cfg: dict) -> int:
     state = StateStore(
         cfg["state"]["path"],
@@ -526,6 +580,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--live", action="store_true", help="override dry_run for this run")
     parser.add_argument("--check-selectors", action="store_true")
     parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="check this environment end to end — session, login, API, "
+             "selectors — without needing a job to be posted",
+    )
+    parser.add_argument(
         "--drop-report",
         action="store_true",
         help="when do shifts actually appear? reads your own detection log",
@@ -544,6 +604,9 @@ def main(argv: list[str] | None = None) -> int:
         return print_drop_report(cfg)
 
     setup_logging(cfg)
+
+    if args.doctor:
+        return run_doctor(cfg)
 
     if cfg["polling"]["mode"] == "dom" and not site_selectors.detection_ready():
         log.error(

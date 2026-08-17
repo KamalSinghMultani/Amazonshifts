@@ -19,6 +19,7 @@ import api_client
 import auth_token
 import browser_launch
 import config as config_mod
+import doctor
 import drop_report
 import site_selectors
 from notifier import TelegramNotifier
@@ -1758,3 +1759,90 @@ def test_a_missing_parent_config_is_named(tmp_path):
     (tmp_path / "child.yaml").write_text('extends: "nope.yaml"\n', "utf-8")
     with pytest.raises(FileNotFoundError, match="nope.yaml"):
         config_mod.load_config(tmp_path / "child.yaml")
+
+
+# ── doctor: is this environment actually ready? ─────────────────────────────
+def test_verdict_distinguishes_broken_from_merely_unable_to_hold():
+    """The distinction the whole command exists for: a signed-out watcher
+    still detects and alerts perfectly, so that is a warning, not a failure."""
+    ok = [doctor.Check("a", doctor.OK)]
+    warn = [doctor.Check("a", doctor.OK), doctor.Check("b", doctor.WARN)]
+    fail = [doctor.Check("a", doctor.WARN), doctor.Check("b", doctor.FAIL)]
+
+    assert doctor.verdict(ok)[0] == 0
+    assert doctor.verdict(warn)[0] == 1
+    assert doctor.verdict(fail)[0] == 2
+    assert "cannot hold" in doctor.verdict(warn)[1]
+    assert "detection" in doctor.verdict(fail)[1].lower()
+
+
+class DoctorPage:
+    def __init__(self, lands_on):
+        self.lands_on = lands_on
+        self.url = "about:blank"
+        self.visited = []
+
+    def goto(self, url, **_kw):
+        self.visited.append(url)
+        self.url = self.lands_on
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+
+def test_portal_login_check_needs_no_job_posting():
+    """hiring.amazon.ca is empty most of the time, so the check has to work
+    with nothing posted. Confirmed live against both states: /application/
+    stays put when signed in and bounces to auth.hiring.amazon.com when not."""
+    signed_in = DoctorPage("https://hiring.amazon.ca/application/ca/#/pre-consent")
+    check = doctor.check_portal_login(signed_in, "https://hiring.amazon.ca", settle_ms=0)
+    assert check.state == doctor.OK
+    assert signed_in.visited == ["https://hiring.amazon.ca/application/"]
+
+    signed_out = DoctorPage("https://auth.hiring.amazon.com/#/login")
+    check = doctor.check_portal_login(signed_out, "https://hiring.amazon.ca", settle_ms=0)
+    assert check.state == doctor.WARN
+    assert "signed OUT" in check.detail
+    assert "save_session.py" in check.fix
+
+
+def test_a_dead_page_does_not_crash_the_doctor():
+    class Broken(DoctorPage):
+        def goto(self, url, **_kw):
+            raise RuntimeError("net::ERR_CONNECTION_REFUSED")
+
+    check = doctor.check_portal_login(Broken(""), "https://hiring.amazon.ca", settle_ms=0)
+    assert check.state == doctor.WARN
+
+
+def test_zero_jobs_is_reported_not_judged():
+    """Canada is empty most of the time. An empty result is healthy."""
+    class Client:
+        def fetch_shifts(self):
+            return []
+
+    class Source:
+        def current(self):
+            return "tok"
+
+    checks = doctor.check_api(Client(), Source())
+    assert all(c.state == doctor.OK for c in checks), [c.render() for c in checks]
+    assert "0 job(s)" in checks[-1].detail
+
+
+def test_an_api_failure_is_a_hard_failure():
+    class Client:
+        def fetch_shifts(self):
+            raise RuntimeError("API returned 500")
+
+    checks = doctor.check_api(Client(), None)
+    assert any(c.state == doctor.FAIL for c in checks)
+
+
+def test_render_lists_the_fixes_once_each():
+    checks = [
+        doctor.Check("a", doctor.WARN, "x", fix="python save_session.py"),
+        doctor.Check("b", doctor.WARN, "y", fix="python save_session.py"),
+    ]
+    text = doctor.render(checks, "Env")
+    assert text.count("python save_session.py") == 1
