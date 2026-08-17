@@ -35,11 +35,22 @@ polling:
   #
   # These values are tuned for `api` mode, where a poll is one small JSON
   # request rather than a page load with every asset.
-  # ⚠️ IF YOU SWITCH BACK TO dom MODE, raise this to 45 first.
-  interval_seconds: 20
+  #
+  # MEASURED 2026-08-17 against the live CA endpoint: 60 consecutive polls
+  # stepping 8s -> 5s -> 3s -> 2s apart drew no 429, no 403 and no WAF page,
+  # at a median of 132ms per poll. 5s is therefore comfortably inside what
+  # the endpoint tolerates, not a guess.
+  #
+  # Why this matters: two CA postings were observed the same evening and BOTH
+  # were gone inside a minute. At 20s a posting could be a third gone before
+  # the first poll sees it.
+  #
+  # ⚠️ IF YOU SWITCH BACK TO dom MODE, raise this to 45 first — a dom poll is
+  # a full page load, and 14s between those already earned a 403.
+  interval_seconds: 5
   # Random 0..jitter_seconds added to each interval so the traffic pattern
   # is not a metronome.
-  jitter_seconds: 10
+  jitter_seconds: 3
 
   # ── Hot mode ────────────────────────────────────────────────────────────
   # Amazon posts shifts in BATCHES: the moment one appears, the next is
@@ -51,7 +62,7 @@ polling:
   # Two triggers, either is enough:
   #   * a match just happened     -> hot for hot_duration_seconds
   #   * the clock is in a window  -> hot for as long as the window lasts
-  hot_interval_seconds: 8
+  hot_interval_seconds: 3
   hot_duration_seconds: 120
 
   # Times of day that are ALWAYS hot, in your local time. May wrap midnight

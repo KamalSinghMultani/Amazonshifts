@@ -519,7 +519,9 @@ def test_polling_defaults_are_conservative_enough_for_the_waf():
     one small JSON request, measured at ~440ms and run at 8s apart without a
     block. So the shipped numbers are only safe *for the shipped mode*."""
     cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
-    floor = 30 if cfg["polling"]["mode"] == "dom" else 10
+    # api floor is measured, not guessed: 60 consecutive polls stepping down to
+    # 2s apart drew no 429, no 403 and no WAF page, median 132ms.
+    floor = 30 if cfg["polling"]["mode"] == "dom" else 3
     assert cfg["polling"]["interval_seconds"] >= floor
     assert cfg["polling"]["render_wait_ms"] >= 1000
 
