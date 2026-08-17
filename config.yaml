@@ -211,13 +211,93 @@ api:
 # All string matching is case-insensitive substring matching.
 # Empty include_* list = "anything passes".
 filters:
-  include_titles: []
+  # Anything warehouse. "Delivery Station Warehouse Associate" contains
+  # "warehouse", so delivery roles DO pass the filter — they are wanted, just
+  # wanted least. That is handled by priority below, not by excluding them.
+  include_titles:
+    - "warehouse"
+    - "fulfillment"
+    - "sortation"
+    - "sort center"
   exclude_titles: []
-  include_locations: []
-  exclude_locations: []
+
+  # Brampton, Mississauga, Toronto, Oakville, and the sites within ~30km of
+  # Brampton. Matching is substring, so "toronto" also catches "Toronto, ON".
+  include_locations:
+    - "brampton"
+    - "mississauga"
+    - "toronto"
+    - "oakville"
+    - "etobicoke"
+    - "malton"
+    - "rexdale"
+    - "north york"
+    - "vaughan"
+    - "woodbridge"
+    - "concord"
+    - "maple"
+    - "kleinburg"
+    - "bolton"
+    - "caledon"
+    - "georgetown"
+    - "halton hills"
+    - "norval"
+    - "milton"
+
+  # Substring matching is blunt: "maple" would also match "Maple Ridge, BC".
+  # Excluding the other provinces costs nothing and stops a 3,000km commute
+  # from ever reaching your phone. Harmless if the site omits the province.
+  exclude_locations:
+    - ", bc"
+    - ", ab"
+    - ", qc"
+    - ", mb"
+    - ", sk"
+    - ", ns"
+    - ", nb"
+    - ", nl"
+    - ", pe"
+    - ", yt"
+    - ", nt"
+    - ", nu"
+
+  # The API only exposes PART_TIME / FULL_TIME / FLEX_TIME here. Actual shift
+  # times live on the job detail page, so they cannot be filtered before the
+  # alert goes out.
   include_schedules: []
   exclude_schedules: []
+
+  # No pay filter: these all pay about the same, so a threshold would only
+  # ever risk silently dropping a shift you wanted.
   min_pay_rate: null
+
+# ── Which one do you want MOST? ─────────────────────────────────────────────
+# Filters decide what is acceptable. This decides the order, which matters
+# because a whole batch can land in one poll and only the front of the list is
+# alerted individually and held (see notifications.max_alerts_per_poll and
+# hold.max_per_poll).
+#
+# `order` is the tie-break sequence. With location first, the shortest commute
+# wins and the role only breaks ties within a city — so a Delivery job in
+# Brampton outranks a Fulfillment job in Toronto.
+priority:
+  order: ["location", "title", "pay"]
+
+  # Earlier = more wanted. Anything unlisted ranks after everything listed.
+  locations:
+    - "brampton"
+    - "mississauga"
+    - "toronto"
+
+  titles:
+    - "fulfillment center warehouse associate"
+    - "fulfillment"
+
+  # Sinks to the bottom of the batch, below every non-demoted role in the
+  # same city. Still alerted — just never the one that gets auto-held while
+  # something better is on the table.
+  demote_titles:
+    - "delivery"
 
 notifications:
   telegram:

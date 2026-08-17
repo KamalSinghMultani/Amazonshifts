@@ -39,7 +39,7 @@ from config import (
     setup_logging,
 )
 from notifier import TelegramNotifier
-from shift_matcher import ShiftMatcher
+from shift_matcher import ShiftMatcher, ShiftRanker
 from state_store import StateStore
 
 log = logging.getLogger("watcher")
@@ -54,6 +54,7 @@ class Watcher:
         self.mode = cfg["polling"]["mode"]
 
         self.matcher = ShiftMatcher(cfg.get("filters"))
+        self.ranker = ShiftRanker(cfg.get("priority"))
         self.state = StateStore(
             cfg["state"]["path"],
             cfg["state"]["ttl_hours"],
@@ -301,16 +302,15 @@ class Watcher:
         self.go_hot()
 
         # Best first. A whole batch can land in one poll, and both caps below
-        # keep only the front of this list, so the order decides which shift
-        # you hear about and which one gets held. Pay is the honest proxy for
-        # "the one you want"; unknown pay sorts last rather than first.
-        new_matches.sort(key=lambda s: (s.pay_rate is None, -(s.pay_rate or 0)))
+        # keep only the front of this list, so this ordering decides which
+        # shift you hear about and which one actually gets held.
+        new_matches = self.ranker.sort(new_matches)
 
         alert_cap = self.cfg["notifications"].get("max_alerts_per_poll") or len(new_matches)
         for index, shift in enumerate(new_matches):
             self.state.log_detection(shift.stable_id, shift.summary())
             self.alerts += 1
-            log.info("MATCH: %s", shift.summary())
+            log.info("MATCH: %s [%s]", shift.summary(), self.ranker.explain(shift))
 
             if index >= alert_cap:
                 continue

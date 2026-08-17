@@ -71,16 +71,43 @@ python watcher.py --check-selectors
 
 ### 3. Say which shifts you want
 
-In `config.yaml`, under `filters:`. All matching is case-insensitive substring
-matching, and an empty `include_*` list means "anything passes".
+Two blocks in `config.yaml` do this, and they answer different questions.
+
+**`filters:` — what is acceptable.** Case-insensitive substring matching; an
+empty `include_*` list means "anything passes". As shipped: any warehouse role,
+in Brampton / Mississauga / Toronto / Oakville and the sites within ~30km of
+Brampton, with no pay threshold.
+
+Note that Delivery roles *pass* the filter — "Delivery Station Warehouse
+Associate" contains "warehouse". They are wanted, just wanted least, which is a
+ranking question rather than a filtering one.
+
+Substring matching is blunt, so the shipped config also excludes the other
+provinces: `"maple"` matches Maple, ON and would otherwise also match Maple
+Ridge, BC.
+
+**`priority:` — which acceptable shift you want most.** This matters because a
+whole batch can land in one poll, and only the front of the ranked list is
+alerted individually and auto-held.
 
 ```yaml
-filters:
-  include_titles: ["warehouse", "sortation"]
-  exclude_titles: ["seasonal"]
-  include_locations: ["brampton", "mississauga"]
-  exclude_schedules: ["night"]
-  min_pay_rate: 18.00
+priority:
+  order: ["location", "title", "pay"]
+  locations: ["brampton", "mississauga", "toronto"]
+  titles: ["fulfillment center warehouse associate", "fulfillment"]
+  demote_titles: ["delivery"]
+```
+
+`order` is the tie-break sequence. With **location first**, the shortest commute
+wins and the role only breaks ties inside a city — so a Delivery job in Brampton
+outranks a Fulfillment job in Toronto. Swap to `["title", "location", "pay"]` if
+you would rather the role decide first. Anything unlisted ranks after everything
+listed; `demote_titles` sinks a role below every other role in the same city.
+
+Every alert logs why it ranked where it did:
+
+```
+MATCH: Fulfillment Center Warehouse Associate — Brampton, ON — $23.00/hr [title #1, location #1]
 ```
 
 ### 4. Run it

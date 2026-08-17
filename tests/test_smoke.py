@@ -22,7 +22,7 @@ import config as config_mod
 import drop_report
 import site_selectors
 from notifier import TelegramNotifier
-from shift_matcher import Shift, ShiftMatcher
+from shift_matcher import Shift, ShiftMatcher, ShiftRanker
 from state_store import StateStore
 
 
@@ -1260,3 +1260,123 @@ def test_every_match_is_deduped_even_the_ones_only_summarised(tmp_path):
     w.poll_once()
     assert w.notifier.shifts == []
     assert w.notifier.texts == []
+
+
+# ── priority: which shift do you want MOST ──────────────────────────────────
+def _shipped():
+    return config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+
+
+def _gta(title, city, pay=23.0):
+    return Shift(id=f"{title}|{city}", title=title, location=f"{city}, ON", pay_rate=pay)
+
+
+FULFILLMENT = "Fulfillment Center Warehouse Associate"
+DELIVERY = "Delivery Station Warehouse Associate"
+SORT = "Sortation Center Warehouse Associate"
+
+
+def test_closer_city_beats_better_role():
+    """The settled rule: location first. A Delivery job in Brampton outranks a
+    Fulfillment job in Toronto, because the commute matters more."""
+    ranker = ShiftRanker(_shipped()["priority"])
+    ranked = ranker.sort([_gta(FULFILLMENT, "Toronto"), _gta(DELIVERY, "Brampton")])
+    assert ranked[0].location.startswith("Brampton")
+
+
+def test_within_one_city_fulfillment_beats_delivery():
+    ranker = ShiftRanker(_shipped()["priority"])
+    ranked = ranker.sort([_gta(DELIVERY, "Brampton"), _gta(FULFILLMENT, "Brampton")])
+    assert ranked[0].title == FULFILLMENT
+
+
+def test_the_configured_city_order_is_respected():
+    ranker = ShiftRanker(_shipped()["priority"])
+    ranked = ranker.sort([
+        _gta(FULFILLMENT, "Toronto"),
+        _gta(FULFILLMENT, "Mississauga"),
+        _gta(FULFILLMENT, "Brampton"),
+    ])
+    assert [s.location.split(",")[0] for s in ranked] == ["Brampton", "Mississauga", "Toronto"]
+
+
+def test_an_unlisted_but_acceptable_city_ranks_after_the_listed_ones():
+    """Milton is inside the 30km net, so it is wanted — just not preferred
+    over the three named cities."""
+    ranker = ShiftRanker(_shipped()["priority"])
+    ranked = ranker.sort([_gta(FULFILLMENT, "Milton"), _gta(FULFILLMENT, "Toronto")])
+    assert ranked[0].location.startswith("Toronto")
+
+
+def test_delivery_sinks_below_every_other_role_in_the_same_city():
+    ranker = ShiftRanker(_shipped()["priority"])
+    ranked = ranker.sort([
+        _gta(DELIVERY, "Brampton"),
+        _gta(SORT, "Brampton"),
+        _gta(FULFILLMENT, "Brampton"),
+    ])
+    assert [s.title for s in ranked] == [FULFILLMENT, SORT, DELIVERY]
+
+
+def test_pay_only_breaks_a_tie_nothing_more():
+    ranker = ShiftRanker(_shipped()["priority"])
+    ranked = ranker.sort([
+        _gta(FULFILLMENT, "Brampton", pay=21.0),
+        _gta(FULFILLMENT, "Brampton", pay=25.0),
+    ])
+    assert ranked[0].pay_rate == 25.0
+    # ...but never outranks a closer city.
+    ranked = ranker.sort([_gta(FULFILLMENT, "Toronto", 99.0), _gta(FULFILLMENT, "Brampton", 20.0)])
+    assert ranked[0].location.startswith("Brampton")
+
+
+def test_the_shipped_filters_accept_what_they_should():
+    matcher = ShiftMatcher(_shipped()["filters"])
+    for title in (FULFILLMENT, DELIVERY, SORT):
+        for city in ("Brampton", "Mississauga", "Toronto", "Oakville", "Milton", "Etobicoke"):
+            assert matcher.matches(_gta(title, city))[0], (title, city)
+
+
+def test_the_shipped_filters_reject_what_they_should():
+    matcher = ShiftMatcher(_shipped()["filters"])
+    assert not matcher.matches(_gta(FULFILLMENT, "Ottawa"))[0]
+    assert not matcher.matches(_gta(FULFILLMENT, "Vancouver"))[0]
+    assert not matcher.matches(Shift(title="Delivery Driver", location="Brampton, ON"))[0]
+
+
+def test_substring_matching_cannot_send_you_across_the_country():
+    """'maple' is in the include list for Maple, ON — and would also match
+    Maple Ridge, BC without the province excludes."""
+    matcher = ShiftMatcher(_shipped()["filters"])
+    assert matcher.matches(_gta(FULFILLMENT, "Maple"))[0]
+    assert not matcher.matches(Shift(title=FULFILLMENT, location="Maple Ridge, BC"))[0]
+
+
+def test_no_pay_filter_is_configured():
+    """These all pay about the same, so a threshold could only ever drop a
+    shift that was wanted."""
+    assert _shipped()["filters"]["min_pay_rate"] is None
+    matcher = ShiftMatcher(_shipped()["filters"])
+    assert matcher.matches(Shift(title=FULFILLMENT, location="Brampton, ON"))[0]
+
+
+def test_the_watcher_holds_the_top_ranked_shift_of_a_batch(tmp_path):
+    """The end of the whole chain: filter, rank, cap, hold exactly one."""
+    shipped = _shipped()
+    held = []
+    w = _batch_watcher(
+        tmp_path,
+        [
+            _gta(DELIVERY, "Oakville"),
+            _gta(FULFILLMENT, "Toronto"),
+            _gta(DELIVERY, "Brampton"),
+            _gta(FULFILLMENT, "Mississauga"),
+        ],
+        dry_run=False,
+        filters=shipped["filters"],
+        priority=shipped["priority"],
+    )
+    w._hold = held.append
+    w.poll_once()
+    assert len(held) == 1
+    assert held[0].location.startswith("Brampton")

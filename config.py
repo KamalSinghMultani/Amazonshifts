@@ -71,6 +71,13 @@ DEFAULTS: dict[str, Any] = {
         "auth_storage_key": "sessionToken",
     },
     "filters": {},
+    # Which acceptable shift you want most. See ShiftRanker.
+    "priority": {
+        "order": ["location", "title", "pay"],
+        "locations": [],
+        "titles": [],
+        "demote_titles": [],
+    },
     "notifications": {
         "telegram": {"enabled": True, "screenshot": True},
         "notify_on_start": True,
