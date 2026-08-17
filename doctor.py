@@ -131,7 +131,15 @@ def check_api(client: Any, token_source: Any) -> list[Check]:
     elapsed = (time.perf_counter() - started) * 1000
     # Zero is a perfectly healthy answer here — Canada is empty most of the
     # time — so it is reported, not judged.
-    checks.append(Check("api poll", OK, f"{len(shifts)} job(s) in {elapsed:.0f}ms"))
+    detail = f"{len(shifts)} job(s) in {elapsed:.0f}ms"
+    if shifts:
+        # Name them. Postings are rare and last about a minute, so a bare
+        # count leaves you unable to tell afterwards whether the one you saw
+        # was even in your area.
+        detail += " — " + "; ".join(s.summary() for s in shifts[:3])
+        if len(shifts) > 3:
+            detail += f"; +{len(shifts) - 3} more"
+    checks.append(Check("api poll", OK, detail))
     return checks
 
 

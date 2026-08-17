@@ -1848,3 +1848,41 @@ def test_render_lists_the_fixes_once_each():
     ]
     text = doctor.render(checks, "Env")
     assert text.count("python save_session.py") == 1
+
+
+def test_a_filtered_out_posting_still_leaves_a_trace(tmp_path, caplog):
+    """Canadian postings are rare and gone in about a minute. If one is
+    filtered out and logged nowhere, you cannot answer the question you will
+    definitely ask later: was that one of mine?"""
+    shipped = _shipped()
+    w = _batch_watcher(
+        tmp_path,
+        [
+            Shift(id="1", title="Fulfillment Center Warehouse Associate",
+                  location="Tsawwassen, BC", pay_rate=23.0),
+            Shift(id="2", title="Delivery Driver", location="Brampton, ON", pay_rate=23.0),
+        ],
+        filters=shipped["filters"],
+        priority=shipped["priority"],
+    )
+    with caplog.at_level("INFO"):
+        w.poll_once()
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "filtered out" in logged
+    assert "Tsawwassen" in logged, "the location is the whole point of the line"
+    assert w.notifier.shifts == [], "neither posting should have alerted"
+
+
+def test_the_doctor_names_the_jobs_it_finds():
+    class Client:
+        def fetch_shifts(self):
+            return [Shift(id="1", title="Fulfillment Center Warehouse Associate",
+                          location="Brampton, ON", pay_rate=23.0)]
+
+    class Source:
+        def current(self):
+            return "tok"
+
+    checks = doctor.check_api(Client(), Source())
+    assert "Brampton" in checks[-1].detail

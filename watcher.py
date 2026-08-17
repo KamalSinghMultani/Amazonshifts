@@ -279,11 +279,18 @@ class Watcher:
             self.polls, len(shifts), fetch_ms, " [hot]" if hot else "",
         )
 
+        # Canadian postings are rare and short-lived, so every one that shows
+        # up is worth a line in the log even when it is filtered out. Without
+        # this, a sighting leaves no trace and you cannot answer the obvious
+        # question afterwards: was that one of mine?
+        rejected: list[str] = []
+
         new_matches = []
         for shift in shifts:
             matched, reason = self.matcher.matches(shift)
             if not matched:
                 log.debug("skip %s (%s)", shift.summary(), reason)
+                rejected.append(f"{shift.summary()} [{reason}]")
                 continue
             if self.state.has_seen(shift.stable_id):
                 log.debug("already alerted: %s", shift.summary())
@@ -293,6 +300,12 @@ class Watcher:
             # retry than spam the same alert on every poll.
             self.state.mark_seen(shift.stable_id, shift.summary())
             new_matches.append(shift)
+
+        if rejected:
+            log.info(
+                "%d posting(s) seen but filtered out: %s",
+                len(rejected), " | ".join(rejected[:5]),
+            )
 
         if not new_matches:
             return
