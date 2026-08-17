@@ -192,6 +192,36 @@ still needs them, since holding means clicking real buttons.
 
 ---
 
+## Two environments
+
+`hiring.amazon.ca` is empty most of the time, so there is often nothing in
+Canada to test against. `hiring.amazon.com` runs the same frontend and the same
+auth service and always has jobs, which makes it the only place the whole path —
+detect, rank, alert, hold — can be exercised on demand.
+
+| | Canada (real) | US (testing) |
+|---|---|---|
+| Config | `config.yaml` | `config.us.yaml` |
+| Login | `python save_session.py` | `python save_session.py --config config.us.yaml` |
+| Run | `python watcher.py` | `python watcher.py --config config.us.yaml` |
+| Profile / session | `browser_profile`, `auth_state.json` | `browser_profile_us`, `auth_state.us.json` |
+| Dedup + detections | `state/seen_shifts.json`, `state/detections.jsonl` | `*.us.json`, `*.us.jsonl` |
+| Log | `logs/watcher.log` | `logs/watcher.us.log` |
+
+**Everything stateful is separate on purpose.** A test run must never mark a
+Canadian shift as already-seen, overwrite the Canadian login, or feed US posting
+times into `--drop-report` — that last one would quietly set your `hot_windows`
+to the wrong hours. There are tests asserting each of those paths differs.
+
+`config.us.yaml` uses `extends: "config.yaml"` and lists only what differs, so
+the two cannot drift apart. `extends` chains and is loop-checked.
+
+Both configs ship `dry_run: true` and `stop_before_submit: true`. Note that an
+end-to-end hold test on the US site starts a **real application** on your
+account, which you then have to withdraw.
+
+---
+
 ## Running it
 
 ```bash

@@ -1688,3 +1688,73 @@ def test_stopping_early_still_says_the_spot_is_not_held(monkeypatch):
     page = ConsentPage(has_button=False)
     ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=True)
     assert "NOT HELD" in message.upper()
+
+
+# ── two environments: Canada for real, the US for testing ───────────────────
+def _both_configs():
+    root = Path(__file__).resolve().parent.parent
+    return config_mod.load_config(root / "config.yaml"), config_mod.load_config(
+        root / "config.us.yaml"
+    )
+
+
+def test_the_us_config_loads_and_points_at_the_us_site():
+    _, us = _both_configs()
+    assert "hiring.amazon.com" in us["site"]["job_search_url"]
+    assert "hiring.amazon.com" in us["api"]["endpoint_url"]
+    assert us["api"]["extra_headers"]["country"] == "United States"
+    assert us["api"]["payload"]["variables"]["searchJobRequest"]["country"] == "United States"
+
+
+def test_extends_inherits_everything_not_overridden():
+    """The US config only lists what differs; the rest must come from the
+    Canadian one, or the two drift apart silently."""
+    ca, us = _both_configs()
+    assert us["polling"]["mode"] == ca["polling"]["mode"]
+    assert us["polling"]["hot_interval_seconds"] == ca["polling"]["hot_interval_seconds"]
+    assert us["api"]["shifts_path"] == ca["api"]["shifts_path"]
+    assert us["api"]["auth_from_page"] == ca["api"]["auth_from_page"]
+    assert us["browser"]["channel"] == ca["browser"]["channel"]
+
+
+def test_a_us_test_run_cannot_touch_canadian_state_or_session():
+    """The real risk of a second environment: a test run marking a Canadian
+    shift as already-seen, overwriting the Canadian login, or feeding US
+    posting times into --drop-report and setting hot_windows to the wrong
+    hours."""
+    ca, us = _both_configs()
+    assert us["state"]["path"] != ca["state"]["path"]
+    assert us["state"]["detections_path"] != ca["state"]["detections_path"]
+    assert us["browser"]["storage_state"] != ca["browser"]["storage_state"]
+    assert us["browser"]["user_data_dir"] != ca["browser"]["user_data_dir"]
+    assert us["logging"]["path"] != ca["logging"]["path"]
+
+
+def test_both_configs_are_safe_by_default():
+    for cfg in _both_configs():
+        assert cfg["dry_run"] is True
+        assert cfg["hold"]["stop_before_submit"] is True
+
+
+def test_extends_can_be_a_chain(tmp_path):
+    (tmp_path / "base.yaml").write_text("polling:\n  interval_seconds: 33\n", "utf-8")
+    (tmp_path / "middle.yaml").write_text(
+        'extends: "base.yaml"\npolling:\n  jitter_seconds: 7\n', "utf-8")
+    (tmp_path / "leaf.yaml").write_text('extends: "middle.yaml"\ndry_run: false\n', "utf-8")
+    cfg = config_mod.load_config(tmp_path / "leaf.yaml")
+    assert cfg["polling"]["interval_seconds"] == 33
+    assert cfg["polling"]["jitter_seconds"] == 7
+    assert cfg["dry_run"] is False
+
+
+def test_an_extends_loop_is_caught_instead_of_hanging(tmp_path):
+    (tmp_path / "a.yaml").write_text('extends: "b.yaml"\n', "utf-8")
+    (tmp_path / "b.yaml").write_text('extends: "a.yaml"\n', "utf-8")
+    with pytest.raises(ValueError, match="loop"):
+        config_mod.load_config(tmp_path / "a.yaml")
+
+
+def test_a_missing_parent_config_is_named(tmp_path):
+    (tmp_path / "child.yaml").write_text('extends: "nope.yaml"\n', "utf-8")
+    with pytest.raises(FileNotFoundError, match="nope.yaml"):
+        config_mod.load_config(tmp_path / "child.yaml")

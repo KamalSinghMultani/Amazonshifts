@@ -114,14 +114,40 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
-def load_config(path: str | os.PathLike = "config.yaml") -> dict:
-    path = Path(path)
+def _load_raw(path: Path, seen: list[Path] | None = None) -> dict:
+    """Read one config file, resolving `extends:` first.
+
+    `extends` exists so a second environment — a US config for testing the
+    workflow against a site that always has jobs, say — can override the five
+    keys that differ instead of duplicating the whole file and quietly drifting
+    out of sync with it.
+    """
+    seen = seen or []
+    path = path.resolve()
+    if path in seen:
+        chain = " -> ".join(p.name for p in [*seen, path])
+        raise ValueError(f"config extends itself in a loop: {chain}")
     if not path.exists():
         raise FileNotFoundError(f"config file not found: {path}")
+
     raw = yaml.safe_load(path.read_text("utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"{path} must contain a YAML mapping at the top level")
-    cfg = _deep_merge(DEFAULTS, raw)
+
+    parent = raw.pop("extends", None)
+    if not parent:
+        return raw
+
+    # Relative to the child config, so configs can live in a subdirectory.
+    base_path = Path(parent)
+    if not base_path.is_absolute():
+        base_path = path.parent / base_path
+    base = _load_raw(base_path, [*seen, path])
+    return _deep_merge(base, raw)
+
+
+def load_config(path: str | os.PathLike = "config.yaml") -> dict:
+    cfg = _deep_merge(DEFAULTS, _load_raw(Path(path)))
     validate_config(cfg)
     return cfg
 
