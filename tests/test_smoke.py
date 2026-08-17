@@ -1,0 +1,424 @@
+"""Smoke tests. No browser and no network required.
+
+Run: python -m pytest -q
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import api_client
+import config as config_mod
+import site_selectors
+from notifier import TelegramNotifier
+from shift_matcher import Shift, ShiftMatcher
+from state_store import StateStore
+
+
+# ── Shift ───────────────────────────────────────────────────────────────────
+def test_shift_normalizes_whitespace_and_pay():
+    shift = Shift(title="  Warehouse   Associate\n", location=" Brampton ", pay_rate="$18.50/hr")
+    assert shift.title == "Warehouse Associate"
+    assert shift.location == "Brampton"
+    assert shift.pay_rate == 18.50
+
+
+def test_stable_id_prefers_site_id():
+    assert Shift(id="ABC123", title="x").stable_id == "id:ABC123"
+
+
+def test_stable_id_is_stable_and_distinct_without_an_id():
+    a = Shift(title="Sorter", location="YYZ", schedule="Mon 8-4")
+    b = Shift(title="sorter", location="YYZ", schedule="Mon 8-4")  # case differs only
+    c = Shift(title="Sorter", location="YOW", schedule="Mon 8-4")
+    assert a.stable_id == b.stable_id
+    assert a.stable_id != c.stable_id
+    assert a.stable_id.startswith("h:")
+
+
+def test_pay_rate_junk_becomes_none():
+    assert Shift(pay_rate="competitive").pay_rate is None
+    assert Shift(pay_rate=None).pay_rate is None
+
+
+# ── ShiftMatcher ────────────────────────────────────────────────────────────
+def test_empty_filters_match_everything():
+    assert ShiftMatcher({}).matches(Shift(title="anything"))[0]
+
+
+def test_include_and_exclude_titles():
+    matcher = ShiftMatcher({"include_titles": ["warehouse"], "exclude_titles": ["seasonal"]})
+    assert matcher.matches(Shift(title="Warehouse Associate"))[0]
+    assert not matcher.matches(Shift(title="Delivery Driver"))[0]
+    assert not matcher.matches(Shift(title="Seasonal Warehouse Associate"))[0]
+
+
+def test_exclude_beats_include():
+    matcher = ShiftMatcher({"include_titles": ["warehouse"], "exclude_titles": ["warehouse"]})
+    matched, reason = matcher.matches(Shift(title="Warehouse"))
+    assert not matched and "excluded" in reason
+
+
+def test_min_pay_rate():
+    matcher = ShiftMatcher({"min_pay_rate": 20})
+    assert matcher.matches(Shift(title="a", pay_rate=22))[0]
+    assert not matcher.matches(Shift(title="a", pay_rate=19.5))[0]
+    # No pay data must not silently pass a pay filter.
+    assert not matcher.matches(Shift(title="a"))[0]
+
+
+def test_location_and_schedule_filters():
+    matcher = ShiftMatcher({"include_locations": ["brampton"], "exclude_schedules": ["night"]})
+    assert matcher.matches(Shift(title="a", location="Brampton, ON", schedule="Day"))[0]
+    assert not matcher.matches(Shift(title="a", location="Ottawa", schedule="Day"))[0]
+    assert not matcher.matches(Shift(title="a", location="Brampton", schedule="Night shift"))[0]
+
+
+# ── StateStore ──────────────────────────────────────────────────────────────
+def test_state_store_persists_across_instances(tmp_path):
+    path = tmp_path / "state" / "seen.json"
+    store = StateStore(path)
+    assert not store.has_seen("id:1")
+    store.mark_seen("id:1", "Sorter")
+    store.save()
+
+    assert StateStore(path).has_seen("id:1")
+
+
+def test_state_store_expires_entries(tmp_path):
+    path = tmp_path / "seen.json"
+    store = StateStore(path, ttl_hours=1)
+    store.mark_seen("id:1")
+    store._seen["id:1"]["ts"] = time.time() - 7200  # 2h ago
+    assert not store.has_seen("id:1")
+
+
+def test_state_store_survives_a_corrupt_file(tmp_path):
+    path = tmp_path / "seen.json"
+    path.write_text("{not json at all", "utf-8")
+    store = StateStore(path)  # must not raise
+    assert len(store) == 0
+    store.mark_seen("id:1")
+    store.save()
+    assert json.loads(path.read_text())["seen"]["id:1"]
+
+
+# ── api_client ──────────────────────────────────────────────────────────────
+def test_dig_walks_dicts_and_list_indexes():
+    payload = {"data": {"results": [{"cards": [1, 2]}]}}
+    assert api_client.dig(payload, "data.results.0.cards") == [1, 2]
+
+
+def test_dig_returns_none_instead_of_raising():
+    assert api_client.dig({"a": 1}, "a.b.c") is None
+    assert api_client.dig({}, "missing") is None
+    assert api_client.dig({"a": [1]}, "a.9") is None
+
+
+def test_parse_shifts_maps_fields_and_builds_urls():
+    payload = {
+        "data": {
+            "jobCards": [
+                {
+                    "jobId": "JOB-1",
+                    "jobTitle": "Warehouse Associate",
+                    "locationName": "Brampton, ON",
+                    "scheduleText": "Mon-Fri 08:00-16:30",
+                    "totalPayRateMin": 18.5,
+                }
+            ]
+        }
+    }
+    shifts = api_client.parse_shifts(
+        payload,
+        "data.jobCards",
+        {
+            "id": "jobId",
+            "title": "jobTitle",
+            "location": "locationName",
+            "schedule": "scheduleText",
+            "pay_rate": "totalPayRateMin",
+            "url": None,
+        },
+        url_template="https://hiring.amazon.ca/app#/jobDetail?jobId={id}",
+    )
+    assert len(shifts) == 1
+    shift = shifts[0]
+    assert shift.id == "JOB-1"
+    assert shift.title == "Warehouse Associate"
+    assert shift.pay_rate == 18.5
+    assert shift.url.endswith("jobId=JOB-1")
+    assert shift.raw["jobId"] == "JOB-1"  # raw payload kept for debugging
+
+
+def test_parse_shifts_handles_a_schema_change_without_crashing():
+    assert api_client.parse_shifts({"data": {}}, "data.jobCards", {"id": "jobId"}) == []
+    assert api_client.parse_shifts({"data": {"jobCards": {}}}, "data.jobCards", {"id": "x"}) == []
+
+
+def test_parse_shifts_ignores_unknown_field_map_keys():
+    shifts = api_client.parse_shifts(
+        {"cards": [{"jobTitle": "A", "bogus": "B"}]},
+        "cards",
+        {"title": "jobTitle", "not_a_shift_field": "bogus"},
+    )
+    assert shifts[0].title == "A"
+
+
+# ── config ──────────────────────────────────────────────────────────────────
+def test_shipped_config_loads_and_validates():
+    cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    assert cfg["dry_run"] is True, "shipped config must stay safe by default"
+    assert cfg["hold"]["stop_before_submit"] is True
+    assert cfg["polling"]["mode"] in ("dom", "api")
+
+
+def test_defaults_fill_in_missing_sections(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text("dry_run: false\n", "utf-8")
+    cfg = config_mod.load_config(path)
+    assert cfg["dry_run"] is False
+    assert cfg["polling"]["interval_seconds"] == 20  # from DEFAULTS
+
+
+def test_api_mode_without_an_endpoint_is_rejected(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text("polling:\n  mode: api\n", "utf-8")
+    with pytest.raises(ValueError, match="endpoint_url"):
+        config_mod.load_config(path)
+
+
+def test_absurd_poll_interval_is_rejected(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text("polling:\n  interval_seconds: 1\n", "utf-8")
+    with pytest.raises(ValueError, match="interval_seconds"):
+        config_mod.load_config(path)
+
+
+def test_bad_mode_is_rejected(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text("polling:\n  mode: telepathy\n", "utf-8")
+    with pytest.raises(ValueError, match="polling.mode"):
+        config_mod.load_config(path)
+
+
+def test_dotenv_does_not_override_real_env(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text('TELEGRAM_BOT_TOKEN="from-file"\nTELEGRAM_CHAT_ID=123\n', "utf-8")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "from-shell")
+    config_mod.load_dotenv(env)
+    import os
+
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "from-shell"
+    assert os.environ["TELEGRAM_CHAT_ID"] == "123"
+
+
+# ── notifier ────────────────────────────────────────────────────────────────
+def test_notifier_disables_itself_without_credentials(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    notifier = TelegramNotifier(enabled=True)
+    assert not notifier.enabled
+    # Muted, but must not raise — a missing token cannot take the watcher down.
+    assert notifier.notify_shift(Shift(title="x")) is False
+
+
+def test_notifier_retries_then_gives_up(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 500
+        text = "boom"
+
+    def fake_post(url, data=None, files=None, timeout=None):
+        calls.append(url)
+        return FakeResponse()
+
+    monkeypatch.setattr("notifier.requests.post", fake_post)
+    monkeypatch.setattr("notifier.time.sleep", lambda _s: None)
+    notifier = TelegramNotifier(enabled=True, token="t", chat_id="c", max_retries=3)
+    assert notifier.send_text("hi") is False
+    assert len(calls) == 3
+
+
+def test_notifier_sends_photo_bytes_so_retries_are_replayable(monkeypatch, tmp_path):
+    """Regression: an open file handle is consumed by attempt 1 and would
+    upload zero bytes on attempt 2."""
+    seen = []
+
+    class FakeResponse:
+        status_code = 500
+        text = ""
+
+    def fake_post(url, data=None, files=None, timeout=None):
+        seen.append(files["photo"][1])
+        return FakeResponse()
+
+    image = tmp_path / "shot.png"
+    image.write_bytes(b"PNGDATA")
+    monkeypatch.setattr("notifier.requests.post", fake_post)
+    monkeypatch.setattr("notifier.time.sleep", lambda _s: None)
+
+    TelegramNotifier(enabled=True, token="t", chat_id="c", max_retries=2).send_photo(image)
+    assert seen == [b"PNGDATA", b"PNGDATA"]
+
+
+def test_notify_shift_escapes_html():
+    notifier = TelegramNotifier(enabled=False)
+    sent = []
+    notifier.send_text = lambda text: sent.append(text) or True
+    notifier.notify_shift(Shift(title="<script>x</script>", location="A & B"))
+    assert "&lt;script&gt;" in sent[0]
+    assert "A &amp; B" in sent[0]
+
+
+# ── site_selectors ──────────────────────────────────────────────────────────
+def test_module_is_not_named_selectors():
+    """Regression: a module named `selectors.py` shadows the stdlib module
+    asyncio (and therefore Playwright) imports, crashing at startup."""
+    assert Path(site_selectors.__file__).name == "site_selectors.py"
+    import selectors as stdlib_selectors
+
+    assert hasattr(stdlib_selectors, "DefaultSelector")
+
+
+def test_placeholders_are_reported_as_unconfigured():
+    missing = site_selectors.unconfigured()
+    assert "job_card" in missing
+    assert "FINAL_SUBMIT" in missing
+    assert not site_selectors.selectors_ready()
+
+
+# ── DOM fakes, to test card matching without a browser ──────────────────────
+class FakeField:
+    def __init__(self, text: str = "", present: bool = True, href: str | None = None):
+        self._text, self._present, self._href = text, present, href
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 1 if self._present else 0
+
+    def inner_text(self, timeout=None):
+        return self._text
+
+    def get_attribute(self, name, timeout=None):
+        return self._href if name == "href" else None
+
+
+class FakeCard:
+    def __init__(self, job_id=None, title="", location="", href=None):
+        self.job_id, self.title, self.location, self.href = job_id, title, location, href
+        self.clicked = False
+
+    def get_attribute(self, name, timeout=None):
+        return self.job_id if name == "data-job-id" else None
+
+    def scroll_into_view_if_needed(self, timeout=None):
+        pass
+
+    def locator(self, selector):
+        if selector == "a":
+            return FakeField(href=self.href, present=self.href is not None)
+        return FakeField({"#title": self.title, "#loc": self.location}.get(selector, ""))
+
+
+class FakeLocator:
+    def __init__(self, cards):
+        self.cards = cards
+
+    def count(self):
+        return len(self.cards)
+
+    def nth(self, index):
+        return self.cards[index]
+
+
+class FakePage:
+    def __init__(self, cards, url="https://hiring.amazon.ca/app"):
+        self.cards = cards
+        self.url = url
+
+    def locator(self, selector):
+        return FakeLocator(self.cards)
+
+
+@pytest.fixture
+def wired_selectors(monkeypatch):
+    monkeypatch.setitem(site_selectors.SELECTORS, "job_card", ".card")
+    monkeypatch.setitem(site_selectors.SELECTORS, "card_title", "#title")
+    monkeypatch.setitem(site_selectors.SELECTORS, "card_location", "#loc")
+    monkeypatch.setitem(site_selectors.SELECTORS, "card_schedule", "#sched")
+    monkeypatch.setitem(site_selectors.SELECTORS, "card_pay", "#pay")
+
+
+def test_find_matching_card_picks_the_right_card_by_id(wired_selectors):
+    """Regression: this used to return the first card on the page regardless
+    of which shift matched — i.e. it would hold the wrong shift."""
+    cards = [
+        FakeCard("JOB-1", "Sorter", "Brampton"),
+        FakeCard("JOB-2", "Picker", "Ottawa"),
+        FakeCard("JOB-3", "Stower", "Calgary"),
+    ]
+    page = FakePage(cards)
+    found = site_selectors.find_matching_card(page, Shift(id="JOB-3", title="Stower"))
+    assert found is cards[2]
+
+
+def test_find_matching_card_falls_back_to_title_and_location(wired_selectors):
+    cards = [FakeCard(None, "Sorter", "Brampton"), FakeCard(None, "Picker", "Ottawa")]
+    page = FakePage(cards)
+    found = site_selectors.find_matching_card(page, Shift(title="Picker", location="Ottawa"))
+    assert found is cards[1]
+
+
+def test_find_matching_card_returns_none_when_absent(wired_selectors):
+    page = FakePage([FakeCard("JOB-1", "Sorter", "Brampton")])
+    assert site_selectors.find_matching_card(page, Shift(id="JOB-9", title="Ghost")) is None
+
+
+def test_find_matching_card_does_not_confuse_same_title_different_location(wired_selectors):
+    cards = [FakeCard(None, "Sorter", "Brampton"), FakeCard(None, "Sorter", "Ottawa")]
+    page = FakePage(cards)
+    found = site_selectors.find_matching_card(page, Shift(title="Sorter", location="Ottawa"))
+    assert found is cards[1]
+
+
+def test_extract_shifts_makes_relative_hrefs_absolute(wired_selectors):
+    """page.goto() needs an absolute URL; cards carry hrefs like '/job/123'."""
+    page = FakePage(
+        [FakeCard("JOB-1", "Sorter", "Brampton", href="/app#/jobDetail?jobId=JOB-1")],
+        url="https://hiring.amazon.ca/app#/jobSearch",
+    )
+    shifts = site_selectors.extract_shifts(page)
+    assert shifts[0].url == "https://hiring.amazon.ca/app#/jobDetail?jobId=JOB-1"
+
+
+def test_extract_shifts_reads_all_fields(wired_selectors):
+    page = FakePage([FakeCard("JOB-1", "Sorter", "Brampton")])
+    shifts = site_selectors.extract_shifts(page)
+    assert len(shifts) == 1
+    assert shifts[0].id == "JOB-1"
+    assert shifts[0].title == "Sorter"
+    assert shifts[0].location == "Brampton"
+    assert shifts[0].url is None  # no anchor on the card
+
+
+def test_extract_shifts_refuses_to_run_on_placeholder_selectors():
+    with pytest.raises(RuntimeError, match="job_card"):
+        site_selectors.extract_shifts(FakePage([]))
+
+
+def test_hold_shift_refuses_when_selectors_are_placeholders():
+    ok, message = site_selectors.hold_shift(FakePage([]), Shift(title="x"))
+    assert not ok
+    assert "not configured" in message

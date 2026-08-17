@@ -1,0 +1,116 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Amazon Shift Auto-Applier — configuration
+#
+# Safe by default. Leave dry_run: true until you have watched it run for a
+# while and trust what it is doing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# When true: detect + alert + log only. No clicking, ever.
+# When false: it will click through to hold a slot, but always stops before
+# the final submit button (see hold.stop_before_submit).
+dry_run: true
+
+site:
+  base_url: "https://hiring.amazon.ca"
+  # The page the watcher reloads in `dom` mode, and opens in `api` mode only
+  # once a match is found.
+  job_search_url: "https://hiring.amazon.ca/app#/jobSearch"
+
+polling:
+  # dom = reload the page and scrape rendered HTML (slower, no setup)
+  # api = hit the site's own JSON endpoint directly (much faster, needs the
+  #       `api:` block below filled in via api_sniffer.py)
+  mode: dom
+
+  interval_seconds: 20
+  # Random 0..jitter_seconds added to each interval so the traffic pattern
+  # is not a metronome.
+  jitter_seconds: 8
+
+  # Circuit breaker: after this many consecutive failures, sleep for
+  # cooldown_seconds before trying again.
+  max_consecutive_errors: 5
+  cooldown_seconds: 180
+
+browser:
+  headless: true
+  # Written by save_session.py. Contains your logged-in cookies — gitignored.
+  storage_state: "auth_state.json"
+  nav_timeout_ms: 30000
+  action_timeout_ms: 10000
+  # null = use Playwright's default. Set a string to override.
+  user_agent: null
+  locale: "en-CA"
+  timezone: "America/Toronto"
+  # null = use the Chromium that `playwright install` downloaded. Set a path
+  # only if you need a specific browser binary.
+  executable_path: null
+
+# ── api mode ────────────────────────────────────────────────────────────────
+# Fill these in from a capture in api_captures/ after running:
+#   python api_sniffer.py
+api:
+  # e.g. "https://e5mquma77feepi2bdn4d6h3mpu.appsync-api.us-east-1.amazonaws.com/graphql"
+  endpoint_url: null
+  method: "POST"
+  # Request body for POST (dict -> sent as JSON), or query params for GET.
+  payload: null
+  # Dotted path into the JSON response where the list of shifts lives.
+  # Supports list indexes: "data.results.0.jobCards"
+  shifts_path: "data.searchJobCardsByLocation.jobCards"
+  # Maps our Shift fields <- keys in each item of that list.
+  # Values may themselves be dotted paths.
+  field_map:
+    id: "jobId"
+    title: "jobTitle"
+    location: "locationName"
+    schedule: "scheduleText"
+    pay_rate: "totalPayRateMin"
+    url: null
+  # If the API only gives an id, build the URL from it. {id} is substituted.
+  url_template: "https://hiring.amazon.ca/app#/jobDetail?jobId={id}"
+  # Extra request headers captured by api_sniffer.
+  # WARNING: if this needs an `authorization` / bearer token, that token will
+  # expire (unlike cookies). See PROJECT_CONTEXT.md.
+  extra_headers: {}
+
+# ── What counts as a shift you want ─────────────────────────────────────────
+# All string matching is case-insensitive substring matching.
+# Empty include_* list = "anything passes".
+filters:
+  include_titles: []
+  exclude_titles: []
+  include_locations: []
+  exclude_locations: []
+  include_schedules: []
+  exclude_schedules: []
+  min_pay_rate: null
+
+notifications:
+  telegram:
+    enabled: true
+    # Attach a screenshot of the held shift (dom mode / after hold only).
+    screenshot: true
+  notify_on_start: true
+  notify_on_error: true
+
+hold:
+  # Click through to hold the slot once a match is found.
+  # Ignored entirely when dry_run is true.
+  enabled: true
+  # NEVER click the final submit button. You finish the application by hand.
+  # Setting this to false enables fully automated booking — only do that
+  # deliberately, once you fully trust the selectors.
+  stop_before_submit: true
+
+state:
+  path: "state/seen_shifts.json"
+  # Forget a shift id after this long, so a genuinely re-posted shift
+  # can alert again.
+  ttl_hours: 72
+
+logging:
+  level: "INFO"
+  path: "logs/watcher.log"
+  max_bytes: 2000000
+  backup_count: 3
