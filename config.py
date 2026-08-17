@@ -64,6 +64,11 @@ DEFAULTS: dict[str, Any] = {
         "field_map": {},
         "url_template": None,
         "extra_headers": {},
+        # The endpoint 401s without an authorization token that the page mints
+        # and rotates. Harvest it live rather than pasting a copy that dies.
+        "auth_from_page": True,
+        "auth_header": "authorization",
+        "auth_storage_key": "sessionToken",
     },
     "filters": {},
     "notifications": {
@@ -174,6 +179,15 @@ def validate_config(cfg: dict) -> None:
         raise ValueError(
             "polling.interval_seconds below 5 is abusive to the site and will "
             "get you rate-limited or blocked"
+        )
+
+    if mode == "dom" and polling["interval_seconds"] < 30:
+        # dom polls are full page loads. Measured: a 403 at ~14s apart.
+        log.warning(
+            "polling.interval_seconds=%s is risky in dom mode — a CloudFront "
+            "403 was observed at ~14s between page loads. 45 is the tested "
+            "value; the faster settings are for api mode.",
+            polling["interval_seconds"],
         )
 
     hot = polling["hot_interval_seconds"]

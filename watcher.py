@@ -29,6 +29,7 @@ from playwright.sync_api import sync_playwright
 import browser_launch
 import site_selectors
 from api_client import ApiClient
+from auth_token import TokenSource
 import drop_report
 from config import (
     in_hot_window,
@@ -81,6 +82,7 @@ class Watcher:
         self.context = None
         self.page = None
         self.api_client: ApiClient | None = None
+        self.token_source = None
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def request_stop(self, signum, _frame) -> None:
@@ -116,7 +118,7 @@ class Watcher:
             self.context.set_default_navigation_timeout(browser_cfg["nav_timeout_ms"])
 
             if self.mode == "api":
-                self.api_client = ApiClient(self.context.request, self.cfg["api"])
+                self._start_api_mode(browser_cfg)
             else:
                 # dom mode keeps one page open and reloads it each poll.
                 self.page = (
@@ -136,6 +138,49 @@ class Watcher:
             self.polls, self.alerts, len(self.state),
         )
         return 0
+
+    def _start_api_mode(self, browser_cfg: dict) -> None:
+        """Set up JSON polling, and the live token it needs.
+
+        A page is opened even though api mode does not scrape one: the endpoint
+        401s without an `authorization` token, and that token is minted by the
+        page's own JavaScript and rotates. Keeping a page open is what makes a
+        *fresh* token available on every poll instead of a pasted one that dies
+        silently. It is also the page the hold flow will use later, so it is not
+        wasted either way.
+        """
+        api_cfg = self.cfg["api"]
+        token_source = None
+
+        if api_cfg.get("auth_from_page", True):
+            page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            self.page = page
+            token_source = TokenSource(
+                page,
+                endpoint_url=api_cfg["endpoint_url"],
+                header=api_cfg.get("auth_header", "authorization"),
+                storage_key=api_cfg.get("auth_storage_key"),
+                reload_url=self.cfg["site"]["job_search_url"],
+                settle_ms=self.cfg["polling"].get("render_wait_ms", 5000),
+            )
+            page.goto(self.cfg["site"]["job_search_url"], wait_until="domcontentloaded")
+            page.wait_for_timeout(self.cfg["polling"].get("render_wait_ms", 5000))
+            if token_source.current():
+                log.info("captured a live auth token from the page")
+            else:
+                log.warning(
+                    "no auth token seen yet — if the endpoint needs one, the "
+                    "first poll will 401 and refresh it"
+                )
+
+        self.token_source = token_source
+        self.api_client = ApiClient(
+            self.context.request,
+            api_cfg,
+            timeout_ms=self.cfg["browser"]["action_timeout_ms"],
+            token_provider=token_source.current if token_source else None,
+            on_unauthorized=token_source.refresh if token_source else None,
+        )
 
     def _announce_start(self) -> None:
         mode_note = "DRY RUN — detect and alert only" if self.dry_run else (

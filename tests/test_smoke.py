@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import api_client
+import auth_token
 import browser_launch
 import config as config_mod
 import drop_report
@@ -512,11 +513,25 @@ def test_no_results_selector_is_configured_from_the_live_site():
 
 
 def test_polling_defaults_are_conservative_enough_for_the_waf():
+    """The floor depends on what a poll costs. A dom poll is a full page load
+    and a live test got CloudFront-blocked at ~14s between them; an api poll is
+    one small JSON request, measured at ~440ms and run at 8s apart without a
+    block. So the shipped numbers are only safe *for the shipped mode*."""
     cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
-    assert cfg["polling"]["interval_seconds"] >= 30, (
-        "a live test got CloudFront-blocked at ~14s between page loads"
-    )
+    floor = 30 if cfg["polling"]["mode"] == "dom" else 10
+    assert cfg["polling"]["interval_seconds"] >= floor
     assert cfg["polling"]["render_wait_ms"] >= 1000
+
+
+def test_dom_mode_warns_when_the_api_mode_cadence_is_left_behind(caplog):
+    """Switching mode back to dom without raising the interval is the easy
+    mistake, and it is the one that gets you WAF-blocked."""
+    cfg = config_mod._deep_merge(
+        config_mod.DEFAULTS, {"polling": {"mode": "dom", "interval_seconds": 20}}
+    )
+    with caplog.at_level("WARNING"):
+        config_mod.validate_config(cfg)
+    assert any("dom mode" in r.getMessage() for r in caplog.records)
 
 
 def test_shipped_config_defaults_to_settings_that_survive_login():
@@ -936,3 +951,194 @@ def test_go_hot_never_shortens_an_existing_hot_period(tmp_path):
     w.hot_until = time.time() + 600
     w.go_hot()
     assert w.hot_until > time.time() + 500
+
+
+# ── api auth: the token that rotates ────────────────────────────────────────
+class FakeResponse:
+    def __init__(self, status=200, payload=None):
+        self.status = status
+        self.ok = 200 <= status < 300
+        self._payload = payload if payload is not None else {"cards": []}
+
+    def json(self):
+        return self._payload
+
+    def text(self):
+        return "body"
+
+
+class FakeRequestContext:
+    """Records the headers of every call and replays a scripted response."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def post(self, url, data=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "data": data, "headers": headers or {}})
+        return self.responses.pop(0) if self.responses else FakeResponse()
+
+    get = post
+
+
+API_CFG = {
+    "endpoint_url": "https://hiring.amazon.ca/graphql",
+    "method": "POST",
+    "payload": {"q": 1},
+    "shifts_path": "cards",
+    "field_map": {"id": "jobId", "title": "jobTitle"},
+}
+
+
+def test_token_provider_supplies_the_auth_header():
+    ctx = FakeRequestContext([FakeResponse(200, {"cards": [{"jobId": "1", "jobTitle": "A"}]})])
+    client = api_client.ApiClient(ctx, API_CFG, token_provider=lambda: "tok-abc")
+    assert client.fetch_shifts()[0].id == "1"
+    assert ctx.calls[0]["headers"]["authorization"] == "tok-abc"
+
+
+def test_a_401_refreshes_the_token_and_retries_once():
+    """The token rotates. Without this, expiry looks exactly like 'no shifts
+    today' — a silent outage, which is the worst failure this tool can have."""
+    tokens = iter(["stale", "fresh"])
+    current = {"tok": next(tokens)}
+    refreshed = []
+
+    def refresh():
+        current["tok"] = next(tokens)
+        refreshed.append(True)
+
+    ctx = FakeRequestContext([
+        FakeResponse(401),
+        FakeResponse(200, {"cards": [{"jobId": "9", "jobTitle": "Sorter"}]}),
+    ])
+    client = api_client.ApiClient(
+        ctx, API_CFG, token_provider=lambda: current["tok"], on_unauthorized=refresh
+    )
+
+    shifts = client.fetch_shifts()
+    assert [s.id for s in shifts] == ["9"]
+    assert refreshed, "a 401 must trigger a token refresh"
+    assert ctx.calls[0]["headers"]["authorization"] == "stale"
+    assert ctx.calls[1]["headers"]["authorization"] == "fresh"
+
+
+def test_a_second_401_gives_up_instead_of_looping():
+    ctx = FakeRequestContext([FakeResponse(401), FakeResponse(401)])
+    client = api_client.ApiClient(
+        ctx, API_CFG, token_provider=lambda: "t", on_unauthorized=lambda: None
+    )
+    with pytest.raises(api_client.Unauthorized):
+        client.fetch_shifts()
+    assert len(ctx.calls) == 2  # one retry, not a retry storm
+
+
+def test_a_500_is_not_treated_as_an_auth_problem():
+    ctx = FakeRequestContext([FakeResponse(500)])
+    refreshed = []
+    client = api_client.ApiClient(
+        ctx, API_CFG, token_provider=lambda: "t",
+        on_unauthorized=lambda: refreshed.append(True),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        client.fetch_shifts()
+    assert not isinstance(excinfo.value, api_client.Unauthorized)
+    assert not refreshed
+
+
+class FakeTokenPage:
+    """Just enough page to exercise TokenSource without a browser."""
+
+    def __init__(self, storage=None):
+        self.handlers = {}
+        self.storage = storage or {}
+        self.reloads = 0
+        self.gotos = []
+
+    def on(self, event, handler):
+        self.handlers[event] = handler
+
+    def fire_request(self, url, headers):
+        self.handlers["request"](FakeRequest(url, headers))
+
+    def evaluate(self, _script, key=None):
+        return self.storage.get(key)
+
+    def reload(self, **_kwargs):
+        self.reloads += 1
+
+    def goto(self, url, **_kwargs):
+        self.gotos.append(url)
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+
+class FakeRequest:
+    def __init__(self, url, headers):
+        self.url = url
+        self._headers = headers
+
+    def all_headers(self):
+        return self._headers
+
+
+def test_token_is_harvested_off_the_page_s_own_requests():
+    """Whatever the site's JS does to mint a token, it has to put the result on
+    the wire — so watching requests needs no knowledge of its internals."""
+    page = FakeTokenPage()
+    source = auth_token.TokenSource(page, endpoint_url="https://hiring.amazon.ca/graphql")
+    assert source.current() is None
+
+    page.fire_request("https://hiring.amazon.ca/graphql", {"authorization": "tok-1"})
+    assert source.current() == "tok-1"
+
+    page.fire_request("https://hiring.amazon.ca/graphql", {"authorization": "tok-2"})
+    assert source.current() == "tok-2", "the newest token wins"
+
+
+def test_unrelated_requests_do_not_clobber_the_token():
+    page = FakeTokenPage()
+    source = auth_token.TokenSource(page, endpoint_url="https://hiring.amazon.ca/graphql")
+    page.fire_request("https://hiring.amazon.ca/graphql", {"authorization": "tok-1"})
+    page.fire_request("https://telemetry.example.com/x", {"authorization": "somebody-elses"})
+    assert source.current() == "tok-1"
+
+
+def test_local_storage_wins_when_it_has_a_value():
+    """The page updates storage on rotation; our captured header is only as new
+    as the last request the page happened to make."""
+    page = FakeTokenPage(storage={"sessionToken": "from-storage"})
+    source = auth_token.TokenSource(
+        page, endpoint_url="https://hiring.amazon.ca/graphql", storage_key="sessionToken"
+    )
+    page.fire_request("https://hiring.amazon.ca/graphql", {"authorization": "older"})
+    assert source.current() == "from-storage"
+
+
+def test_refresh_reloads_the_page_that_mints_tokens():
+    page = FakeTokenPage(storage={"sessionToken": "t"})
+    source = auth_token.TokenSource(
+        page,
+        endpoint_url="https://hiring.amazon.ca/graphql",
+        storage_key="sessionToken",
+        reload_url="https://hiring.amazon.ca/app#/jobSearch",
+    )
+    assert source.refresh() == "t"
+    assert page.gotos == ["https://hiring.amazon.ca/app#/jobSearch"]
+
+
+def test_a_broken_request_event_cannot_disturb_polling():
+    """This handler runs on Playwright's event thread; an exception there must
+    not be able to take down the watcher."""
+    page = FakeTokenPage()
+    source = auth_token.TokenSource(page, endpoint_url="https://hiring.amazon.ca/graphql")
+
+    class Exploding:
+        url = "https://hiring.amazon.ca/graphql"
+
+        def all_headers(self):
+            raise RuntimeError("boom")
+
+    page.handlers["request"](Exploding())  # must not raise
+    assert source.current() is None

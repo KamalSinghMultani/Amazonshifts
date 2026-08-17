@@ -17,9 +17,11 @@ list, and copy its details into the `api:` block of config.yaml.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,8 +41,24 @@ def _slug(url: str, index: int) -> str:
     return f"{index:03d}-{tail or 'request'}"
 
 
-def main() -> int:
-    cfg = load_config()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Discover the site's JSON endpoint")
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="capture for this long and exit, instead of waiting for Enter. "
+             "The job list loads by itself, so this needs no browsing.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="only useful with --seconds — there is nothing to watch",
+    )
+    args = parser.parse_args(argv)
+
+    cfg = load_config(args.config)
     site = cfg["site"]
     browser_cfg = cfg["browser"]
     storage = Path(browser_cfg["storage_state"])
@@ -49,14 +67,17 @@ def main() -> int:
     captures: list[dict] = []
 
     print(f"Captures will be written to {OUT_DIR}/")
-    print("Browse the site normally — search jobs, change filters.")
-    print("Press Enter in this terminal when you are done.\n")
+    if args.seconds is None:
+        print("Browse the site normally — search jobs, change filters.")
+        print("Press Enter in this terminal when you are done.\n")
+    else:
+        print(f"Capturing for {args.seconds:.0f}s, no interaction needed.\n")
 
     with sync_playwright() as playwright:
         browser, context = browser_launch.launch_context(
             playwright,
             browser_cfg,
-            headless=False,
+            headless=bool(args.headless and args.seconds is not None),
             storage_state=str(storage) if storage.exists() else None,
         )
 
@@ -113,10 +134,16 @@ def main() -> int:
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(site["job_search_url"], timeout=browser_cfg["nav_timeout_ms"])
 
-        try:
-            input("\nPress Enter when done capturing… ")
-        except (EOFError, KeyboardInterrupt):
-            pass
+        if args.seconds is not None:
+            # The results list fetches itself on load, so waiting is enough.
+            deadline = time.monotonic() + args.seconds
+            while time.monotonic() < deadline:
+                page.wait_for_timeout(500)
+        else:
+            try:
+                input("\nPress Enter when done capturing… ")
+            except (EOFError, KeyboardInterrupt):
+                pass
 
         browser_launch.close_context(browser, context)
 

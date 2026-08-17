@@ -21,6 +21,10 @@ from shift_matcher import Shift
 log = logging.getLogger(__name__)
 
 
+class Unauthorized(RuntimeError):
+    """The endpoint rejected our token. Recoverable: mint a new one and retry."""
+
+
 def dig(payload: Any, path: str) -> Any:
     """Walk a dotted path into nested dicts/lists.
 
@@ -81,9 +85,28 @@ def parse_shifts(
 
 
 class ApiClient:
-    """Polls the JSON endpoint using the browser context's cookies."""
+    """Polls the JSON endpoint using the browser context's cookies.
 
-    def __init__(self, request_context, api_cfg: dict, timeout_ms: int = 15000) -> None:
+    Cookies alone are not enough on hiring.amazon.*: the graphql endpoint
+    returns 401 without an `authorization` header, and that token is minted by
+    the page's own JavaScript and rotates. Pasting one into config.yaml works
+    for a while and then silently stops — the exact failure the sniffer warns
+    about.
+
+    So the token is never stored. `token_provider` is a callable that returns
+    the current one straight from a live browser page, and `on_unauthorized`
+    mints a fresh one when a poll comes back 401. That turns token expiry from
+    a silent outage into a single retried poll.
+    """
+
+    def __init__(
+        self,
+        request_context,
+        api_cfg: dict,
+        timeout_ms: int = 15000,
+        token_provider=None,
+        on_unauthorized=None,
+    ) -> None:
         self.request = request_context
         self.endpoint_url = api_cfg["endpoint_url"]
         self.method = str(api_cfg.get("method", "POST")).upper()
@@ -92,12 +115,37 @@ class ApiClient:
         self.field_map = api_cfg.get("field_map") or {}
         self.url_template = api_cfg.get("url_template")
         self.extra_headers = api_cfg.get("extra_headers") or {}
+        self.auth_header = api_cfg.get("auth_header") or "authorization"
         self.timeout_ms = timeout_ms
+        self.token_provider = token_provider
+        self.on_unauthorized = on_unauthorized
+
+    def _headers(self) -> dict:
+        headers = {"accept": "application/json", **self.extra_headers}
+        if self.token_provider:
+            token = self.token_provider()
+            if token:
+                headers[self.auth_header] = token
+            else:
+                log.warning("no auth token available for this poll")
+        return headers
 
     def fetch_shifts(self) -> list[Shift]:
         """One poll. Raises on transport/HTTP failure so the watcher's circuit
         breaker can count it."""
-        headers = {"accept": "application/json", **self.extra_headers}
+        try:
+            return self._fetch_once()
+        except Unauthorized:
+            if not self.on_unauthorized:
+                raise
+            # The token rotated out from under us. Mint a new one and take one
+            # more shot before giving up — a rotation is routine, not an error.
+            log.info("token rejected (401) — refreshing it and retrying once")
+            self.on_unauthorized()
+            return self._fetch_once()
+
+    def _fetch_once(self) -> list[Shift]:
+        headers = self._headers()
 
         if self.method == "GET":
             response = self.request.get(
@@ -120,6 +168,8 @@ class ApiClient:
                 body = response.text()[:300]
             except Exception:  # noqa: BLE001 - body is diagnostics only
                 pass
+            if response.status in (401, 403):
+                raise Unauthorized(f"API returned {response.status}: {body}")
             raise RuntimeError(f"API returned {response.status}: {body}")
 
         try:

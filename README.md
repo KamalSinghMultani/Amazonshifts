@@ -51,7 +51,12 @@ session expires.
 
 ### 2. Fill in the selectors
 
-`site_selectors.py` ships with placeholders. Get the real ones:
+**Detection needs none of this** — the default `api` mode reads the JSON endpoint
+and the detection selectors are already filled in from the live site. This step is
+for *holding* a slot, which means clicking real buttons, and for the `dom`
+fallback. You can skip it until you've watched it detect for a while.
+
+`site_selectors.py` still has placeholders for the apply flow. Get the real ones:
 
 ```bash
 python -m playwright codegen --load-storage=auth_state.json https://hiring.amazon.ca/app#/jobSearch
@@ -93,36 +98,67 @@ Watch it for a while in dry run. When the alerts look right, set `dry_run: false
 
 Set `polling.mode` in `config.yaml`.
 
-### `dom` (default)
-
-Reloads the job search page each poll and scrapes the rendered HTML. Needs no
-setup beyond the selectors, but a page load costs seconds — and seconds are the
-whole game against bots that grab shifts in under one.
-
-### `api` (faster)
+### `api` (default)
 
 Calls the JSON endpoint the page itself calls, through Playwright's
-`context.request`, which reuses your session cookies automatically. Measured at
-~60ms per poll versus seconds for a page load. The browser page is only opened
-once a match is found, and **the Telegram alert is sent before that happens** —
-so you hear about the shift at the moment the bot does, not after it finishes
-navigating.
+`context.request`, which reuses your session cookies automatically.
 
-To set it up:
+**Measured side by side against the live site, 2026-08-17:**
 
-```bash
-python api_sniffer.py
+| | `dom` | `api` |
+|---|---|---|
+| Time per poll | 5,697–6,127 ms | **234–769 ms** |
+| Jobs returned | 25 | **99** |
+| Amazon's real `jobId` | no | **yes** |
+
+Two things to notice. It is ~10x faster — and `dom`'s 25 was never the whole
+truth, just the one page of results the UI had rendered. Scraping was blind to
+three quarters of the listings. The real `jobId` also makes dedup exact, where
+the DOM fallback hashes title+location and can collide between two genuinely
+different openings at the same warehouse.
+
+Sustained live run: 15 consecutive polls at ~440ms, 8-10s apart, no rate limit
+and no WAF block.
+
+#### The authorization token
+
+The endpoint returns **401 with cookies alone** — it needs an `authorization`
+header that the page's own JavaScript mints and rotates. A token pasted into
+`config.yaml` would work for a while and then silently start 401ing, which looks
+exactly like "no shifts today".
+
+So none is stored. The watcher keeps a page open, reads the token that page is
+already using, and on a 401 reloads once to mint a fresh one and retries the
+poll. Nothing to paste, nothing to expire:
+
+```yaml
+api:
+  auth_from_page: true
+  auth_header: "authorization"
+  auth_storage_key: "sessionToken"
 ```
 
-Browse the site normally in the window that opens. Every JSON request is logged
-to `api_captures/`; start with `api_captures/index.md`, find the one carrying the
-job list, and copy its URL, method, body, and headers into the `api:` block of
-`config.yaml`. Then set `polling.mode: api`.
+#### If the endpoint moves
 
-> ⚠️ If that request needs an `authorization: Bearer …` header, note that tokens
-> expire and rotate — unlike cookies, which Playwright refreshes for you. A pasted
-> token works for a while and then starts returning 401. The sniffer flags any
-> request where it sees one. If you hit this, `dom` mode is the reliable fallback.
+```bash
+python api_sniffer.py --seconds 20 --headless   # unattended
+python api_sniffer.py                           # or browse it yourself
+```
+
+Every JSON request is logged to `api_captures/`; start with `index.md`, find the
+one carrying the job list, and copy its URL, method, and body into the `api:`
+block. Tokens and cookies are redacted in what gets written to disk.
+
+### `dom` (fallback)
+
+Reloads the job search page each poll and scrapes the rendered HTML. Slower and
+partially blind, but it depends on nothing except the selectors — so it is what
+you fall back to if Amazon changes the API.
+
+**If you switch to `dom`, raise `interval_seconds` to 45 first.** The shipped
+value is tuned for API polling; a full page load every 20s risks the CloudFront
+403 that a live test already triggered at ~14s. The watcher warns you at startup
+if you forget.
 
 `api` mode can detect shifts without any selectors configured — but holding a slot
 still needs them, since holding means clicking real buttons.
@@ -311,14 +347,16 @@ keeping:
 
 | File | Purpose |
 |---|---|
-| `watcher.py` | Main loop, circuit breaker, CLI |
-| `config.py` | Config loading, defaults, validation, logging setup |
+| `watcher.py` | Main loop, hot mode, circuit breaker, CLI |
+| `config.py` | Config loading, defaults, validation, hot-window parsing, logging |
 | `config.yaml` | All settings |
 | `site_selectors.py` | Every CSS selector + the DOM click flow |
 | `api_client.py` | JSON endpoint polling and parsing |
 | `api_sniffer.py` | Discovers that endpoint |
+| `auth_token.py` | Keeps a live `authorization` token; refreshes it on 401 |
+| `drop_report.py` | Turns the detection log into suggested `hot_windows` |
 | `shift_matcher.py` | `Shift` model, stable ids, filter matching |
-| `state_store.py` | Persistent "already alerted" set |
+| `state_store.py` | Persistent "already alerted" set + the detection log |
 | `notifier.py` | Telegram, with retry/backoff |
 | `save_session.py` | One-time manual login |
 | `tests/test_smoke.py` | The test suite |
@@ -328,9 +366,15 @@ keeping:
 
 ## Status
 
-Verified end-to-end against a local mock server (both modes, with a real browser).
-**Not yet run against hiring.amazon.ca** — see `PROJECT_CONTEXT.md` for exactly
-what remains.
+**Detection is verified against the live site.** Both modes were run against
+hiring.amazon.* on 2026-08-17: `api` returned 99 real jobs in 234–769 ms with a
+live-harvested token, `dom` scraped 25 cards in ~6s, dedup held across polls, and
+the "no jobs posted" case was correctly distinguished from broken selectors.
+
+**Still unproven:** holding a slot. The last two steps of the apply flow can only
+be captured against a job you actually intend to take, so they remain placeholders
+and the watcher refuses to click until they're filled in. Telegram also needs a
+token in `.env` before any alert leaves the machine. See `PROJECT_CONTEXT.md`.
 
 Use this for your own applications, at a polite polling rate. It exists to put you
 on even footing with the paid snipers, not to hammer the site.

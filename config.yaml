@@ -17,25 +17,29 @@ site:
   job_search_url: "https://hiring.amazon.ca/app#/jobSearch"
 
 polling:
-  # dom = reload the page and scrape rendered HTML (slower, no setup)
-  # api = hit the site's own JSON endpoint directly (much faster, needs the
-  #       `api:` block below filled in via api_sniffer.py)
-  mode: dom
+  # api = hit the site's own JSON endpoint directly  <- default, and much faster
+  # dom = reload the page and scrape rendered HTML   <- fallback if the API moves
+  #
+  # Measured side by side on the live site, 2026-08-17:
+  #     dom  5,697–6,127 ms/poll, 25 jobs
+  #     api    234–769 ms/poll,   99 jobs
+  # dom's 25 is one rendered page of results, not the whole listing — so dom
+  # was never seeing three quarters of the jobs. api also returns Amazon's real
+  # jobId, which makes dedup exact.
+  mode: api
 
   # ⚠️ Amazon fronts this site with a CloudFront WAF that WILL block you.
-  # Measured against the live site: three full page loads about 14s apart
-  # returned "403 ERROR / Request blocked" on the third.
+  # Measured: three full page loads about 14s apart returned "403 ERROR /
+  # Request blocked" on the third. A blocked watcher finds nothing at all, so
+  # a block costs far more than a slow poll ever does.
   #
-  # 45s ± 20s is a deliberately conservative starting point. Lower it only
-  # while watching the logs — a block costs you far more than a slower poll,
-  # because a blocked watcher finds nothing at all.
-  #
-  # `api` mode is much lighter on the WAF (one JSON request per poll instead
-  # of a full page load with every asset), so it tolerates faster polling.
-  interval_seconds: 45
+  # These values are tuned for `api` mode, where a poll is one small JSON
+  # request rather than a page load with every asset.
+  # ⚠️ IF YOU SWITCH BACK TO dom MODE, raise this to 45 first.
+  interval_seconds: 20
   # Random 0..jitter_seconds added to each interval so the traffic pattern
   # is not a metronome.
-  jitter_seconds: 20
+  jitter_seconds: 10
 
   # ── Hot mode ────────────────────────────────────────────────────────────
   # Amazon posts shifts in BATCHES: the moment one appears, the next is
@@ -47,7 +51,7 @@ polling:
   # Two triggers, either is enough:
   #   * a match just happened     -> hot for hot_duration_seconds
   #   * the clock is in a window  -> hot for as long as the window lasts
-  hot_interval_seconds: 20
+  hot_interval_seconds: 8
   hot_duration_seconds: 120
 
   # Times of day that are ALWAYS hot, in your local time. May wrap midnight
@@ -110,32 +114,98 @@ browser:
   stealth: true
 
 # ── api mode ────────────────────────────────────────────────────────────────
-# Fill these in from a capture in api_captures/ after running:
-#   python api_sniffer.py
+# CONFIRMED live 2026-08-17 against the same frontend. Measured side by side:
+#
+#     dom:  5,697–6,127 ms per poll,  25 jobs
+#     api:    501–769 ms per poll,    99 jobs   <- 10x faster, 4x the coverage
+#
+# The 25 was never the truth: it is one rendered page of results. The API also
+# returns Amazon's real jobId, which makes dedup exact instead of a hash of
+# title+location that collides between two openings at the same warehouse.
+#
+# Re-discover any of this with: python api_sniffer.py --seconds 20 --headless
 api:
-  # e.g. "https://e5mquma77feepi2bdn4d6h3mpu.appsync-api.us-east-1.amazonaws.com/graphql"
-  endpoint_url: null
+  endpoint_url: "https://hiring.amazon.ca/graphql"
   method: "POST"
-  # Request body for POST (dict -> sent as JSON), or query params for GET.
-  payload: null
+
+  # The site's own query, trimmed to the fields we use — a smaller response is
+  # a faster one. pageSize 100 is what the site itself asks for.
+  payload:
+    operationName: "searchJobCardsByLocation"
+    variables:
+      searchJobRequest:
+        locale: "en-CA"
+        country: "Canada"
+        keyWords: ""
+        equalFilters: []
+        containFilters:
+          - key: "isPrivateSchedule"
+            val: ["false"]
+        rangeFilters: []
+        orFilters: []
+        # No dateFilters on purpose: the site pins today's date here, which
+        # would silently rot in a config file at the next midnight.
+        dateFilters: []
+        sorters: []
+        pageSize: 100
+        consolidateSchedule: true
+    query: |
+      query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+        searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+          nextToken
+          jobCards {
+            jobId
+            jobTitle
+            locationName
+            city
+            state
+            jobType
+            employmentType
+            totalPayRateMin
+            totalPayRateMax
+            scheduleCount
+            __typename
+          }
+          __typename
+        }
+      }
+
   # Dotted path into the JSON response where the list of shifts lives.
   # Supports list indexes: "data.results.0.jobCards"
   shifts_path: "data.searchJobCardsByLocation.jobCards"
+
   # Maps our Shift fields <- keys in each item of that list.
-  # Values may themselves be dotted paths.
+  # `schedule` is jobType (PART_TIME / FULL_TIME); employmentType carries
+  # Regular vs Seasonal and is still in Shift.raw if you want to filter on it.
   field_map:
     id: "jobId"
     title: "jobTitle"
     location: "locationName"
-    schedule: "scheduleText"
+    schedule: "jobType"
     pay_rate: "totalPayRateMin"
     url: null
+
   # If the API only gives an id, build the URL from it. {id} is substituted.
   url_template: "https://hiring.amazon.ca/app#/jobDetail?jobId={id}"
-  # Extra request headers captured by api_sniffer.
-  # WARNING: if this needs an `authorization` / bearer token, that token will
-  # expire (unlike cookies). See PROJECT_CONTEXT.md.
-  extra_headers: {}
+
+  extra_headers:
+    country: "Canada"
+    iscanary: "false"
+    origin: "https://hiring.amazon.ca"
+    referer: "https://hiring.amazon.ca/app"
+
+  # ── the authorization token ───────────────────────────────────────────────
+  # Measured: this endpoint returns 401 with cookies alone. The token is minted
+  # by the page's JavaScript and rotates, so a value pasted here would work for
+  # a while and then silently start 401ing — which looks exactly like "no
+  # shifts today".
+  #
+  # So we never store one. With auth_from_page the watcher keeps a page open,
+  # reads the token the page itself is using, and on a 401 reloads once to mint
+  # a fresh one and retries the poll. Nothing to paste, nothing to expire.
+  auth_from_page: true
+  auth_header: "authorization"
+  auth_storage_key: "sessionToken"
 
 # ── What counts as a shift you want ─────────────────────────────────────────
 # All string matching is case-insensitive substring matching.
