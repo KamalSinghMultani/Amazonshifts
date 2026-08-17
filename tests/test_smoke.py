@@ -426,6 +426,82 @@ def test_hidden_captcha_modal_is_not_a_captcha():
     assert state == "ok"
 
 
+def test_card_selectors_are_configured_from_the_live_site():
+    """Captured from real job cards on hiring.amazon.com."""
+    assert site_selectors.SELECTORS["job_card"] == "[data-test-id='JobCard']"
+    assert site_selectors.SELECTORS["card_pay"] == "[data-test-id='jobCardPayRateText']"
+    for name in ("job_card", "card_title", "card_pay", "card_schedule", "card_location"):
+        assert name not in site_selectors.unconfigured(), name
+
+
+def test_first_two_hold_steps_are_confirmed():
+    assert site_selectors.HOLD_STEPS[0][1] == ":scope"       # card is the button
+    assert "jobDetailSelectScheduleButton" in site_selectors.HOLD_STEPS[1][1]
+
+
+class DetailPage(TextPage):
+    def __init__(self, url, marker_count=0):
+        super().__init__("", url=url)
+        self._marker_count = marker_count
+
+    def locator(self, _selector):
+        return FakeField(present=self._marker_count > 0)
+
+
+def test_detail_page_detected_from_url():
+    page = DetailPage("https://hiring.amazon.com/app#/jobDetail?jobId=JOB-US-1")
+    assert site_selectors.on_detail_page(page)
+
+
+def test_detail_page_detected_from_marker_when_url_is_opaque():
+    assert site_selectors.on_detail_page(DetailPage("https://hiring.amazon.ca/app", 1))
+
+
+def test_results_list_is_not_a_detail_page():
+    assert not site_selectors.on_detail_page(
+        DetailPage("https://hiring.amazon.ca/app#/jobSearch", 0)
+    )
+
+
+def test_hold_skips_the_card_click_when_already_on_the_detail_page(monkeypatch):
+    """Regression: api mode navigates straight to the job URL, where no cards
+    exist — attempting the card click there would always fail."""
+    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", "#submit")
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [("open job", ":scope"), ("sched", "#s")])
+    monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
+
+    clicked, searched = [], []
+
+    class Target:
+        def wait_for(self, **kw):
+            pass
+
+        def click(self, **kw):
+            clicked.append(True)
+
+    class Page:
+        url = "https://hiring.amazon.com/app#/jobDetail?jobId=X"
+
+        def locator(self, sel):
+            class L:
+                first = Target()
+
+                def count(self_inner):
+                    return 1
+            return L()
+
+        def screenshot(self, **kw):
+            pass
+
+    monkeypatch.setattr(
+        site_selectors, "find_matching_card",
+        lambda *a: searched.append(True) or None,
+    )
+    ok, msg = site_selectors.hold_shift(Page(), Shift(id="X", title="t"))
+    assert not searched, "must not hunt for a card on the detail page"
+    assert ok, msg
+
+
 def test_no_results_selector_is_configured_from_the_live_site():
     """Confirmed live: <div id="jobNotFoundContainer">. Without this, 'no jobs
     posted' and 'our selectors rotted' are indistinguishable."""
@@ -517,10 +593,15 @@ def test_module_is_not_named_selectors():
     assert hasattr(stdlib_selectors, "DefaultSelector")
 
 
-def test_placeholders_are_reported_as_unconfigured():
+def test_remaining_placeholders_are_reported():
+    """Detection selectors are captured; the final apply steps are not, because
+    capturing them would mean submitting a real application."""
     missing = site_selectors.unconfigured()
-    assert "job_card" in missing
     assert "FINAL_SUBMIT" in missing
+    assert any("pick a shift" in m for m in missing)
+    assert any("create application" in m for m in missing)
+    # ...but nothing needed for *detection* is still a placeholder.
+    assert not any(m.startswith("card_") or m == "job_card" for m in missing)
     assert not site_selectors.selectors_ready()
 
 
@@ -587,11 +668,16 @@ class FakePage:
 
 @pytest.fixture
 def wired_selectors(monkeypatch):
+    """A simple synthetic card layout, independent of Amazon's real one."""
     monkeypatch.setitem(site_selectors.SELECTORS, "job_card", ".card")
     monkeypatch.setitem(site_selectors.SELECTORS, "card_title", "#title")
     monkeypatch.setitem(site_selectors.SELECTORS, "card_location", "#loc")
     monkeypatch.setitem(site_selectors.SELECTORS, "card_schedule", "#sched")
     monkeypatch.setitem(site_selectors.SELECTORS, "card_pay", "#pay")
+    # Amazon's real cards expose neither, but the code paths still exist for
+    # sites/layouts that do.
+    monkeypatch.setitem(site_selectors.SELECTORS, "card_id_attr", "data-job-id")
+    monkeypatch.setitem(site_selectors.SELECTORS, "card_link", "a")
 
 
 def test_find_matching_card_picks_the_right_card_by_id(wired_selectors):
@@ -646,7 +732,8 @@ def test_extract_shifts_reads_all_fields(wired_selectors):
     assert shifts[0].url is None  # no anchor on the card
 
 
-def test_extract_shifts_refuses_to_run_on_placeholder_selectors():
+def test_extract_shifts_refuses_to_run_on_placeholder_selectors(monkeypatch):
+    monkeypatch.setitem(site_selectors.SELECTORS, "job_card", site_selectors.TODO)
     with pytest.raises(RuntimeError, match="job_card"):
         site_selectors.extract_shifts(FakePage([]))
 
