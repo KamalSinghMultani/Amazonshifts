@@ -25,6 +25,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+import browser_launch
 from config import load_config
 
 OUT_DIR = Path("api_captures")
@@ -52,15 +53,11 @@ def main() -> int:
     print("Press Enter in this terminal when you are done.\n")
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
+        browser, context = browser_launch.launch_context(
+            playwright,
+            browser_cfg,
             headless=False,
-            executable_path=browser_cfg.get("executable_path") or None,
-        )
-        context = browser.new_context(
             storage_state=str(storage) if storage.exists() else None,
-            user_agent=browser_cfg.get("user_agent") or None,
-            locale=browser_cfg.get("locale") or None,
-            timezone_id=browser_cfg.get("timezone") or None,
         )
 
         def on_response(response) -> None:
@@ -113,7 +110,7 @@ def main() -> int:
             print(f"[{index:03d}] {request.method} {response.url[:90]}{marker}")
 
         context.on("response", on_response)
-        page = context.new_page()
+        page = context.pages[0] if context.pages else context.new_page()
         page.goto(site["job_search_url"], timeout=browser_cfg["nav_timeout_ms"])
 
         try:
@@ -121,7 +118,7 @@ def main() -> int:
         except (EOFError, KeyboardInterrupt):
             pass
 
-        browser.close()
+        browser_launch.close_context(browser, context)
 
     _write_index(captures)
     print(f"\n{len(captures)} JSON request(s) captured in {OUT_DIR}/")

@@ -45,6 +45,10 @@ never reads them. Press Enter in the terminal when you're logged in; cookies are
 saved to `auth_state.json` and reused from then on. Re-run this whenever the
 session expires.
 
+> **If login stalls at the verification-code step**, that's Amazon's bot detection,
+> not a bug in the script. See [Login is being refused](#login-is-being-refused) below.
+> The shipped defaults already work around it.
+
 ### 2. Fill in the selectors
 
 `site_selectors.py` ships with placeholders. Get the real ones:
@@ -154,6 +158,55 @@ Ctrl-C shuts down cleanly, saving state first. Logs go to `logs/watcher.log`
   network or a bad token degrades to a log line.
 - **Session expiry** is detected by watching for a redirect to a login URL, and
   reported on Telegram.
+
+---
+
+## Troubleshooting
+
+### Login is being refused
+
+The usual symptom: the browser opens, you type your email and password fine, and
+then the **"send verification code"** step just refuses to complete. No error — it
+simply never proceeds.
+
+That's Amazon detecting an automated browser. Playwright's bundled Chromium is
+easy to spot: it sets `navigator.webdriver`, launches with `--enable-automation`,
+and starts from an empty profile with no device history, so every login looks like
+a brand new device worth challenging.
+
+Three settings under `browser:` in `config.yaml` address it, and **all three are on
+by default**:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `channel` | `"chrome"` | Drives your real installed Chrome instead of bundled Chromium. Biggest single improvement. |
+| `user_data_dir` | `"browser_profile"` | Keeps a persistent profile, so Amazon remembers the device and stops re-challenging every login. |
+| `stealth` | `true` | Removes the automation flags and hides `navigator.webdriver`. |
+
+Verified on Windows with Chrome 151: `navigator.webdriver` is `undefined`, the user
+agent is ordinary (`Chrome/151.0.0.0`, no `HeadlessChrome`), `window.chrome` is
+present, and `navigator.plugins` is populated — the same fingerprint as opening
+Chrome yourself.
+
+If it still fails:
+
+- **`Chromium distribution 'chrome' is not found`** — you don't have Chrome
+  installed. Either install it, or set `channel: null` to fall back to bundled
+  Chromium (and then run `python -m playwright install chromium`).
+- **Try `msedge`** — set `channel: "msedge"`. Edge is present on every Windows
+  install.
+- **Delete `browser_profile/` and retry.** A half-completed login can leave the
+  profile in a wedged state.
+- **Log in on the same machine in normal Chrome first.** Once Amazon trusts the
+  device, the automated profile is challenged less aggressively.
+
+None of this bypasses a CAPTCHA or logs in for you — you still type your own
+password and OTP. It stops a genuine manual login from being misread as a bot.
+
+### The watcher says it's logged out
+
+Re-run `python save_session.py`. Sessions expire; with `user_data_dir` set they
+last considerably longer, since the profile persists.
 
 ---
 

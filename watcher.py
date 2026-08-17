@@ -25,6 +25,7 @@ from pathlib import Path
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
+import browser_launch
 import site_selectors
 from api_client import ApiClient
 from config import load_config, load_dotenv, setup_logging
@@ -69,9 +70,15 @@ class Watcher:
     def run(self, once: bool = False) -> int:
         browser_cfg = self.cfg["browser"]
         storage = Path(browser_cfg["storage_state"])
-        if not storage.exists():
+        profile = browser_cfg.get("user_data_dir")
+        # Either source of session is enough: a persistent profile carries the
+        # login on its own, and does not need auth_state.json.
+        has_profile = bool(profile) and Path(profile).exists()
+        if not storage.exists() and not has_profile:
             log.error(
-                "no saved session at %s — run `python save_session.py` first", storage
+                "no saved session (looked for %s and profile %s) — "
+                "run `python save_session.py` first",
+                storage, profile or "<disabled>",
             )
             return 2
 
@@ -79,15 +86,11 @@ class Watcher:
         signal.signal(signal.SIGTERM, self.request_stop)
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                headless=browser_cfg["headless"],
-                executable_path=browser_cfg.get("executable_path") or None,
-            )
-            self.context = browser.new_context(
-                storage_state=str(storage),
-                user_agent=browser_cfg.get("user_agent") or None,
-                locale=browser_cfg.get("locale") or None,
-                timezone_id=browser_cfg.get("timezone") or None,
+            log.info("browser: %s", browser_launch.describe(browser_cfg))
+            browser, self.context = browser_launch.launch_context(
+                playwright,
+                browser_cfg,
+                storage_state=str(storage) if storage.exists() else None,
             )
             self.context.set_default_timeout(browser_cfg["action_timeout_ms"])
             self.context.set_default_navigation_timeout(browser_cfg["nav_timeout_ms"])
@@ -96,7 +99,9 @@ class Watcher:
                 self.api_client = ApiClient(self.context.request, self.cfg["api"])
             else:
                 # dom mode keeps one page open and reloads it each poll.
-                self.page = self.context.new_page()
+                self.page = (
+                    self.context.pages[0] if self.context.pages else self.context.new_page()
+                )
                 self.page.goto(self.cfg["site"]["job_search_url"])
 
             self._announce_start()
@@ -104,7 +109,7 @@ class Watcher:
                 self._loop(once=once)
             finally:
                 self.state.save()
-                browser.close()
+                browser_launch.close_context(browser, self.context)
 
         log.info(
             "stopped after %d poll(s), %d alert(s), %d shift(s) remembered",

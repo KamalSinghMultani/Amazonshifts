@@ -46,6 +46,25 @@ browser:
   # only if you need a specific browser binary.
   executable_path: null
 
+  # ── Getting past Amazon's bot detection at login ──────────────────────────
+  # If login stalls at the "send verification code" step, these are the fix.
+  # See browser_launch.py for why.
+
+  # "chrome" or "msedge" drives your REAL installed browser instead of the
+  # Chromium Playwright downloads. This is the single most effective setting —
+  # try it first if login is being refused.
+  channel: "chrome"
+
+  # Persistent profile directory. Amazon remembers the device between runs, so
+  # it stops re-challenging you on every login, and the session lasts longer.
+  # Set to null to use a fresh throwaway context each time.
+  # NOTE: this directory holds your logged-in session — it is gitignored, and
+  # should be treated as sensitive as auth_state.json.
+  user_data_dir: "browser_profile"
+
+  # Drop the automation flags and hide navigator.webdriver.
+  stealth: true
+
 # ── api mode ────────────────────────────────────────────────────────────────
 # Fill these in from a capture in api_captures/ after running:
 #   python api_sniffer.py

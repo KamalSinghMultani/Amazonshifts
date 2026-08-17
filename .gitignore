@@ -2,6 +2,7 @@
 .env
 auth_state.json
 *.storage.json
+browser_profile/
 
 # Runtime output
 logs/

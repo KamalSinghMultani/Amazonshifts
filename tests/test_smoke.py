@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import api_client
+import browser_launch
 import config as config_mod
 import site_selectors
 from notifier import TelegramNotifier
@@ -218,6 +219,122 @@ def test_dotenv_does_not_override_real_env(tmp_path, monkeypatch):
 
     assert os.environ["TELEGRAM_BOT_TOKEN"] == "from-shell"
     assert os.environ["TELEGRAM_CHAT_ID"] == "123"
+
+
+# ── browser_launch ──────────────────────────────────────────────────────────
+class FakeContext:
+    def __init__(self):
+        self.init_scripts = []
+        self.closed = False
+        self.pages = []
+
+    def add_init_script(self, script):
+        self.init_scripts.append(script)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeBrowser:
+    def __init__(self):
+        self.closed = False
+        self.new_context_kwargs = None
+
+    def new_context(self, **kwargs):
+        self.new_context_kwargs = kwargs
+        return FakeContext()
+
+    def close(self):
+        self.closed = True
+
+
+class FakeChromium:
+    def __init__(self):
+        self.launch_kwargs = None
+        self.persistent_kwargs = None
+        self.persistent_dir = None
+        self.browser = FakeBrowser()
+
+    def launch(self, **kwargs):
+        self.launch_kwargs = kwargs
+        return self.browser
+
+    def launch_persistent_context(self, user_data_dir, **kwargs):
+        self.persistent_dir = user_data_dir
+        self.persistent_kwargs = kwargs
+        return FakeContext()
+
+
+class FakePlaywright:
+    def __init__(self):
+        self.chromium = FakeChromium()
+
+
+def test_launch_uses_a_fresh_context_when_no_profile_is_configured():
+    pw = FakePlaywright()
+    browser, context = browser_launch.launch_context(
+        pw, {"user_data_dir": None, "headless": True}, storage_state="auth_state.json"
+    )
+    assert browser is pw.chromium.browser
+    assert pw.chromium.persistent_dir is None
+    assert browser.new_context_kwargs["storage_state"] == "auth_state.json"
+
+
+def test_launch_uses_a_persistent_profile_when_configured(tmp_path):
+    """A persistent profile is what stops Amazon re-challenging every login."""
+    pw = FakePlaywright()
+    profile = tmp_path / "browser_profile"
+    browser, context = browser_launch.launch_context(
+        pw, {"user_data_dir": str(profile), "headless": False}
+    )
+    assert browser is None, "persistent context owns the browser process"
+    assert pw.chromium.persistent_dir == str(profile)
+    assert profile.exists(), "profile directory should be created"
+
+
+def test_stealth_removes_automation_flags_and_webdriver():
+    pw = FakePlaywright()
+    _, context = browser_launch.launch_context(pw, {"stealth": True, "user_data_dir": None})
+    kwargs = pw.chromium.launch_kwargs
+    assert "--disable-blink-features=AutomationControlled" in kwargs["args"]
+    assert "--enable-automation" in kwargs["ignore_default_args"]
+    assert any("webdriver" in s for s in context.init_scripts)
+
+
+def test_stealth_can_be_turned_off():
+    pw = FakePlaywright()
+    _, context = browser_launch.launch_context(pw, {"stealth": False, "user_data_dir": None})
+    assert "args" not in pw.chromium.launch_kwargs
+    assert context.init_scripts == []
+
+
+def test_channel_selects_the_real_installed_browser():
+    pw = FakePlaywright()
+    browser_launch.launch_context(pw, {"channel": "chrome", "user_data_dir": None})
+    assert pw.chromium.launch_kwargs["channel"] == "chrome"
+
+
+def test_no_channel_key_means_bundled_chromium():
+    pw = FakePlaywright()
+    browser_launch.launch_context(pw, {"channel": None, "user_data_dir": None})
+    assert "channel" not in pw.chromium.launch_kwargs
+
+
+def test_close_context_closes_whichever_owns_the_process():
+    browser, context = FakeBrowser(), FakeContext()
+    browser_launch.close_context(browser, context)
+    assert browser.closed and not context.closed
+
+    context2 = FakeContext()
+    browser_launch.close_context(None, context2)  # persistent case
+    assert context2.closed
+
+
+def test_shipped_config_defaults_to_settings_that_survive_login():
+    cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    assert cfg["browser"]["channel"] == "chrome"
+    assert cfg["browser"]["user_data_dir"]
+    assert cfg["browser"]["stealth"] is True
 
 
 # ── notifier ────────────────────────────────────────────────────────────────

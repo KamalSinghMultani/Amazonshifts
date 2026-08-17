@@ -39,6 +39,11 @@ DEFAULTS: dict[str, Any] = {
         "locale": "en-CA",
         "timezone": "America/Toronto",
         "executable_path": None,
+        # See browser_launch.py — these exist to stop a legitimate manual
+        # login being misread as a bot.
+        "channel": "chrome",
+        "user_data_dir": "browser_profile",
+        "stealth": True,
     },
     "api": {
         "endpoint_url": None,
