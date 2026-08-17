@@ -275,9 +275,14 @@ def validate_config(cfg: dict) -> None:
             raise ValueError("api.method must be GET or POST")
 
     if not cfg["dry_run"] and cfg["hold"]["enabled"] and not cfg["hold"]["stop_before_submit"]:
+        # Precise, because the difference matters: it creates an application
+        # and reserves the shift, and stops. It does not fill in or submit the
+        # 7-step form behind it.
         log.warning(
-            "hold.stop_before_submit is FALSE — this bot will submit "
-            "applications with no human in the loop."
+            "LIVE HOLD ENABLED — on a match this will press Create "
+            "Application, accepting the 18+/drug-test declarations and "
+            "reserving the shift for ~3 hours. It does not fill in or submit "
+            "the application itself."
         )
 
 

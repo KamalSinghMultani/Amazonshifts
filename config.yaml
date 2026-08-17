@@ -6,9 +6,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # When true: detect + alert + log only. No clicking, ever.
-# When false: it will click through to hold a slot, but always stops before
-# the final submit button (see hold.stop_before_submit).
-dry_run: true
+# When false: it clicks through and — with hold.stop_before_submit: false —
+# presses Create Application, which reserves the shift for ~3 hours.
+#
+# LIVE as of 2026-08-17: signed in and holding enabled. Set back to true for
+# alert-only.
+dry_run: false
 
 site:
   base_url: "https://hiring.amazon.ca"
@@ -353,7 +356,7 @@ hold:
   # Either way the watcher never fills in the application itself: the
   # remaining steps involve your personal details and consents, and it stops
   # as soon as the spot is secured.
-  stop_before_submit: true
+  stop_before_submit: false
 
 state:
   path: "state/seen_shifts.json"

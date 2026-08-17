@@ -180,9 +180,25 @@ def test_parse_shifts_ignores_unknown_field_map_keys():
 # ── config ──────────────────────────────────────────────────────────────────
 def test_shipped_config_loads_and_validates():
     cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
-    assert cfg["dry_run"] is True, "shipped config must stay safe by default"
-    assert cfg["hold"]["stop_before_submit"] is True
     assert cfg["polling"]["mode"] in ("dom", "api")
+    assert cfg["state"]["path"]
+
+
+def test_a_live_config_must_have_filters_and_a_hold_cap():
+    """config.yaml is now deliberately live, so "safe by default" no longer
+    fits it. What still has to hold: a live watcher that matches everything
+    would auto-create applications on shifts across the whole country, and one
+    that holds several per poll multiplies the clicks for no benefit — you can
+    only work one shift."""
+    cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    if cfg["dry_run"]:
+        return  # nothing to guard
+
+    filters = cfg["filters"]
+    assert filters.get("include_titles"), "live + no title filter would hold anything"
+    assert filters.get("include_locations"), "live + no location filter is country-wide"
+    assert cfg["hold"]["max_per_poll"] == 1
+    assert cfg["notifications"]["max_alerts_per_poll"], "live runs need an alert cap"
 
 
 def test_defaults_fill_in_missing_sections(tmp_path):
@@ -1733,10 +1749,12 @@ def test_a_us_test_run_cannot_touch_canadian_state_or_session():
     assert us["logging"]["path"] != ca["logging"]["path"]
 
 
-def test_both_configs_are_safe_by_default():
-    for cfg in _both_configs():
-        assert cfg["dry_run"] is True
-        assert cfg["hold"]["stop_before_submit"] is True
+def test_the_testing_config_stays_safe_by_default():
+    """The US config exists to exercise the code. A test run must never start
+    a real application unless somebody deliberately edits this file."""
+    _, us = _both_configs()
+    assert us["dry_run"] is True
+    assert us["hold"]["stop_before_submit"] is True
 
 
 def test_extends_can_be_a_chain(tmp_path):

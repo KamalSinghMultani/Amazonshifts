@@ -186,9 +186,12 @@ class Watcher:
 
     def _announce_start(self) -> None:
         mode_note = "DRY RUN — detect and alert only" if self.dry_run else (
-            "LIVE — will hold slots, stopping before submit"
+            # Accuracy matters here: neither mode submits an application. One
+            # stops short of holding anything, the other reserves the slot and
+            # leaves the 7-step form to you.
+            "LIVE — walks to the consent screen but does NOT hold the slot"
             if self.cfg["hold"]["stop_before_submit"]
-            else "LIVE — FULLY AUTOMATED, will submit applications"
+            else "LIVE — will HOLD slots (presses Create Application; you finish the steps)"
         )
         polling = self.cfg["polling"]
         windows = polling.get("hot_windows") or []
