@@ -84,8 +84,47 @@ real Chromium instance:
   clicked → with `stop_before_submit: false` it did click submit → a shift not on
   the page failed cleanly instead of raising.
 
-**Nothing has been run against the real hiring.amazon.ca yet.** No network access
-to it from the build environment.
+### Live findings — 2026-08-17, first real run against hiring.amazon.ca
+
+Login now works and the session is valid. Four things were learned that changed
+the code:
+
+1. **Bot detection at login.** Playwright's bundled Chromium got as far as the
+   OTP step and then silently refused. Fixed with real Chrome (`channel`), a
+   persistent profile (`user_data_dir`), and `stealth`. Verified: `navigator.
+   webdriver` undefined, UA `Chrome/151.0.0.0`, `window.chrome` present.
+
+2. **Headless leaks `HeadlessChrome` in the UA — and CloudFront blocks on it.**
+   This is the important one. Overriding `navigator.userAgent` from JS is *not*
+   enough, because the CDN inspects the request header. `resolve_user_agent()`
+   probes the browser and strips the marker at context level.
+
+3. **The WAF is real and it bites.** Three full page loads ~14s apart returned
+   `403 ERROR / Request blocked` from CloudFront. Defaults were moved from
+   20s ± 8s to **45s ± 20s**, and a block now raises so the circuit breaker backs
+   off. Do not lower the interval without watching the logs.
+
+4. **The access token expires but self-heals.** The first load after a while
+   shows "Token expired. Try refreshing the browser." A single reload clears it —
+   verified. The watcher does that reload automatically and does not treat it as
+   an error.
+
+Also confirmed live:
+
+- `no_results` is `#jobNotFoundContainer` — now filled in, no longer a placeholder.
+- Job cards live inside `[data-test-id='jobResultContainer']` (recorded as
+  `RESULTS_CONTAINER`). The individual card selector could **not** be captured,
+  because no jobs were posted at the time.
+- The site ships a **CAPTCHA modal** (`[data-test-id='captchaModal']`), hidden in
+  the DOM on every load. Only visibility counts. Detected as its own state.
+- CSS classes are Emotion hashes (`hvh-careers-emotion-1ua2ui2`) and **will rot**.
+  Use `data-test-id` / `id` when filling in the rest.
+
+The single most important structural lesson: a WAF block, a CAPTCHA, and an
+expired token all render as a normal HTTP 200 page with zero job cards. Without
+`page_state()` classifying them, the watcher would report "no shifts available"
+forever while being completely broken. Any future change here must preserve that
+distinction.
 
 ---
 

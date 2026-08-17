@@ -25,10 +25,15 @@ DEFAULTS: dict[str, Any] = {
     },
     "polling": {
         "mode": "dom",
-        "interval_seconds": 20,
-        "jitter_seconds": 8,
+        # Raised from 20s after a live test: three page loads ~14s apart got a
+        # CloudFront "Request blocked" 403. See config.yaml for the tradeoff.
+        "interval_seconds": 45,
+        "jitter_seconds": 20,
         "max_consecutive_errors": 5,
-        "cooldown_seconds": 180,
+        "cooldown_seconds": 300,
+        # The site is a SPA; scraping right after domcontentloaded finds an
+        # empty shell.
+        "render_wait_ms": 5000,
     },
     "browser": {
         "headless": True,

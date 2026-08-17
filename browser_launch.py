@@ -42,6 +42,52 @@ Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 """
 
 
+def resolve_user_agent(playwright, browser_cfg: dict, headless: bool) -> str | None:
+    """Return a user agent that does not advertise headless Chrome.
+
+    Headless Chrome puts "HeadlessChrome" in both `navigator.userAgent` AND the
+    User-Agent request header. Amazon's CloudFront WAF blocks on it — you get a
+    "403 ERROR / Request blocked" page instead of the site. Overriding
+    navigator.userAgent from JS is not enough, because the header is what the
+    CDN actually inspects, so the UA has to be set on the context itself.
+
+    We probe the real browser for its UA rather than hardcoding a version, so
+    this keeps working as Chrome updates. Returns None when no override is
+    needed (headed mode already reports a normal UA).
+    """
+    explicit = browser_cfg.get("user_agent")
+    if explicit:
+        return explicit
+    if not headless:
+        return None
+
+    probe_kwargs: dict = {"headless": True}
+    if browser_cfg.get("channel"):
+        probe_kwargs["channel"] = browser_cfg["channel"]
+    if browser_cfg.get("executable_path"):
+        probe_kwargs["executable_path"] = browser_cfg["executable_path"]
+
+    browser = None
+    try:
+        browser = playwright.chromium.launch(**probe_kwargs)
+        user_agent = browser.new_page().evaluate("() => navigator.userAgent")
+    except Exception as exc:  # noqa: BLE001 - probing is best effort
+        log.warning("could not probe the browser user agent: %s", exc)
+        return None
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if "Headless" not in user_agent:
+        return None
+    fixed = user_agent.replace("HeadlessChrome", "Chrome")
+    log.info("overriding headless user agent so CloudFront does not block us")
+    return fixed
+
+
 def launch_context(
     playwright,
     browser_cfg: dict,
@@ -73,7 +119,7 @@ def launch_context(
         launch_kwargs["ignore_default_args"] = list(STEALTH_IGNORE_ARGS)
 
     context_kwargs = {
-        "user_agent": browser_cfg.get("user_agent") or None,
+        "user_agent": resolve_user_agent(playwright, browser_cfg, headless),
         "locale": browser_cfg.get("locale") or None,
         "timezone_id": browser_cfg.get("timezone") or None,
     }

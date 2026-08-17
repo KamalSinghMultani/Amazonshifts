@@ -22,15 +22,30 @@ polling:
   #       `api:` block below filled in via api_sniffer.py)
   mode: dom
 
-  interval_seconds: 20
+  # ⚠️ Amazon fronts this site with a CloudFront WAF that WILL block you.
+  # Measured against the live site: three full page loads about 14s apart
+  # returned "403 ERROR / Request blocked" on the third.
+  #
+  # 45s ± 20s is a deliberately conservative starting point. Lower it only
+  # while watching the logs — a block costs you far more than a slower poll,
+  # because a blocked watcher finds nothing at all.
+  #
+  # `api` mode is much lighter on the WAF (one JSON request per poll instead
+  # of a full page load with every asset), so it tolerates faster polling.
+  interval_seconds: 45
   # Random 0..jitter_seconds added to each interval so the traffic pattern
   # is not a metronome.
-  jitter_seconds: 8
+  jitter_seconds: 20
+
+  # The site is a React SPA — scraping immediately after domcontentloaded
+  # finds an empty shell. This is how long to wait for it to render.
+  render_wait_ms: 5000
 
   # Circuit breaker: after this many consecutive failures, sleep for
-  # cooldown_seconds before trying again.
+  # cooldown_seconds before trying again. A WAF block counts as a failure,
+  # so repeated blocks make the watcher back off rather than dig in.
   max_consecutive_errors: 5
-  cooldown_seconds: 180
+  cooldown_seconds: 300
 
 browser:
   headless: true

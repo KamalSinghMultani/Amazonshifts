@@ -206,17 +206,52 @@ class Watcher:
         except PlaywrightError:
             # A reload can fail on a hash-routed SPA; a fresh goto recovers it.
             self.page.goto(self.cfg["site"]["job_search_url"], wait_until="domcontentloaded")
-        self._warn_if_logged_out(self.page)
-        return site_selectors.extract_shifts(self.page)
 
-    def _warn_if_logged_out(self, page) -> None:
-        url = (page.url or "").lower()
-        if any(marker in url for marker in ("login", "signin", "sign-in")):
-            log.error("looks like the session expired — re-run save_session.py")
+        # The SPA renders after domcontentloaded; scraping immediately finds
+        # an empty shell.
+        self.page.wait_for_timeout(self.cfg["polling"].get("render_wait_ms", 5000))
+
+        state, detail = site_selectors.page_state(self.page)
+
+        if state == "stale":
+            # The access token expires quickly, but a reload refreshes it.
+            # Verified: a second load comes back clean.
+            log.info("token expired (%s) — reloading once to refresh it", detail)
+            self.page.reload(wait_until="domcontentloaded")
+            self.page.wait_for_timeout(self.cfg["polling"].get("render_wait_ms", 5000))
+            state, detail = site_selectors.page_state(self.page)
+
+        if state == "captcha":
+            # Only a human can clear this. Alert loudly rather than sitting
+            # there reporting zero shifts.
+            log.error("a CAPTCHA is on screen — this needs you (%s)", detail)
             if self.cfg["notifications"].get("notify_on_error"):
                 self.notifier.notify_error(
-                    "Session appears to have expired — re-run save_session.py"
+                    "A CAPTCHA is blocking the watcher. Run save_session.py and "
+                    "clear it by hand, or set browser.headless: false to solve it live."
                 )
+            raise RuntimeError(f"captcha challenge ({detail})")
+
+        if state == "blocked":
+            # Raise so the circuit breaker counts it and backs off. Never treat
+            # a WAF block as "no shifts today".
+            raise RuntimeError(
+                f"blocked by Amazon's WAF/CloudFront ({detail}). "
+                "Polling too fast, or the browser looks automated."
+            )
+
+        if state == "login":
+            self._report_logged_out(detail)
+            raise RuntimeError(f"session expired ({detail})")
+
+        return site_selectors.extract_shifts(self.page)
+
+    def _report_logged_out(self, detail: str) -> None:
+        log.error("looks like the session expired — re-run save_session.py (%s)", detail)
+        if self.cfg["notifications"].get("notify_on_error"):
+            self.notifier.notify_error(
+                "Session appears to have expired — re-run save_session.py"
+            )
 
     # ── holding ─────────────────────────────────────────────────────────────
     def _hold(self, shift) -> None:

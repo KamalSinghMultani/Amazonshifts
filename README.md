@@ -203,6 +203,31 @@ If it still fails:
 None of this bypasses a CAPTCHA or logs in for you — you still type your own
 password and OTP. It stops a genuine manual login from being misread as a bot.
 
+### "403 ERROR / Request blocked" — you've been WAF-blocked
+
+Amazon fronts the site with CloudFront. Measured live: three page loads about
+14 seconds apart got blocked on the third. The block page returns HTTP 200 and
+contains no job cards, so the watcher explicitly detects it rather than
+reporting "no shifts".
+
+If you see this:
+
+- **Slow down.** `polling.interval_seconds` defaults to 45s ± 20s for this reason.
+- **Use `api` mode** once it's configured — one JSON request per poll is far
+  lighter than a full page load with every asset.
+- **Wait it out.** The block clears on its own; the circuit breaker already backs
+  off for `cooldown_seconds`.
+
+Don't drop the interval to chase speed without watching the logs. A blocked
+watcher finds nothing at all, which loses you far more shifts than a slower poll.
+
+### A CAPTCHA is blocking it
+
+The site ships a CAPTCHA modal that only a human can clear. The watcher detects
+it and alerts rather than silently reporting zero shifts. To clear it, run
+`python save_session.py` and solve it in the visible browser, or set
+`browser.headless: false` so you can solve it while the watcher runs.
+
 ### The watcher says it's logged out
 
 Re-run `python save_session.py`. Sessions expire; with `user_data_dir` set they
