@@ -136,6 +136,7 @@ python watcher.py                    # config.yaml, dry run unless configured ot
 python watcher.py --once             # one poll, then exit
 python watcher.py --live             # force dry_run: false for this run only
 python watcher.py --check-selectors  # list unconfigured selectors
+python watcher.py --drop-report      # when do shifts actually appear?
 python watcher.py --config other.yaml
 ```
 
@@ -148,6 +149,13 @@ Ctrl-C shuts down cleanly, saving state first. Logs go to `logs/watcher.log`
 
 - **Polling** is randomized: `interval_seconds` plus a random `0..jitter_seconds`,
   so the traffic isn't a metronome. Intervals under 5s are rejected outright.
+- **Hot mode** exploits the fact that Amazon posts shifts in *batches*. After any
+  match, and during any configured `hot_windows`, the watcher drops to
+  `hot_interval_seconds` for `hot_duration_seconds`, then relaxes. Jitter shrinks
+  but never disappears. See below for how to find your windows.
+- **Every poll reports its own latency** (`poll 7: 3 shift(s) in 61ms [hot]`, and
+  `alert sent 88ms after poll start`), because latency is the entire point and you
+  cannot tune what you cannot see.
 - **Dedup** is persistent (`state/seen_shifts.json`), so a shift alerts once, not
   once per poll. Entries expire after `state.ttl_hours` so a genuinely re-posted
   shift can alert again. A shift is marked seen *before* the hold is attempted —
@@ -158,6 +166,43 @@ Ctrl-C shuts down cleanly, saving state first. Logs go to `logs/watcher.log`
   network or a bad token degrades to a log line.
 - **Session expiry** is detected by watching for a redirect to a login URL, and
   reported on Telegram.
+
+---
+
+## Finding your hot windows
+
+Don't guess when shifts drop — measure it. Every detection is appended to
+`state/detections.jsonl`, and the report reads your own data back:
+
+```
+$ python watcher.py --drop-report
+73 detection(s) from 2026-08-10 06:26 to 2026-08-16 17:38
+
+Detections by hour (your local time):
+  06:00 ######################################## 42
+  09:00 ###########################              28
+  13:00 #                                        1
+
+Suggested config.yaml:
+
+polling:
+  hot_windows:
+    - "06:00-07:00"
+    - "09:00-10:00"
+```
+
+Run in dry run for a few days first, then paste the suggestion in. Windows are in
+your local time and may wrap midnight (`"22:00-02:00"`). Everything the report
+prints is validated by the same parser `config.yaml` uses, so a paste always loads.
+
+Writing the log is best-effort and a torn line is skipped, not fatal — analytics
+must never be able to break detection.
+
+**A word on how fast to go.** In `dom` mode a poll is a full page load: measured
+here, ~6.3s each, most of it `render_wait_ms`. Setting `hot_interval_seconds`
+below that buys nothing, and 14s between page loads has already earned a
+CloudFront 403 on this site — so anything under 20s warns at startup. Single-digit
+polling is an `api` mode feature, not a dom one.
 
 ---
 

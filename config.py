@@ -29,6 +29,12 @@ DEFAULTS: dict[str, Any] = {
         # CloudFront "Request blocked" 403. See config.yaml for the tradeoff.
         "interval_seconds": 45,
         "jitter_seconds": 20,
+        # ── hot mode ──
+        # Amazon posts shifts in batches: once one appears, the next is usually
+        # seconds away. Poll faster during those windows only.
+        "hot_interval_seconds": 20,
+        "hot_duration_seconds": 120,
+        "hot_windows": [],
         "max_consecutive_errors": 5,
         "cooldown_seconds": 300,
         # The site is a SPA; scraping right after domcontentloaded finds an
@@ -66,7 +72,12 @@ DEFAULTS: dict[str, Any] = {
         "notify_on_error": True,
     },
     "hold": {"enabled": True, "stop_before_submit": True},
-    "state": {"path": "state/seen_shifts.json", "ttl_hours": 72},
+    "state": {
+        "path": "state/seen_shifts.json",
+        "ttl_hours": 72,
+        # Append-only log of every detection, read back by --drop-report.
+        "detections_path": "state/detections.jsonl",
+    },
     "logging": {
         "level": "INFO",
         "path": "logs/watcher.log",
@@ -98,16 +109,104 @@ def load_config(path: str | os.PathLike = "config.yaml") -> dict:
     return cfg
 
 
+# ── hot windows ─────────────────────────────────────────────────────────────
+# A window is "HH:MM-HH:MM" in your LOCAL time. It may wrap midnight
+# ("22:00-02:00"), which is why they are stored as minute offsets and compared
+# with a wrap-aware test rather than a simple start <= now <= end.
+def _parse_clock(text: str, window: str) -> int:
+    parts = str(text).strip().split(":")
+    if len(parts) != 2:
+        raise ValueError(f"bad time {text!r} in hot window {window!r} — want HH:MM")
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(f"bad time {text!r} in hot window {window!r} — want HH:MM") from None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"time out of range in hot window {window!r}: {text!r}")
+    return hour * 60 + minute
+
+
+def parse_hot_windows(windows: Any) -> list[tuple[int, int]]:
+    """["06:00-09:00"] -> [(360, 540)]. Raises on anything malformed.
+
+    Parsing happens at startup so a typo like "breakfast" fails immediately
+    instead of quietly never opening a window — a silent no-op would look
+    exactly like a day with no shifts.
+    """
+    if not windows:
+        return []
+    if isinstance(windows, str):
+        windows = [windows]
+
+    parsed: list[tuple[int, int]] = []
+    for window in windows:
+        text = str(window).strip()
+        if text.count("-") != 1:
+            raise ValueError(f"bad hot window {window!r} — want \"HH:MM-HH:MM\"")
+        start_text, end_text = text.split("-")
+        start = _parse_clock(start_text, text)
+        end = _parse_clock(end_text, text)
+        if start == end:
+            raise ValueError(f"hot window {window!r} is zero-length")
+        parsed.append((start, end))
+    return parsed
+
+
+def in_hot_window(now: Any, windows: list[tuple[int, int]]) -> bool:
+    """Is `now` (a datetime) inside any window? Wrap-aware."""
+    minutes = now.hour * 60 + now.minute
+    for start, end in windows:
+        if start < end:
+            if start <= minutes < end:
+                return True
+        elif minutes >= start or minutes < end:  # wraps midnight
+            return True
+    return False
+
+
 def validate_config(cfg: dict) -> None:
     mode = cfg["polling"]["mode"]
     if mode not in ("dom", "api"):
         raise ValueError(f"polling.mode must be 'dom' or 'api', got {mode!r}")
 
-    if cfg["polling"]["interval_seconds"] < 5:
+    polling = cfg["polling"]
+    if polling["interval_seconds"] < 5:
         raise ValueError(
             "polling.interval_seconds below 5 is abusive to the site and will "
             "get you rate-limited or blocked"
         )
+
+    hot = polling["hot_interval_seconds"]
+    if hot < 3:
+        raise ValueError(
+            "polling.hot_interval_seconds below 3 will get you blocked long "
+            "before it wins you a shift"
+        )
+    if hot > polling["interval_seconds"]:
+        raise ValueError(
+            "polling.hot_interval_seconds must be <= interval_seconds — "
+            "hot mode is the fast cadence, not the slow one"
+        )
+    if mode == "dom" and hot < 20:
+        # Measured, not guessed: three full page loads ~14s apart earned a
+        # CloudFront 403. A blocked watcher finds nothing at all, which loses
+        # more shifts than a slower poll ever will.
+        log.warning(
+            "polling.hot_interval_seconds=%s in dom mode risks a CloudFront "
+            "block (a 403 was observed at ~14s between page loads). Configure "
+            "api mode before polling this fast.",
+            hot,
+        )
+    if hot * 1000 < polling.get("render_wait_ms", 0) and mode == "dom":
+        log.warning(
+            "hot_interval_seconds=%ss is shorter than render_wait_ms=%sms — "
+            "each dom poll already takes longer than that, so the extra speed "
+            "is imaginary",
+            hot, polling.get("render_wait_ms"),
+        )
+
+    # Parse for the side effect: a malformed window must fail at startup.
+    polling["hot_windows_parsed"] = parse_hot_windows(polling.get("hot_windows"))
 
     if mode == "api":
         api = cfg["api"]

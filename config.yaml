@@ -37,6 +37,35 @@ polling:
   # is not a metronome.
   jitter_seconds: 20
 
+  # ── Hot mode ────────────────────────────────────────────────────────────
+  # Amazon posts shifts in BATCHES: the moment one appears, the next is
+  # usually seconds away rather than minutes. A flat interval sleeps through
+  # exactly the window that matters. Hot mode polls fast during it and
+  # relaxes afterwards, so you get low latency without hammering the site
+  # all day.
+  #
+  # Two triggers, either is enough:
+  #   * a match just happened     -> hot for hot_duration_seconds
+  #   * the clock is in a window  -> hot for as long as the window lasts
+  hot_interval_seconds: 20
+  hot_duration_seconds: 120
+
+  # Times of day that are ALWAYS hot, in your local time. May wrap midnight
+  # ("22:00-02:00"). A malformed entry fails at startup rather than silently
+  # never opening.
+  #
+  # Don't guess these — measure them. Run in dry run for a few days, then:
+  #     python watcher.py --drop-report
+  # and paste what it suggests.
+  hot_windows: []
+  # hot_windows: ["06:00-08:00", "09:00-10:00"]
+
+  # ⚠️ In dom mode a poll is a full page load, and 14s between page loads has
+  # already earned a CloudFront 403 here — so hot_interval_seconds below 20
+  # warns at startup. Configure `api` mode before polling faster than that:
+  # one JSON request is far lighter than a page load, and it is the only
+  # honest way to get down to single-digit seconds.
+
   # The site is a React SPA — scraping immediately after domcontentloaded
   # finds an empty shell. This is how long to wait for it to render.
   render_wait_ms: 5000
@@ -142,6 +171,10 @@ state:
   # Forget a shift id after this long, so a genuinely re-posted shift
   # can alert again.
   ttl_hours: 72
+  # Append-only log of every detection. This is what --drop-report reads to
+  # tell you when shifts actually drop. Writing it is best-effort: analytics
+  # can never break detection.
+  detections_path: "state/detections.jsonl"
 
 logging:
   level: "INFO"

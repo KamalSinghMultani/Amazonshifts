@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import api_client
 import browser_launch
 import config as config_mod
+import drop_report
 import site_selectors
 from notifier import TelegramNotifier
 from shift_matcher import Shift, ShiftMatcher
@@ -605,6 +607,19 @@ def test_remaining_placeholders_are_reported():
     assert not site_selectors.selectors_ready()
 
 
+def test_detection_can_be_ready_while_holding_is_not():
+    """Regression: the watcher used to refuse to start in dom mode unless every
+    selector was filled in, including the apply-flow steps that can only be
+    captured by submitting a real application. That blocked the dry-run period
+    you are supposed to do *first*."""
+    assert site_selectors.detection_ready()
+    assert not site_selectors.selectors_ready()
+    assert site_selectors.unconfigured_hold()
+    assert site_selectors.unconfigured() == (
+        site_selectors.unconfigured_detection() + site_selectors.unconfigured_hold()
+    )
+
+
 # ── DOM fakes, to test card matching without a browser ──────────────────────
 class FakeField:
     def __init__(self, text: str = "", present: bool = True, href: str | None = None,
@@ -742,3 +757,182 @@ def test_hold_shift_refuses_when_selectors_are_placeholders():
     ok, message = site_selectors.hold_shift(FakePage([]), Shift(title="x"))
     assert not ok
     assert "not configured" in message
+
+
+# ── hot mode ────────────────────────────────────────────────────────────────
+def test_hot_windows_parse_to_minute_offsets():
+    assert config_mod.parse_hot_windows(["06:00-09:30"]) == [(360, 570)]
+    assert config_mod.parse_hot_windows([]) == []
+
+
+@pytest.mark.parametrize("bad", ["breakfast", "6-9", "25:00-26:00", "06:00-06:00", "06:00"])
+def test_malformed_hot_window_fails_at_startup(bad):
+    """A window that silently never opens looks exactly like a quiet day, so
+    anything unparseable has to be fatal at load time."""
+    with pytest.raises(ValueError):
+        config_mod.parse_hot_windows([bad])
+
+
+def test_hot_window_membership():
+    windows = config_mod.parse_hot_windows(["06:00-09:00"])
+    assert config_mod.in_hot_window(datetime(2026, 8, 17, 6, 0), windows)
+    assert config_mod.in_hot_window(datetime(2026, 8, 17, 8, 59), windows)
+    assert not config_mod.in_hot_window(datetime(2026, 8, 17, 9, 0), windows)  # end exclusive
+    assert not config_mod.in_hot_window(datetime(2026, 8, 17, 5, 59), windows)
+
+
+def test_hot_window_can_wrap_midnight():
+    windows = config_mod.parse_hot_windows(["22:00-02:00"])
+    for hour in (22, 23, 0, 1):
+        assert config_mod.in_hot_window(datetime(2026, 8, 17, hour, 30), windows), hour
+    assert not config_mod.in_hot_window(datetime(2026, 8, 17, 3, 0), windows)
+
+
+def test_hot_interval_floor_is_enforced():
+    cfg = config_mod._deep_merge(config_mod.DEFAULTS, {"polling": {"hot_interval_seconds": 1}})
+    with pytest.raises(ValueError, match="hot_interval_seconds"):
+        config_mod.validate_config(cfg)
+
+
+def test_hot_interval_may_not_exceed_the_idle_interval():
+    """Hot mode is the fast cadence. Inverting them would silently slow the
+    watcher down exactly when a batch is landing."""
+    cfg = config_mod._deep_merge(
+        config_mod.DEFAULTS,
+        {"polling": {"interval_seconds": 20, "hot_interval_seconds": 45}},
+    )
+    with pytest.raises(ValueError, match="hot_interval_seconds"):
+        config_mod.validate_config(cfg)
+
+
+def test_validate_parses_windows_so_a_typo_never_reaches_the_loop():
+    cfg = config_mod._deep_merge(config_mod.DEFAULTS, {"polling": {"hot_windows": ["nope"]}})
+    with pytest.raises(ValueError):
+        config_mod.validate_config(cfg)
+
+
+# ── detection log ───────────────────────────────────────────────────────────
+def test_detections_are_logged_and_read_back(tmp_path):
+    store = StateStore(
+        tmp_path / "seen.json", 72, detections_path=tmp_path / "detections.jsonl"
+    )
+    store.log_detection("id-1", "Sorter — Brampton")
+    store.log_detection("id-2", "Picker — Mississauga")
+    entries = store.read_detections()
+    assert [e["id"] for e in entries] == ["id-1", "id-2"]
+    assert all(isinstance(e["ts"], float) for e in entries)
+
+
+def test_torn_detection_lines_are_skipped_not_fatal(tmp_path):
+    """The process can be killed mid-append at any moment; a half-written last
+    line must not take the report down with it."""
+    path = tmp_path / "detections.jsonl"
+    path.write_text('{"ts": 1, "id": "ok"}\n{"ts": 2, "id": "tor', encoding="utf-8")
+    store = StateStore(tmp_path / "seen.json", 72, detections_path=path)
+    assert [e["id"] for e in store.read_detections()] == ["ok"]
+
+
+def test_detection_logging_is_best_effort(tmp_path):
+    """Analytics must never be able to break detection."""
+    store = StateStore(tmp_path / "seen.json", 72, detections_path=None)
+    store.log_detection("id-1", "no path configured")  # must not raise
+    assert store.read_detections() == []
+
+
+# ── drop report ─────────────────────────────────────────────────────────────
+def _at(hour: int, day: int = 17) -> dict:
+    return {"ts": datetime(2026, 8, day, hour, 30).timestamp()}
+
+
+def test_hourly_counts_uses_local_time():
+    counts = drop_report.hourly_counts([_at(6), _at(6), _at(9)])
+    assert counts == {6: 2, 9: 1}
+
+
+def test_adjacent_busy_hours_merge_into_one_window():
+    entries = [_at(6)] * 5 + [_at(7)] * 4 + [_at(9)] * 3
+    assert drop_report.suggest_windows(drop_report.hourly_counts(entries)) == [
+        "06:00-08:00",
+        "09:00-10:00",
+    ]
+
+
+def test_a_single_stray_detection_does_not_earn_a_window():
+    entries = [_at(6)] * 10 + [_at(3)]
+    assert drop_report.suggest_windows(drop_report.hourly_counts(entries)) == ["06:00-07:00"]
+
+
+def test_suggested_windows_always_parse():
+    """Whatever the report prints has to load — including the 23:00 wrap."""
+    entries = [_at(23)] * 5 + [_at(0)] * 5
+    windows = drop_report.suggest_windows(drop_report.hourly_counts(entries))
+    assert windows
+    config_mod.parse_hot_windows(windows)
+
+
+def test_report_with_no_data_explains_itself_instead_of_crashing():
+    text = drop_report.render([])
+    assert "No detections logged yet" in text
+
+
+def test_report_renders_a_histogram_and_a_suggestion():
+    text = drop_report.render([_at(6)] * 3 + [_at(9)])
+    assert "06:00" in text
+    assert "hot_windows" in text
+
+
+# ── the watcher's own scheduling ────────────────────────────────────────────
+def _watcher(tmp_path, **polling):
+    import watcher as watcher_mod
+
+    cfg = config_mod._deep_merge(
+        config_mod.DEFAULTS,
+        {
+            "polling": polling,
+            "state": {
+                "path": str(tmp_path / "seen.json"),
+                "detections_path": str(tmp_path / "detections.jsonl"),
+            },
+            "notifications": {"telegram": {"enabled": False}},
+        },
+    )
+    config_mod.validate_config(cfg)
+    return watcher_mod.Watcher(cfg)
+
+
+def test_a_match_turns_hot_mode_on_then_it_expires(tmp_path):
+    """The batching bet: one shift appearing means the next is probably seconds
+    away, so the cadence tightens for a while afterwards."""
+    w = _watcher(tmp_path, hot_duration_seconds=120)
+    assert not w.is_hot()
+    w.go_hot()
+    assert w.is_hot()
+
+    w.hot_until = time.time() - 1  # let it lapse
+    assert not w.is_hot()
+
+
+def test_hot_mode_uses_the_fast_cadence(tmp_path):
+    w = _watcher(tmp_path, interval_seconds=45, jitter_seconds=20, hot_interval_seconds=20)
+    idle, was_hot = w._next_delay()
+    assert not was_hot and 45 <= idle <= 65
+
+    w.go_hot()
+    hot, was_hot = w._next_delay()
+    assert was_hot
+    # Fast, but never a metronome — some jitter survives.
+    assert 20 <= hot <= 26
+    assert hot < idle
+
+
+def test_a_clock_window_makes_it_hot_without_any_match(tmp_path):
+    w = _watcher(tmp_path, hot_windows=["06:00-09:00"])
+    assert w.is_hot(datetime(2026, 8, 17, 6, 30))
+    assert not w.is_hot(datetime(2026, 8, 17, 12, 0))
+
+
+def test_go_hot_never_shortens_an_existing_hot_period(tmp_path):
+    w = _watcher(tmp_path, hot_duration_seconds=120)
+    w.hot_until = time.time() + 600
+    w.go_hot()
+    assert w.hot_until > time.time() + 500

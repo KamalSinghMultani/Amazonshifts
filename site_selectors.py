@@ -116,13 +116,37 @@ DETAIL_PAGE_MARKER = "[data-test-id='jobDetailSelectScheduleButton']"
 FINAL_SUBMIT: str = TODO  # e.g. "button:has-text('Submit application')"
 
 
-def unconfigured() -> list[str]:
-    """Names of every selector still left as a placeholder."""
-    missing = [name for name, sel in SELECTORS.items() if sel == TODO]
-    missing += [f"HOLD_STEPS[{i}] {label}" for i, (label, sel) in enumerate(HOLD_STEPS) if sel == TODO]
+def unconfigured_detection() -> list[str]:
+    """Placeholders that stop the watcher from *seeing* shifts."""
+    return [name for name, sel in SELECTORS.items() if sel == TODO]
+
+
+def unconfigured_hold() -> list[str]:
+    """Placeholders that stop the watcher from *clicking* through to a slot."""
+    missing = [
+        f"HOLD_STEPS[{i}] {label}"
+        for i, (label, sel) in enumerate(HOLD_STEPS)
+        if sel == TODO
+    ]
     if FINAL_SUBMIT == TODO:
         missing.append("FINAL_SUBMIT")
     return missing
+
+
+def unconfigured() -> list[str]:
+    """Names of every selector still left as a placeholder."""
+    return unconfigured_detection() + unconfigured_hold()
+
+
+def detection_ready() -> bool:
+    """Enough is configured to detect and alert.
+
+    Deliberately separate from selectors_ready(): the last two hold steps can
+    only be captured by starting a real application, so requiring them before
+    the watcher will run at all would block the dry-run period that is supposed
+    to come *first*. Detecting and alerting needs none of them.
+    """
+    return not unconfigured_detection()
 
 
 def selectors_ready() -> bool:

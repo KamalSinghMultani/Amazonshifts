@@ -19,6 +19,7 @@ import random
 import signal
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -28,7 +29,14 @@ from playwright.sync_api import sync_playwright
 import browser_launch
 import site_selectors
 from api_client import ApiClient
-from config import load_config, load_dotenv, setup_logging
+import drop_report
+from config import (
+    in_hot_window,
+    load_config,
+    load_dotenv,
+    parse_hot_windows,
+    setup_logging,
+)
 from notifier import TelegramNotifier
 from shift_matcher import ShiftMatcher
 from state_store import StateStore
@@ -45,7 +53,19 @@ class Watcher:
         self.mode = cfg["polling"]["mode"]
 
         self.matcher = ShiftMatcher(cfg.get("filters"))
-        self.state = StateStore(cfg["state"]["path"], cfg["state"]["ttl_hours"])
+        self.state = StateStore(
+            cfg["state"]["path"],
+            cfg["state"]["ttl_hours"],
+            detections_path=cfg["state"].get("detections_path"),
+        )
+
+        # Hot mode: poll fast inside a configured window, and for a while after
+        # any match, because Amazon posts in batches.
+        polling = cfg["polling"]
+        self.hot_windows = polling.get("hot_windows_parsed") or parse_hot_windows(
+            polling.get("hot_windows")
+        )
+        self.hot_until = 0.0
 
         telegram_cfg = cfg["notifications"]["telegram"]
         self.notifier = TelegramNotifier(
@@ -123,7 +143,14 @@ class Watcher:
             if self.cfg["hold"]["stop_before_submit"]
             else "LIVE — FULLY AUTOMATED, will submit applications"
         )
-        log.info("watcher started | mode=%s | %s", self.mode, mode_note)
+        polling = self.cfg["polling"]
+        windows = polling.get("hot_windows") or []
+        log.info(
+            "watcher started | mode=%s | %s | poll %ss (hot %ss%s)",
+            self.mode, mode_note,
+            polling["interval_seconds"], polling["hot_interval_seconds"],
+            f", windows {', '.join(str(w) for w in windows)}" if windows else "",
+        )
         if self.cfg["notifications"].get("notify_on_start"):
             self.notifier.send_text(
                 f"👀 <b>Shift watcher started</b>\n"
@@ -146,9 +173,40 @@ class Watcher:
             if once or self.stop_event.is_set():
                 break
 
-            delay = polling["interval_seconds"] + random.uniform(0, polling["jitter_seconds"])
-            log.debug("sleeping %.1fs", delay)
+            delay, hot = self._next_delay()
+            log.debug("sleeping %.1fs%s", delay, " [hot]" if hot else "")
             self.stop_event.wait(delay)
+
+    # ── hot mode ────────────────────────────────────────────────────────────
+    def is_hot(self, now: datetime | None = None) -> bool:
+        """Should we be on the fast cadence right now?
+
+        Two independent triggers: a configured clock window, or the tail of a
+        recent match. The second is the one that exploits batching — the moment
+        one shift appears, the next is usually seconds away, not minutes.
+        """
+        now = now or datetime.now()
+        if in_hot_window(now, self.hot_windows):
+            return True
+        return now.timestamp() < self.hot_until
+
+    def go_hot(self) -> None:
+        duration = self.cfg["polling"]["hot_duration_seconds"]
+        self.hot_until = max(self.hot_until, datetime.now().timestamp() + duration)
+
+    def _next_delay(self) -> tuple[float, bool]:
+        polling = self.cfg["polling"]
+        hot = self.is_hot()
+        if not hot:
+            return (
+                polling["interval_seconds"] + random.uniform(0, polling["jitter_seconds"]),
+                False,
+            )
+        # Keep some jitter even when hot — a metronome is the easiest possible
+        # traffic pattern to spot — but never enough to undo the speedup.
+        base = polling["hot_interval_seconds"]
+        jitter = min(polling["jitter_seconds"], base * 0.3)
+        return base + random.uniform(0, jitter), True
 
     def _trip_circuit_breaker(self, exc: Exception) -> None:
         cooldown = self.cfg["polling"]["cooldown_seconds"]
@@ -163,8 +221,16 @@ class Watcher:
 
     def poll_once(self) -> None:
         self.polls += 1
+        # You cannot tune what you do not measure — and the whole point of this
+        # tool is latency, so every poll reports its own.
+        started = time.perf_counter()
+        hot = self.is_hot()
         shifts = self._fetch_shifts()
-        log.info("poll %d: %d shift(s) visible", self.polls, len(shifts))
+        fetch_ms = (time.perf_counter() - started) * 1000
+        log.info(
+            "poll %d: %d shift(s) in %.0fms%s",
+            self.polls, len(shifts), fetch_ms, " [hot]" if hot else "",
+        )
 
         for shift in shifts:
             matched, reason = self.matcher.matches(shift)
@@ -179,12 +245,21 @@ class Watcher:
             # miss a retry than spam the same alert on every poll.
             self.state.mark_seen(shift.stable_id, shift.summary())
             self.state.save()
+            self.state.log_detection(shift.stable_id, shift.summary())
             self.alerts += 1
+
+            # A match means a batch is probably landing — speed up regardless
+            # of what happens with the alert or the hold below.
+            self.go_hot()
 
             log.info("MATCH: %s", shift.summary())
             # Alert first, always. In api mode nothing has touched the browser
             # yet, so this fires within milliseconds of the shift appearing.
             self.notifier.notify_shift(shift, dry_run=self.dry_run)
+            log.info(
+                "alert sent %.0fms after poll start",
+                (time.perf_counter() - started) * 1000,
+            )
 
             if self.dry_run:
                 log.info("dry run — not clicking")
@@ -255,6 +330,19 @@ class Watcher:
 
     # ── holding ─────────────────────────────────────────────────────────────
     def _hold(self, shift) -> None:
+        missing = site_selectors.unconfigured_hold()
+        if missing:
+            # Bail before navigating: opening the listing and then failing on
+            # the first click wastes the seconds that matter most, and lands
+            # the browser on a job page the next poll has to navigate back off.
+            log.error("cannot hold — unconfigured: %s", ", ".join(missing))
+            self.notifier.notify_error(
+                "Matched a shift but cannot hold it — the apply-flow selectors "
+                f"are still placeholders ({', '.join(missing)}). Open the "
+                "listing yourself."
+            )
+            return
+
         page = self.page
         if page is None:
             # api mode: this is the first time we need a browser page at all.
@@ -290,22 +378,62 @@ class Watcher:
             self.notifier.notify_error(f"Hold failed for {shift.summary()}\n{message}")
 
 
+def _use_utf8_console() -> None:
+    """Windows terminals default to cp1252, which cannot encode the emoji this
+    program prints and logs. Without this, `--check-selectors` dies with a
+    UnicodeEncodeError and every emoji log line raises inside logging."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):  # not a real console; nothing to do
+            pass
+
+
 def check_selectors() -> int:
-    missing = site_selectors.unconfigured()
-    if not missing:
+    detection = site_selectors.unconfigured_detection()
+    hold = site_selectors.unconfigured_hold()
+
+    if not detection and not hold:
         print("✅ all selectors are configured")
         return 0
-    print("❌ these selectors are still placeholders in site_selectors.py:\n")
-    for name in missing:
-        print(f"   - {name}")
+
+    if detection:
+        print("❌ detection is not configured — the watcher cannot see shifts:\n")
+        for name in detection:
+            print(f"   - {name}")
+    else:
+        print("✅ detection selectors are configured — dry-run watching works\n")
+
+    if hold:
+        print("\n⚠️  holding is not configured — detection and alerts still work,")
+        print("   but the click-through will refuse to run:\n")
+        for name in hold:
+            print(f"   - {name}")
+
     print(
         "\nFill them in with:\n"
         "   python -m playwright codegen --load-storage=auth_state.json \\\n"
-        "          https://hiring.amazon.ca/app#/jobSearch\n"
-        "\ndom mode and holding will not work until these are set. "
-        "api mode can detect shifts without them, but cannot hold."
+        "          https://hiring.amazon.ca/app#/jobSearch"
     )
-    return 1
+    return 1 if detection else 0
+
+
+def print_drop_report(cfg: dict) -> int:
+    state = StateStore(
+        cfg["state"]["path"],
+        cfg["state"]["ttl_hours"],
+        detections_path=cfg["state"].get("detections_path"),
+    )
+    entries = state.read_detections()
+    print(drop_report.render(entries))
+
+    # Anything this report prints must actually load. Validating the suggestion
+    # with the same parser config.yaml uses means a paste can never produce a
+    # window that silently never opens.
+    suggested = drop_report.suggest_windows(drop_report.hourly_counts(entries))
+    if suggested:
+        parse_hot_windows(suggested)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -314,18 +442,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="one poll, then exit")
     parser.add_argument("--live", action="store_true", help="override dry_run for this run")
     parser.add_argument("--check-selectors", action="store_true")
+    parser.add_argument(
+        "--drop-report",
+        action="store_true",
+        help="when do shifts actually appear? reads your own detection log",
+    )
     args = parser.parse_args(argv)
+
+    _use_utf8_console()
 
     if args.check_selectors:
         return check_selectors()
 
     load_dotenv()
     cfg = load_config(args.config)
+
+    if args.drop_report:
+        return print_drop_report(cfg)
+
     setup_logging(cfg)
 
-    if cfg["polling"]["mode"] == "dom" and not site_selectors.selectors_ready():
-        log.error("dom mode needs real selectors — run `python watcher.py --check-selectors`")
+    if cfg["polling"]["mode"] == "dom" and not site_selectors.detection_ready():
+        log.error(
+            "dom mode needs the detection selectors — run "
+            "`python watcher.py --check-selectors`"
+        )
         return 2
+
+    missing_hold = site_selectors.unconfigured_hold()
+    if missing_hold:
+        # Not fatal: detection and alerting are the point, and the dry-run
+        # period is what you do *before* capturing the apply flow.
+        log.warning(
+            "holding is disabled — these are still placeholders: %s",
+            ", ".join(missing_hold),
+        )
 
     return Watcher(cfg, live_override=args.live).run(once=args.once)
 

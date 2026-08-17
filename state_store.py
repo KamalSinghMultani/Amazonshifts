@@ -18,9 +18,15 @@ log = logging.getLogger(__name__)
 
 
 class StateStore:
-    def __init__(self, path: str | os.PathLike, ttl_hours: float = 72) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike,
+        ttl_hours: float = 72,
+        detections_path: str | os.PathLike | None = None,
+    ) -> None:
         self.path = Path(path)
         self.ttl_seconds = float(ttl_hours) * 3600 if ttl_hours else None
+        self.detections_path = Path(detections_path) if detections_path else None
         self._seen: dict[str, dict] = {}
         self._load()
 
@@ -74,6 +80,46 @@ class StateStore:
         for key in stale:
             del self._seen[key]
         return len(stale)
+
+    # ── detection log ───────────────────────────────────────────────────────
+    def log_detection(self, key: str, summary: str = "") -> None:
+        """Append one detection, for --drop-report to read back later.
+
+        Best-effort by design: analytics must never be able to break detection,
+        so every failure here is a log line and nothing more.
+        """
+        if not self.detections_path:
+            return
+        try:
+            self.detections_path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps({"ts": time.time(), "id": key, "summary": summary})
+            with self.detections_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            log.warning("could not log detection: %s", exc)
+
+    def read_detections(self) -> list[dict]:
+        """Every logged detection. Torn or truncated lines are skipped, not
+        fatal — the process can be killed mid-append at any time."""
+        if not self.detections_path or not self.detections_path.exists():
+            return []
+        entries: list[dict] = []
+        try:
+            text = self.detections_path.read_text("utf-8")
+        except OSError as exc:
+            log.warning("could not read %s: %s", self.detections_path, exc)
+            return []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # a torn last line from a kill mid-write
+            if isinstance(entry, dict) and isinstance(entry.get("ts"), (int, float)):
+                entries.append(entry)
+        return entries
 
     def _expired(self, entry: dict) -> bool:
         if self.ttl_seconds is None:
