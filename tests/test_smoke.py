@@ -469,7 +469,7 @@ def test_results_list_is_not_a_detail_page():
 def test_hold_skips_the_card_click_when_already_on_the_detail_page(monkeypatch):
     """Regression: api mode navigates straight to the job URL, where no cards
     exist — attempting the card click there would always fail."""
-    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", "#submit")
+    monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
     monkeypatch.setattr(site_selectors, "HOLD_STEPS", [("open job", ":scope"), ("sched", "#s")])
     monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
 
@@ -618,27 +618,30 @@ def test_every_selector_is_captured_from_the_live_site():
     assert site_selectors.detection_ready()
 
     labels = [label for label, _ in site_selectors.HOLD_STEPS]
-    assert labels == ["open job", "select schedule", "pick a shift"]
+    assert labels == [
+        "open job", "select schedule", "pick a shift", "open the consent screen",
+    ]
     assert "ScheduleCardSelectScheduleLink" in dict(site_selectors.HOLD_STEPS)["pick a shift"]
 
 
-def test_the_flow_stops_at_the_application_rather_than_filling_it_in():
-    """What follows the application page is consent, personal details and
-    background-check authorisation. A human fills those in."""
-    assert "Next" in site_selectors.FINAL_SUBMIT
-    assert site_selectors.APPLICATION_URL_MARKER == "/application/"
-    labels = [label for label, _ in site_selectors.HOLD_STEPS]
-    assert not any("consent" in label or "submit" in label for label in labels)
+def test_creating_the_application_is_not_one_of_the_automatic_steps():
+    """Create Application accepts the age and drug-test declarations and is
+    what actually reserves the slot. It stays behind stop_before_submit, so a
+    default run can never commit you to anything."""
+    step_selectors = [selector for _, selector in site_selectors.HOLD_STEPS]
+    assert site_selectors.CREATE_APPLICATION not in step_selectors
+    assert not any("Create Application" in s for s in step_selectors)
+    assert "Create Application" in site_selectors.CREATE_APPLICATION
 
 
 def test_detection_stays_ready_when_a_hold_selector_rots(monkeypatch):
     """Amazon will change these eventually. When a hold selector goes stale,
     detection and alerting must keep working — losing the clicks is bad,
     losing the alerts too would be worse."""
-    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", site_selectors.TODO)
+    monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", site_selectors.TODO)
     assert site_selectors.detection_ready()
     assert not site_selectors.selectors_ready()
-    assert "FINAL_SUBMIT" in site_selectors.unconfigured_hold()
+    assert "CREATE_APPLICATION" in site_selectors.unconfigured_hold()
 
 
 def test_detection_can_be_ready_while_holding_is_not():
@@ -788,7 +791,7 @@ def test_extract_shifts_refuses_to_run_on_placeholder_selectors(monkeypatch):
 def test_hold_shift_refuses_when_selectors_are_placeholders(monkeypatch):
     """Load-bearing: a stale selector must stop the click path, not have it
     guess at buttons on a real application form."""
-    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", site_selectors.TODO)
+    monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", site_selectors.TODO)
     ok, message = site_selectors.hold_shift(FakePage([]), Shift(title="x"))
     assert not ok
     assert "not configured" in message
@@ -1463,7 +1466,7 @@ def test_a_login_tab_is_reported_as_a_login_problem(monkeypatch):
     """Confirmed live: clicking Apply opened auth.hiring.amazon.com/#/login.
     Job search is public, so detection keeps working while signed out and
     nothing warns you until a hold is attempted."""
-    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", "#submit")
+    monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
     # on_detail_page drops the leading "open job" step, so include it.
     monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
         ("open job", ":scope"),
@@ -1485,7 +1488,7 @@ def test_a_login_tab_is_reported_as_a_login_problem(monkeypatch):
 def test_the_flow_follows_the_tab_that_apply_opens(monkeypatch):
     """Without following it, later steps would hunt for buttons on the page we
     already left and fail with a misleading 'button not found'."""
-    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", "#submit")
+    monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
     monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
         ("open job", ":scope"),
         ("select schedule", "#sched"),
@@ -1526,7 +1529,7 @@ def test_is_login_page_recognises_the_portal_and_ignores_job_pages():
 
 def test_pick_a_shift_is_scoped_to_the_schedule_flyout(monkeypatch):
     """An unscoped Apply selector could match a button elsewhere on the page."""
-    monkeypatch.setattr(site_selectors, "FINAL_SUBMIT", "#submit")
+    monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
     # The real steps, minus the one still behind the login wall.
     monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
         ("open job", ":scope"),
@@ -1584,3 +1587,104 @@ def test_the_screenshot_waits_for_the_application_to_render(monkeypatch, tmp_pat
     assert ok, message
     assert events == ["waited-for-application", "screenshot"], events
     assert "scheduleId=SCH-1" in message, "the alert must carry the link to finish"
+
+
+# ── the one click that actually holds the spot ──────────────────────────────
+class ConsentPage:
+    """The consent screen, and what it becomes once the application exists."""
+
+    def __init__(self, banner_after_click=True, has_button=True):
+        self.url = "https://hiring.amazon.com/application/us/?scheduleId=SCH-9#/consent"
+        self.context = None
+        self.clicked = []
+        self.banner = ""
+        self.banner_after_click = banner_after_click
+        self.has_button = has_button
+        self.shots = 0
+
+    def locator(self, selector):
+        page = self
+
+        class L:
+            @property
+            def first(self):
+                return self
+
+            def wait_for(self, **_kw):
+                if "Create Application" in selector and not page.has_button:
+                    raise RuntimeError("not visible")
+
+            def click(self, **_kw):
+                page.clicked.append(selector)
+                if "Create Application" in selector and page.banner_after_click:
+                    page.banner = (
+                        "We are holding a spot for you for the next 2 hours "
+                        "and 59 minutes to complete the remaining steps."
+                    )
+
+        return L()
+
+    def evaluate(self, _script, _arg=None):
+        return self.banner
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+    def screenshot(self, **_kw):
+        self.shots += 1
+
+
+def _consent_flow(monkeypatch):
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [("open job", ":scope")])
+    monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
+    monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
+
+
+def test_the_default_run_never_presses_create_application(monkeypatch):
+    """Everything before it is reversible browsing. This click accepts the age
+    and drug-test declarations, so it must not happen by default."""
+    _consent_flow(monkeypatch)
+    page = ConsentPage()
+    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=True)
+    assert ok
+    assert page.clicked == [], "nothing may be clicked on the consent screen"
+    assert "NOT held" in message
+    assert "stop_before_submit" in message
+
+
+def test_pressing_create_application_holds_the_spot_and_reads_the_banner(monkeypatch):
+    """The site states the hold itself, with a countdown — so report that
+    rather than assuming a click that appeared to work did work."""
+    _consent_flow(monkeypatch)
+    page = ConsentPage()
+    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=False)
+    assert ok
+    assert any("Create Application" in c for c in page.clicked)
+    assert "SPOT HELD" in message
+    assert "2 hours and 59 minutes" in message
+    assert "scheduleId=SCH-9" in message
+
+
+def test_a_missing_banner_is_reported_honestly_rather_than_claimed(monkeypatch):
+    _consent_flow(monkeypatch)
+    page = ConsentPage(banner_after_click=False)
+    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=False)
+    assert ok  # the click did happen
+    assert "never appeared" in message
+    assert "check it by hand" in message
+
+
+def test_a_missing_create_button_fails_instead_of_claiming_a_hold(monkeypatch):
+    _consent_flow(monkeypatch)
+    page = ConsentPage(has_button=False)
+    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=False)
+    assert not ok
+    assert "Create Application" in message
+
+
+def test_stopping_early_still_says_the_spot_is_not_held(monkeypatch):
+    """The dangerous failure is believing a shift is yours when it is not."""
+    _consent_flow(monkeypatch)
+    page = ConsentPage(has_button=False)
+    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=True)
+    assert "NOT HELD" in message.upper()

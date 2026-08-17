@@ -323,9 +323,25 @@ hold:
   # a whole batch would race itself and multiply the clicks.
   max_per_poll: 1
 
-  # NEVER click the final submit button. You finish the application by hand.
-  # Setting this to false enables fully automated booking — only do that
-  # deliberately, once you fully trust the selectors.
+  # ── The one click that commits you ────────────────────────────────────────
+  # CONFIRMED live: the shift is reserved only when "Create Application" is
+  # pressed on the consent screen. That screen declares you are 18+, willing
+  # to take a drug test, and agree to the data policy. Pressing it produces:
+  #
+  #   "We are holding a spot for you for the next 2 hours and 59 minutes to
+  #    complete the remaining steps."        (then Step 1 of 7)
+  #
+  # true  = walk up to that screen, screenshot it, alert you, press NOTHING.
+  #         Safe, commits you to nothing — but THE SPOT IS NOT HELD, and
+  #         somebody else can still take it while you get to your phone.
+  #
+  # false = also press Create Application, so the spot is genuinely held for
+  #         ~3 hours and you finish the 7 remaining steps whenever you can.
+  #         This is what you want if the point is to win the shift.
+  #
+  # Either way the watcher never fills in the application itself: the
+  # remaining steps involve your personal details and consents, and it stops
+  # as soon as the spot is secured.
   stop_before_submit: true
 
 state:

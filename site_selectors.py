@@ -99,6 +99,10 @@ HOLD_STEPS: list[tuple[str, str]] = [
     # ⚠️ This click OPENS A NEW TAB. hold_shift() follows it — see
     # _wait_for_new_page(). Anything after this step runs in that tab.
     ("pick a shift", "[data-test-id='ScheduleCardSelectScheduleLink']"),
+    # CONFIRMED: the application opens on a pre-consent page whose only action
+    # is "Next". Harmless — it commits nothing, it just reveals the consent
+    # screen where the real decision lives.
+    ("open the consent screen", "[data-test-id='layout'] button:has-text('Next')"),
 ]
 
 # That is the whole click path, and it is deliberately short.
@@ -130,14 +134,25 @@ DETAIL_PAGE_MARKER = "[data-test-id='jobDetailSelectScheduleButton']"
 #   https://hiring.amazon.ca/app#/jobDetail?jobId={id}
 # and the watcher can jump straight to the job instead of hunting for a card.
 
-# The first button of the application proper — "Next" on the pre-consent page.
-# NEVER clicked while hold.stop_before_submit is true: we confirm it is on
-# screen (which proves the application really opened against our scheduleId),
-# screenshot it, and hand over. Treat this as load-bearing safety.
+# THE one click that commits you, and the one that actually holds the shift.
 #
-# It has no data-test-id, so it is matched by text inside the application
-# layout. Scoped to [data-test-id='layout'] to avoid the nav and footer.
-FINAL_SUBMIT: str = "[data-test-id='layout'] button:has-text('Next')"
+# The consent screen states you are 18+, willing to take a drug test, and
+# agree to the data policy. Pressing Create Application accepts all of that
+# and reserves the slot — confirmed by the banner it produces:
+#
+#   "We are holding a spot for you for the next 2 hours and 59 minutes to
+#    complete the remaining steps."   (then Step 1 of 7)
+#
+# So this is deliberately NOT part of HOLD_STEPS. It is clicked only when
+# hold.stop_before_submit is false, exactly like the old final-submit guard:
+# everything before it is reversible browsing, this is not.
+CREATE_APPLICATION: str = (
+    "[data-test-id='layout'] button:has-text('Create Application')"
+)
+
+# Proof the spot is really held, rather than us assuming it from a click that
+# appeared to work. Read back and passed on to Telegram with its countdown.
+HOLD_CONFIRMATION_PATTERN = r"holding a spot[^\n]*"
 
 # Marks the application page, so a hold can prove it landed where it meant to
 # rather than reporting success from whatever page it happens to be on.
@@ -157,8 +172,8 @@ def unconfigured_hold() -> list[str]:
         for i, (label, sel) in enumerate(HOLD_STEPS)
         if sel == TODO
     ]
-    if FINAL_SUBMIT == TODO:
-        missing.append("FINAL_SUBMIT")
+    if CREATE_APPLICATION == TODO:
+        missing.append("CREATE_APPLICATION")
     return missing
 
 
@@ -499,6 +514,41 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
 
 
 # ── acting on the page ──────────────────────────────────────────────────────
+def _screenshot(page: Any, path: str | None) -> None:
+    if not path:
+        return
+    try:
+        page.screenshot(path=path, full_page=False)
+    except Exception as exc:  # noqa: BLE001 - an image is never worth failing over
+        log.warning("screenshot failed: %s", exc)
+
+
+def _hold_confirmation(page: Any, timeout_ms: int = 10000) -> str:
+    """The site's own "we are holding a spot…" banner, or ''.
+
+    Polled rather than read once: the banner appears after the application is
+    created server-side, which takes a moment.
+    """
+    waited = 0
+    while waited < timeout_ms:
+        try:
+            found = page.evaluate(
+                """(pattern) => {
+                    const text = document.body ? document.body.innerText : '';
+                    const match = text.match(new RegExp(pattern, 'i'));
+                    return match ? match[0].trim() : '';
+                }""",
+                HOLD_CONFIRMATION_PATTERN,
+            )
+            if found:
+                return found
+        except Exception as exc:  # noqa: BLE001 - page may still be navigating
+            log.debug("could not read the holding banner: %s", exc)
+        page.wait_for_timeout(1000)
+        waited += 1000
+    return ""
+
+
 def hold_shift(
     page: Any,
     shift: Shift,
@@ -580,42 +630,58 @@ def hold_shift(
 
         scope = page  # subsequent steps are page-wide
 
-    # Wait for the application to actually render BEFORE capturing it. The tab
-    # opens blank and the app mounts a second or two later, so screenshotting
-    # immediately produced a plain white image — a Telegram alert carrying a
-    # blank photo is worse than no photo, because it looks like a failure.
+    # Wait for the consent screen to actually render BEFORE capturing it. The
+    # tab opens blank and the app mounts a second or two later, so
+    # screenshotting immediately produced a plain white image — a Telegram
+    # alert carrying a blank photo reads as a failure even when the hold worked.
     ready_error = None
     try:
-        page.locator(FINAL_SUBMIT).first.wait_for(state="visible", timeout=timeout_ms)
+        page.locator(CREATE_APPLICATION).first.wait_for(state="visible", timeout=timeout_ms)
     except Exception as exc:  # noqa: BLE001 - the URL check below still applies
         ready_error = exc
 
-    if screenshot_path:
-        try:
-            page.screenshot(path=screenshot_path, full_page=False)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("screenshot failed: %s", exc)
+    landed = APPLICATION_URL_MARKER in (page.url or "")
 
     if stop_before_submit:
-        landed = APPLICATION_URL_MARKER in (page.url or "")
+        _screenshot(page, screenshot_path)
         if ready_error is not None:
-            exc = ready_error
             if landed:
-                # The application is open, which is the part that matters, even
-                # if the button moved. Say exactly that rather than implying a
-                # failure or a clean success.
                 return True, (
-                    f"application open at {page.url} — could not confirm the "
-                    f"Next button ({exc})"
+                    f"application open at {page.url} — but the Create "
+                    f"Application button was not found ({ready_error}). "
+                    "THE SPOT IS NOT HELD."
                 )
             return False, (
-                f"clicked through but never reached the application page "
-                f"(still at {page.url}): {exc}"
+                f"clicked through but never reached the application "
+                f"(still at {page.url}): {ready_error}"
             )
-        return True, f"slot held — finish the application at {page.url}"
+        # Deliberate: everything so far is reversible browsing. Create
+        # Application accepts the drug-test and age declarations and is what
+        # reserves the slot, so it is gated behind stop_before_submit: false.
+        return True, (
+            "stopped at the consent screen — NOT held. Finish it yourself at "
+            f"{page.url}, or set hold.stop_before_submit: false to have the "
+            "watcher press Create Application for you."
+        )
+
+    if ready_error is not None:
+        _screenshot(page, screenshot_path)
+        return False, f"could not find the Create Application button: {ready_error}"
 
     try:
-        page.locator(FINAL_SUBMIT).first.click(timeout=timeout_ms)
-        return True, "application submitted automatically"
+        page.locator(CREATE_APPLICATION).first.click(timeout=timeout_ms)
     except Exception as exc:  # noqa: BLE001
-        return False, f"final submit click failed: {exc}"
+        _screenshot(page, screenshot_path)
+        return False, f"Create Application click failed: {exc}"
+
+    # Do not assume the click worked — the site says so itself, with a
+    # countdown. Read it back and pass it on.
+    confirmation = _hold_confirmation(page, timeout_ms=timeout_ms)
+    _screenshot(page, screenshot_path)
+
+    if confirmation:
+        return True, f"SPOT HELD — {confirmation}\nFinish the steps at {page.url}"
+    return True, (
+        "Create Application was clicked but the holding banner never appeared "
+        f"— check it by hand at {page.url}"
+    )

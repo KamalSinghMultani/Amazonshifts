@@ -140,15 +140,40 @@ class TelegramNotifier:
         )
         return self.send_text("\n".join(lines))
 
-    def notify_held(self, shift, stopped_before_submit: bool = True) -> bool:
-        tail = (
-            "Held — <b>finish the final submit yourself</b>."
-            if stopped_before_submit
-            else "Submitted automatically."
-        )
-        return self.send_text(
-            f"✅ <b>{html.escape(shift.title or 'Shift')}</b>\n{tail}"
-        )
+    def notify_held(
+        self, shift, stopped_before_submit: bool = True, detail: str = ""
+    ) -> bool:
+        """Report what actually happened to the slot.
+
+        The distinction is the whole message: a spot that is genuinely
+        reserved for three hours, versus one the watcher merely walked up to
+        and left open for somebody else. Reading "held" and finding the shift
+        gone is the worst outcome this tool can produce, so the wording never
+        blurs the two.
+        """
+        if stopped_before_submit:
+            head = "⚠️ <b>NOT held — you need to act</b>"
+            tail = (
+                "The watcher stopped at the consent screen without pressing "
+                "<b>Create Application</b>, so this shift is still open to "
+                "everyone else. Open it and press that button to hold it.\n\n"
+                "To have the watcher do this itself, set "
+                "<code>hold.stop_before_submit: false</code>."
+            )
+        else:
+            head = "✅ <b>SPOT HELD</b>"
+            tail = (
+                "Amazon is holding this for about <b>3 hours</b>. Finish the "
+                "remaining steps before it lapses."
+            )
+
+        lines = [head, f"<b>{html.escape(shift.title or 'Shift')}</b>"]
+        if shift.location:
+            lines.append(f"📍 {html.escape(shift.location)}")
+        lines.append(tail)
+        if detail:
+            lines.append(f"\n<pre>{html.escape(detail[:500])}</pre>")
+        return self.send_text("\n".join(lines))
 
     def notify_error(self, message: str) -> bool:
         return self.send_text(f"⚠️ <b>Watcher error</b>\n<pre>{html.escape(message[:600])}</pre>")

@@ -452,8 +452,10 @@ class Watcher:
 
         if ok:
             log.info("hold succeeded: %s", message)
-            self.notifier.notify_held(shift, self.cfg["hold"]["stop_before_submit"])
-            self.notifier.send_photo(shot, caption=message)
+            self.notifier.notify_held(
+                shift, self.cfg["hold"]["stop_before_submit"], detail=message
+            )
+            self.notifier.send_photo(shot, caption=message[:1000])
         else:
             log.error("hold failed: %s", message)
             self.notifier.notify_error(f"Hold failed for {shift.summary()}\n{message}")

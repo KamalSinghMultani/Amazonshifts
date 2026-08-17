@@ -63,7 +63,7 @@ python -m playwright codegen --load-storage=auth_state.json https://hiring.amazo
 ```
 
 Click through a job the way the bot should, copy the selectors Playwright generates,
-paste them into `SELECTORS`, `HOLD_STEPS`, and `FINAL_SUBMIT`. Then check your work:
+paste them into `SELECTORS`, `HOLD_STEPS`, and `CREATE_APPLICATION`. Then check your work:
 
 ```bash
 python watcher.py --check-selectors
