@@ -208,19 +208,25 @@ detect, rank, alert, hold — can be exercised on demand.
 | Dedup + detections | `state/seen_shifts.json`, `state/detections.jsonl` | `*.us.json`, `*.us.jsonl` |
 | Log | `logs/watcher.log` | `logs/watcher.us.log` |
 
-> ### ⚠️ One logged-in session at a time
+> ### ⚠️ Don't run two clients off one login
 >
-> `auth.hiring.amazon.com` serves both countries and you have ONE account
-> there, so a second signed-in client appears to invalidate the first.
-> Observed on 2026-08-17: a CA login at 19:01 left the US session dead by
-> 20:55, and a second CA client replaying copied cookies left the CA profile
-> signed out while its own copy still worked.
+> **Tested 2026-08-17, and the obvious theory was wrong:** signing in to the
+> same account in a second browser did NOT log the watcher out. Two concurrent
+> browser sessions coexist happily.
 >
-> **Running the US test environment can therefore log your Canadian watcher
-> out** — and a signed-out watcher still detects and alerts, so nothing looks
-> wrong until a shift is missed. Only use `config.us.yaml` when you do not
-> need Canada holding, and re-run `save_session.py` for Canada afterwards.
-> The session watch (every 10 minutes) is what tells you it happened.
+> What did coincide with a logout was something subtler — a second watcher
+> replaying a *copy* of the same cookies (`auth_state.json`) while the first
+> used the profile. Sessions rotate their tokens, and two clients taking turns
+> on one chain look like theft rather than use. So the rule is narrower than
+> "one login at a time": **don't run two watchers off the same saved session.**
+>
+> Detection needs no login at all, so US testing is safe as shipped —
+> `config.us.yaml` runs `dry_run: true` and never signs in. Only *holding*
+> needs a session, and only then does the US environment become worth thinking
+> about.
+>
+> How long a session survives on its own is still unmeasured. The session
+> watch (every 10 minutes) tells you the moment it stops.
 
 **Everything stateful is separate on purpose.** A test run must never mark a
 Canadian shift as already-seen, overwrite the Canadian login, or feed US posting

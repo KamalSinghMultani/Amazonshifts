@@ -65,11 +65,16 @@ You will be told: the watcher checks every 10 minutes and Telegram says
 
 Three things cause it, in order of likelihood:
 
-1. Someone signed in to the same Amazon account elsewhere — including the US
-   test environment, another browser, or your phone
-2. The session aged out on its own
+1. The session aged out on its own. How long that takes is unmeasured — the
+   clean test is to leave one watcher running overnight and check in the
+   morning
+2. Two watchers were running off the same saved session, rotating each other's
+   tokens
 3. You ticked nothing at login. If the login page offers **"Keep me signed
    in"**, use it
+
+Signing in on a second browser is NOT a cause — that was tested and the
+session survived it.
 
 Then:
 
@@ -84,10 +89,14 @@ Then:
 The US site always has jobs, so it is where the code gets exercised. It has its
 own profile, state and log.
 
-**But it shares your Amazon account.** One account appears to allow one live
-session, so signing in to the US site can sign the Canadian watcher out — and a
-signed-out watcher still detects and alerts, so nothing looks broken until a
-shift is missed. After any US testing:
+**Detection needs no login**, so testing here is safe as shipped: it runs
+`dry_run: true` and never signs in. Tested 2026-08-17 — a second browser login
+on the same account did NOT sign the watcher out.
+
+The one thing to avoid is two watchers running off the SAME saved session
+(`auth_state.json` copied into a second config). Sessions rotate their tokens
+and two clients on one chain can knock each other out. If you ever do sign in
+for a US hold test, check Canada afterwards:
 
     python watcher.py --doctor        # expect: hiring portal login — signed in
     python save_session.py            # if it says signed OUT
