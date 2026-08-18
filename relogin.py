@@ -39,6 +39,20 @@ EMAIL_INPUT = "#login, [data-test-id='input-test-id-login']"
 CONTINUE_BUTTON = "[data-test-id='button-continue']"
 CONSENT_BUTTON = "[data-test-id='consentBtn']"
 
+# The login form has a REQUIRED country selector, and skipping it fails in a
+# way that looks like something else entirely: Continue simply never becomes
+# clickable, and the first attempt died on a 20s click timeout rather than on
+# anything to do with credentials. The error only appears after you try:
+# "Please select the country where you registered your account."
+COUNTRY_TOGGLE = "#country-toggle-button"
+COUNTRY_OPTION = "li[role='option']"
+
+# Which country to pick, from the site being watched.
+COUNTRY_BY_HOST = {
+    "hiring.amazon.ca": "Canada",
+    "hiring.amazon.com": "United States",
+}
+
 # Step 2 is a 6-DIGIT PIN, not a password. Learned from the competing
 # service's own onboarding bot, which asks its customers for exactly that:
 #
@@ -130,6 +144,43 @@ def _needs_a_human(text: str) -> str | None:
 
 
 
+
+def country_for(base_url: str) -> str:
+    """Canada for the .ca site, United States for .com."""
+    for host, country in COUNTRY_BY_HOST.items():
+        if host in (base_url or ""):
+            return country
+    return "Canada"
+
+
+def _dismiss_consent(page: Any) -> None:
+    """The cookie modal renders over the login form and eats the clicks.
+
+    It is present on the auth domain too, not just the hiring site — which is
+    why dismissing it once before navigating here was not enough.
+    """
+    try:
+        consent = page.locator(CONSENT_BUTTON).first
+        if consent.count() and consent.is_visible():
+            consent.click(timeout=8000)
+            page.wait_for_timeout(800)
+    except Exception as exc:  # noqa: BLE001 - absence is the normal case
+        log.debug("no consent modal: %s", exc)
+
+
+def _select_country(page: Any, country: str, *, timeout_ms: int = 20000) -> bool:
+    """Pick the country. Required, and the form will not proceed without it."""
+    try:
+        page.locator(COUNTRY_TOGGLE).first.click(timeout=timeout_ms)
+        page.wait_for_timeout(800)
+        option = page.locator(f"{COUNTRY_OPTION}:has-text('{country}')").first
+        option.click(timeout=timeout_ms)
+        page.wait_for_timeout(600)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not select the country %r: %s", country, exc)
+        return False
+
 def _enter_pin(page: Any, pin: str, *, timeout_ms: int = 20000) -> bool:
     """Type the PIN, whether it is one field or six little boxes.
 
@@ -193,11 +244,19 @@ def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, 
         if blocker:
             return OTP_REQUIRED, f"the login page is asking for {blocker!r}"
 
+        # The consent modal is on this domain too, and its backdrop swallows
+        # every click on the form behind it.
+        _dismiss_consent(page)
+
+        country = country_for(base_url)
+        if not _select_country(page, country, timeout_ms=timeout_ms):
+            return UNKNOWN, f"could not select the country {country!r} on the login form"
+
         field = page.locator(EMAIL_INPUT).first
         field.wait_for(state="visible", timeout=timeout_ms)
         field.fill(email)
         page.locator(CONTINUE_BUTTON).first.click(timeout=timeout_ms)
-        page.wait_for_timeout(4000)
+        page.wait_for_timeout(5000)
 
         text = _page_text(page)
         blocker = _needs_a_human(text)

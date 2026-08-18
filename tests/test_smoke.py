@@ -2440,3 +2440,25 @@ def test_a_split_digit_pin_field_gets_every_digit():
     page = SplitPinPage()
     assert relogin._enter_pin(page, "485469") is True
     assert page.digits == ["4", "8", "5", "4", "6", "9"]
+
+
+def test_the_country_is_chosen_from_the_site_being_watched():
+    """The login form requires a country, and skipping it fails in a way that
+    looks like something else: Continue never becomes clickable, so the first
+    real attempt died on a 20s click timeout with nothing to do with
+    credentials."""
+    assert relogin.country_for("https://hiring.amazon.ca") == "Canada"
+    assert relogin.country_for("https://hiring.amazon.com") == "United States"
+    assert relogin.country_for("") == "Canada"
+
+
+def test_an_emailed_verification_code_stops_the_attempt(monkeypatch):
+    """Confirmed against the live login on 2026-08-17: email and PIN both go
+    through, then Amazon offers to email a code. The attempt must stop there —
+    it cannot read your email, and clicking 'Send verification code' would
+    spam you for nothing."""
+    monkeypatch.setenv("AMAZON_LOGIN_EMAIL", "someone@example.com")
+    monkeypatch.setenv("AMAZON_LOGIN_PIN", "123456")
+    assert relogin._needs_a_human("where should we send your verification code?")
+    assert relogin._needs_a_human("check your email for the code")
+    assert not relogin._needs_a_human("welcome back")
