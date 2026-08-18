@@ -208,6 +208,20 @@ detect, rank, alert, hold — can be exercised on demand.
 | Dedup + detections | `state/seen_shifts.json`, `state/detections.jsonl` | `*.us.json`, `*.us.jsonl` |
 | Log | `logs/watcher.log` | `logs/watcher.us.log` |
 
+> ### ⚠️ One logged-in session at a time
+>
+> `auth.hiring.amazon.com` serves both countries and you have ONE account
+> there, so a second signed-in client appears to invalidate the first.
+> Observed on 2026-08-17: a CA login at 19:01 left the US session dead by
+> 20:55, and a second CA client replaying copied cookies left the CA profile
+> signed out while its own copy still worked.
+>
+> **Running the US test environment can therefore log your Canadian watcher
+> out** — and a signed-out watcher still detects and alerts, so nothing looks
+> wrong until a shift is missed. Only use `config.us.yaml` when you do not
+> need Canada holding, and re-run `save_session.py` for Canada afterwards.
+> The session watch (every 10 minutes) is what tells you it happened.
+
 **Everything stateful is separate on purpose.** A test run must never mark a
 Canadian shift as already-seen, overwrite the Canadian login, or feed US posting
 times into `--drop-report` — that last one would quietly set your `hot_windows`

@@ -60,8 +60,18 @@ Skipping this makes it hang on a profile lock and look broken when it is not.
 
 ## 4. When the session expires
 
-You will be told — Telegram says "Session appears to have expired", or `--doctor`
-reports `signed OUT`. Then:
+You will be told: the watcher checks every 10 minutes and Telegram says
+**"Amazon session expired"**, or `--doctor` reports `signed OUT`.
+
+Three things cause it, in order of likelihood:
+
+1. Someone signed in to the same Amazon account elsewhere — including the US
+   test environment, another browser, or your phone
+2. The session aged out on its own
+3. You ticked nothing at login. If the login page offers **"Keep me signed
+   in"**, use it
+
+Then:
 
     Stop-ScheduledTask -TaskName AmazonShiftWatcher
     python save_session.py
@@ -72,7 +82,15 @@ reports `signed OUT`. Then:
 ## 5. Testing (US site — never for real shifts)
 
 The US site always has jobs, so it is where the code gets exercised. It has its
-own login, state and log, and cannot touch the Canadian setup.
+own profile, state and log.
+
+**But it shares your Amazon account.** One account appears to allow one live
+session, so signing in to the US site can sign the Canadian watcher out — and a
+signed-out watcher still detects and alerts, so nothing looks broken until a
+shift is missed. After any US testing:
+
+    python watcher.py --doctor        # expect: hiring portal login — signed in
+    python save_session.py            # if it says signed OUT
 
 | When | Command |
 |---|---|
