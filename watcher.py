@@ -87,6 +87,16 @@ class Watcher:
         # you would hear nothing at all. So they go out in parallel.
         self._senders: list[threading.Thread] = []
 
+        # Session watch. The portal signs itself out after a couple of hours
+        # while job search carries on working, so nothing about a normal poll
+        # reveals that holding has become impossible.
+        session_cfg = cfg.get("session") or {}
+        self.session_check_every = float(session_cfg.get("check_every_seconds") or 0)
+        self.session_keepalive = bool(session_cfg.get("keepalive", True))
+        self.alert_on_expiry = bool(session_cfg.get("alert_on_expiry", True))
+        self.next_session_check = 0.0
+        self.session_ok: bool | None = None
+
         self.context = None
         self.page = None
         self.api_client: ApiClient | None = None
@@ -249,12 +259,75 @@ class Watcher:
                 if self.consecutive_errors >= polling["max_consecutive_errors"]:
                     self._trip_circuit_breaker(exc)
 
+            self.check_session_if_due()
+
             if once or self.stop_event.is_set():
                 break
 
             delay, hot = self._next_delay()
             log.debug("sleeping %.1fs%s", delay, " [hot]" if hot else "")
             self.stop_event.wait(delay)
+
+    # ── session watch ───────────────────────────────────────────────────────
+    def session_check_due(self, now: float | None = None) -> bool:
+        if self.session_check_every <= 0 or self.dry_run:
+            # In dry run nothing will be held anyway, so an expired session
+            # costs nothing and does not deserve an alert.
+            return False
+        return (now if now is not None else time.monotonic()) >= self.next_session_check
+
+    def check_session_if_due(self) -> bool | None:
+        """Confirm the hiring portal is still signed in, and say so if not.
+
+        Loading /application/ doubles as the keepalive: an idle session is what
+        expires, and this is the same page the hold flow needs anyway.
+        """
+        if not self.session_check_due():
+            return None
+        self.next_session_check = time.monotonic() + self.session_check_every
+
+        page = None
+        try:
+            page = self.context.new_page()
+            check = doctor.check_portal_login(page, self.cfg["site"]["base_url"])
+            signed_in = check.state == doctor.OK
+        except Exception as exc:  # noqa: BLE001 - a check must never kill the loop
+            log.warning("session check failed: %s", exc)
+            return None
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        was = self.session_ok
+        self.session_ok = signed_in
+
+        if signed_in:
+            if was is False:
+                log.info("hiring portal session is back")
+                if self.alert_on_expiry:
+                    self.notify_async(
+                        self.notifier.send_text,
+                        "\u2705 <b>Session restored</b> — holding works again.",
+                    )
+            else:
+                log.debug("session check: still signed in")
+            return True
+
+        log.error("hiring portal session has EXPIRED — detection works, holding will not")
+        # Once per expiry, not once per check: an hourly nag you learn to
+        # ignore is worse than no alert at all.
+        if was is not False and self.alert_on_expiry:
+            self.notify_async(
+                self.notifier.send_text,
+                "\u26a0\ufe0f <b>Amazon session expired</b>\n"
+                "Shifts will still be detected and alerted, but the watcher "
+                "<b>cannot hold one</b> until you log in again:\n"
+                "<code>python save_session.py</code>",
+            )
+        return False
 
     # ── hot mode ────────────────────────────────────────────────────────────
     def is_hot(self, now: datetime | None = None) -> bool:

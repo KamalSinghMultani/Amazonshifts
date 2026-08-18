@@ -89,6 +89,14 @@ DEFAULTS: dict[str, Any] = {
     # max_per_poll: you only need to win one shift; holding a whole batch
     # would race itself and multiply the clicks.
     "hold": {"enabled": True, "stop_before_submit": True, "max_per_poll": 1},
+    # The hiring portal session expires on its own — measured at roughly two
+    # hours. Detection keeps working when it does, which is precisely the
+    # danger: the watcher looks healthy and cannot hold a thing.
+    "session": {
+        "check_every_seconds": 600,
+        "keepalive": True,
+        "alert_on_expiry": True,
+    },
     "state": {
         "path": "state/seen_shifts.json",
         "ttl_hours": 72,
@@ -256,6 +264,14 @@ def validate_config(cfg: dict) -> None:
             "is imaginary",
             hot, polling.get("render_wait_ms"),
         )
+
+    session = cfg.get("session") or {}
+    if session.get("check_every_seconds") is not None:
+        if int(session["check_every_seconds"]) < 60:
+            raise ValueError(
+                "session.check_every_seconds below 60 loads a page far more "
+                "often than a session can plausibly expire"
+            )
 
     # Parse for the side effect: a malformed window must fail at startup.
     polling["hot_windows_parsed"] = parse_hot_windows(polling.get("hot_windows"))

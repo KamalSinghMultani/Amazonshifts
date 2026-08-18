@@ -358,6 +358,22 @@ hold:
   # as soon as the spot is secured.
   stop_before_submit: false
 
+# ── Session watch ───────────────────────────────────────────────────────────
+# MEASURED 2026-08-17: the hiring-portal session signed itself out after about
+# two hours, while job search kept working perfectly. That is the dangerous
+# failure — the watcher looks healthy, detects shifts, alerts you, and cannot
+# hold a single one.
+#
+# So it checks periodically and tells you. Loading /application/ doubles as a
+# keepalive, since it is an idle session that expires, and it is the same page
+# the hold flow needs anyway.
+session:
+  check_every_seconds: 600   # 10 minutes
+  keepalive: true
+  # One alert per expiry, not one per check — an hourly nag is one you learn
+  # to ignore. You also get a message when the session comes back.
+  alert_on_expiry: true
+
 state:
   path: "state/seen_shifts.json"
   # Forget a shift id after this long, so a genuinely re-posted shift

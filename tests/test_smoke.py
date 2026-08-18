@@ -2076,3 +2076,136 @@ def test_the_profile_in_use_error_says_how_to_fix_it():
         "the browser profile browser_profile is already open in another process"
     )
     assert "already open" in str(exc)
+
+
+# ── session expiry: the silent killer ───────────────────────────────────────
+class FakeCheckPage:
+    def __init__(self, url):
+        self.url = url
+        self.closed = False
+
+    def goto(self, url, **_kw):
+        pass
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def _session_watcher(tmp_path, signed_in, **overrides):
+    overrides.setdefault("dry_run", False)
+    w = _batch_watcher(tmp_path, [], **overrides)
+    w.session_check_every = 600
+    w.next_session_check = 0.0
+
+    url = ("https://hiring.amazon.ca/application/ca/#/pre-consent" if signed_in
+           else "https://auth.hiring.amazon.com/#/login")
+
+    class Ctx:
+        pages = []
+
+        def new_page(self_inner):
+            return FakeCheckPage(url)
+
+    w.context = Ctx()
+    return w
+
+
+def test_an_expired_session_is_detected_and_alerted(tmp_path):
+    """Measured live: the CA portal signed itself out after about two hours
+    while job search carried on working. Nothing about a poll reveals it, so
+    the watcher would alert on a Brampton shift and then fail to hold it."""
+    w = _session_watcher(tmp_path, signed_in=False)
+    assert w.check_session_if_due() is False
+    w.drain_notifications(timeout=5)
+    assert any("session expired" in t.lower() for t in w.notifier.texts), w.notifier.texts
+    assert any("save_session.py" in t for t in w.notifier.texts)
+
+
+def test_an_expired_session_is_only_alerted_once(tmp_path):
+    """An hourly nag is one you learn to ignore, which is worse than silence."""
+    w = _session_watcher(tmp_path, signed_in=False)
+    for _ in range(3):
+        w.next_session_check = 0.0
+        w.check_session_if_due()
+    w.drain_notifications(timeout=5)
+    assert len(w.notifier.texts) == 1, w.notifier.texts
+
+
+def test_recovery_is_reported_too(tmp_path):
+    w = _session_watcher(tmp_path, signed_in=False)
+    w.check_session_if_due()
+
+    healthy = _session_watcher(tmp_path, signed_in=True)
+    healthy.notifier = w.notifier
+    healthy.session_ok = False
+    healthy.next_session_check = 0.0
+    assert healthy.check_session_if_due() is True
+    healthy.drain_notifications(timeout=5)
+    assert any("restored" in t.lower() for t in healthy.notifier.texts)
+
+
+def test_a_healthy_session_says_nothing(tmp_path):
+    w = _session_watcher(tmp_path, signed_in=True)
+    assert w.check_session_if_due() is True
+    w.drain_notifications(timeout=5)
+    assert w.notifier.texts == []
+
+
+def test_dry_run_does_not_nag_about_the_session(tmp_path):
+    """Nothing will be held in dry run, so an expired session costs nothing."""
+    w = _session_watcher(tmp_path, signed_in=False, dry_run=True)
+    assert w.check_session_if_due() is None
+    assert w.notifier.texts == []
+
+
+def test_the_check_page_is_always_closed(tmp_path):
+    """A page leaked every ten minutes would quietly eat the machine."""
+    pages = []
+
+    w = _batch_watcher(tmp_path, [], dry_run=False)
+    w.session_check_every = 600
+    w.next_session_check = 0.0
+
+    class Ctx:
+        pages = []
+
+        def new_page(self_inner):
+            page = FakeCheckPage("https://auth.hiring.amazon.com/#/login")
+            pages.append(page)
+            return page
+
+    w.context = Ctx()
+    w.check_session_if_due()
+    assert pages and all(p.closed for p in pages)
+
+
+def test_a_broken_check_never_takes_the_loop_down(tmp_path):
+    w = _batch_watcher(tmp_path, [], dry_run=False)
+    w.session_check_every = 600
+    w.next_session_check = 0.0
+
+    class Ctx:
+        pages = []
+
+        def new_page(self_inner):
+            raise RuntimeError("browser is having a bad day")
+
+    w.context = Ctx()
+    assert w.check_session_if_due() is None  # must not raise
+
+
+def test_the_check_does_not_run_more_often_than_configured(tmp_path):
+    w = _session_watcher(tmp_path, signed_in=True)
+    assert w.check_session_if_due() is True
+    assert w.check_session_if_due() is None, "second call is not due yet"
+
+
+def test_a_silly_session_check_interval_is_rejected():
+    cfg = config_mod._deep_merge(
+        config_mod.DEFAULTS, {"session": {"check_every_seconds": 5}}
+    )
+    with pytest.raises(ValueError, match="check_every_seconds"):
+        config_mod.validate_config(cfg)
