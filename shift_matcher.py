@@ -7,9 +7,12 @@ browser.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
+
+log = logging.getLogger(__name__)
 
 
 def _norm(value: Any) -> str:
@@ -19,14 +22,33 @@ def _norm(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
+# An hourly wage above this is not a wage. Seen live: Amazon returned
+# 1.797...e308 — DBL_MAX, its "no pay data" sentinel — for a Nisku posting.
+# Left alone that sorts ABOVE every genuine shift, so priority.order: pay
+# would rank a posting with no pay data first in a batch.
+IMPLAUSIBLE_PAY_RATE = 1000.0
+
+
 def _to_float(value: Any) -> float | None:
     """Best-effort numeric parse. '$18.50/hr' -> 18.5, junk -> None."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
-    match = re.search(r"\d+(?:\.\d+)?", str(value).replace(",", ""))
-    return float(match.group()) if match else None
+        number = float(value)
+    else:
+        match = re.search(r"\d+(?:\.\d+)?", str(value).replace(",", ""))
+        if not match:
+            return None
+        number = float(match.group())
+
+    # Treat a sentinel as missing rather than enormous: "unknown" already sorts
+    # last, which is where a posting with no pay data belongs.
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    if abs(number) > IMPLAUSIBLE_PAY_RATE:
+        log.debug("ignoring implausible pay rate %r", value)
+        return None
+    return number
 
 
 @dataclass

@@ -2800,3 +2800,22 @@ def test_a_dead_session_alerts_instead_of_attempting_a_doomed_hold(tmp_path):
     assert urgent, w.notifier.texts
     assert "jobDetail" in urgent[0], "the alert must carry the link to grab by hand"
     assert "save_session.py" in urgent[0]
+
+
+def test_amazons_no_pay_sentinel_is_not_a_wage():
+    """Seen live: a Nisku posting came back with 1.797e308 — DBL_MAX, Amazon's
+    "no pay data" marker. Parsed as a wage it sorts above every real shift, so
+    priority.order: pay would rank it first in a batch."""
+    assert Shift(pay_rate=1.7976931348623157e308).pay_rate is None
+    assert Shift(pay_rate=float("inf")).pay_rate is None
+    assert Shift(pay_rate=99999).pay_rate is None
+    # ...while real wages are untouched
+    assert Shift(pay_rate=23.10).pay_rate == 23.10
+    assert Shift(pay_rate="$18.50/hr").pay_rate == 18.50
+
+
+def test_a_sentinel_pay_rate_ranks_last_not_first():
+    ranker = ShiftRanker({"order": ["pay"], "locations": [], "titles": [], "demote_titles": []})
+    junk = Shift(id="junk", title="A", location="Nisku, AB", pay_rate=1.7976931348623157e308)
+    real = Shift(id="real", title="B", location="Brampton, ON", pay_rate=23.10)
+    assert ranker.sort([junk, real])[0].id == "real"
