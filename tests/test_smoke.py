@@ -2056,3 +2056,23 @@ def test_settling_gives_up_immediately_on_a_login_page():
             raise AssertionError("must not probe for buttons on the login page")
 
     assert site_selectors._settle_after_popup(LoginPage(), timeout_ms=20000) is False
+
+
+# ── two processes, one browser profile ──────────────────────────────────────
+def test_a_locked_profile_is_named_as_such():
+    """Chrome allows one process per profile and exits 21 when a second tries.
+    Playwright reports that as a TargetClosedError with sixty lines of launch
+    flags, which reads like a Playwright bug and sends you debugging the wrong
+    thing. It is almost always just the watcher already running."""
+    assert browser_launch.looks_like_profile_in_use("<process did exit: exitCode=21>")
+    assert browser_launch.looks_like_profile_in_use(
+        "BrowserType.launch_persistent_context: Target page, context or browser has been closed"
+    )
+    assert not browser_launch.looks_like_profile_in_use("net::ERR_CONNECTION_REFUSED")
+
+
+def test_the_profile_in_use_error_says_how_to_fix_it():
+    exc = browser_launch.ProfileInUse(
+        "the browser profile browser_profile is already open in another process"
+    )
+    assert "already open" in str(exc)

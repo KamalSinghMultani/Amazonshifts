@@ -131,9 +131,21 @@ def launch_context(
         profile = Path(user_data_dir)
         profile.mkdir(parents=True, exist_ok=True)
         log.info("using persistent browser profile at %s", profile)
-        context = playwright.chromium.launch_persistent_context(
-            str(profile), **launch_kwargs, **context_kwargs
-        )
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                str(profile), **launch_kwargs, **context_kwargs
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised, just intelligibly
+            if looks_like_profile_in_use(str(exc)):
+                raise ProfileInUse(
+                    f"the browser profile {profile} is already open in another "
+                    "process — almost always the watcher itself.\n"
+                    "Stop it first, then run this again:\n"
+                    "    Stop-ScheduledTask -TaskName AmazonShiftWatcher\n"
+                    "    (or press Ctrl-C in the run_watcher.bat window)\n"
+                    "Only one process at a time can use a Chrome profile."
+                ) from exc
+            raise
         browser = None
     else:
         browser = playwright.chromium.launch(**launch_kwargs)
@@ -144,6 +156,30 @@ def launch_context(
 
     return browser, context
 
+
+
+class ProfileInUse(RuntimeError):
+    """Another process already has this browser profile open.
+
+    Chrome allows exactly one process per profile directory and exits with
+    code 21 when a second tries. Playwright surfaces that as a TargetClosedError
+    with sixty lines of launch flags, which reads like a Playwright bug and
+    sends you debugging the wrong thing. It is almost always just the watcher
+    already running.
+    """
+
+
+# Signatures of "profile is locked" inside Playwright's launch error text.
+PROFILE_IN_USE_MARKERS = ("exitcode=21", "process singleton", "profile appears to be in use")
+
+
+def looks_like_profile_in_use(error_text: str) -> bool:
+    low = (error_text or "").lower()
+    if any(marker in low for marker in PROFILE_IN_USE_MARKERS):
+        return True
+    # The generic close error only means this when a persistent profile was
+    # involved, which the caller establishes before asking.
+    return "target page, context or browser has been closed" in low
 
 def close_context(browser, context) -> None:
     """Close whichever of the two actually owns the browser process."""

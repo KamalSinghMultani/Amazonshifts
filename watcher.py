@@ -699,7 +699,11 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(cfg)
 
     if args.doctor:
-        return run_doctor(cfg)
+        try:
+            return run_doctor(cfg)
+        except browser_launch.ProfileInUse as exc:
+            log.error("%s", exc)
+            return 3
 
     if cfg["polling"]["mode"] == "dom" and not site_selectors.detection_ready():
         log.error(
@@ -717,7 +721,12 @@ def main(argv: list[str] | None = None) -> int:
             ", ".join(missing_hold),
         )
 
-    return Watcher(cfg, live_override=args.live).run(once=args.once)
+    try:
+        return Watcher(cfg, live_override=args.live).run(once=args.once)
+    except browser_launch.ProfileInUse as exc:
+        # Two watchers on one profile is a configuration mistake, not a crash.
+        log.error("%s", exc)
+        return 3
 
 
 if __name__ == "__main__":
