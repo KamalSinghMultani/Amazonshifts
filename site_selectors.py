@@ -17,7 +17,8 @@ import with a confusing traceback.
 from __future__ import annotations
 
 import logging
-from typing import Any
+import time
+from typing import Any, NamedTuple
 from urllib.parse import urljoin
 
 from shift_matcher import Shift
@@ -82,27 +83,42 @@ RESULTS_CONTAINER = "[data-test-id='jobResultContainer']"
 # `hvh-careers-emotion-1ua2ui2` — that hash changes whenever Amazon rebuilds
 # the frontend, and any selector using it will silently rot.
 
-# The click path to hold a slot, in order. Each step is (label, selector).
+class HoldStep(NamedTuple):
+    """One click in the path to a held slot.
+
+    `opens_popup` exists because waiting for a new tab is expensive and only
+    one step actually opens one. Measured on a real hold: waiting after every
+    step burned 8 seconds twice — 16 of the 28 seconds between spotting the
+    shift and having it reserved, spent watching for tabs that were never
+    going to appear.
+    """
+
+    label: str
+    selector: str
+    opens_popup: bool = False
+
+
+# The click path to hold a slot, in order.
 # Everything here IS clicked when dry_run is false.
 # ":scope" means "the matched card itself" — job cards are role="link" divs
 # with a JS click handler, so the card IS the button.
-HOLD_STEPS: list[tuple[str, str]] = [
+HOLD_STEPS: list[HoldStep] = [
     # CONFIRMED: the card is role="link" — clicking it opens
     #   /app#/jobDetail?jobId=JOB-US-0000018024
-    ("open job", ":scope"),
+    HoldStep("open job", ":scope"),
     # CONFIRMED: the detail page's primary action. Opens the schedule flyout
-    # ([data-test-id='scheduleSelectorPanelFlyout']).
-    ("select schedule", "[data-test-id='jobDetailSelectScheduleButton']"),
+    # ([data-test-id='scheduleSelectorPanelFlyout']) in the SAME tab.
+    HoldStep("select schedule", "[data-test-id='jobDetailSelectScheduleButton']"),
     # CONFIRMED live 2026-08-17: each schedule card in the flyout carries its
     # own "Apply" button. Despite the name it is a <button>, not a link.
     #
-    # ⚠️ This click OPENS A NEW TAB. hold_shift() follows it — see
-    # _wait_for_new_page(). Anything after this step runs in that tab.
-    ("pick a shift", "[data-test-id='ScheduleCardSelectScheduleLink']"),
+    # ⚠️ The one step that OPENS A NEW TAB. Everything after it runs there.
+    HoldStep("pick a shift", "[data-test-id='ScheduleCardSelectScheduleLink']",
+             opens_popup=True),
     # CONFIRMED: the application opens on a pre-consent page whose only action
-    # is "Next". Harmless — it commits nothing, it just reveals the consent
+    # is "Next" — same tab. It commits nothing, it just reveals the consent
     # screen where the real decision lives.
-    ("open the consent screen", "[data-test-id='layout'] button:has-text('Next')"),
+    HoldStep("open the consent screen", "[data-test-id='layout'] button:has-text('Next')"),
 ]
 
 # That is the whole click path, and it is deliberately short.
@@ -157,6 +173,14 @@ HOLD_CONFIRMATION_PATTERN = r"holding a spot[^\n]*"
 # Marks the application page, so a hold can prove it landed where it meant to
 # rather than reporting success from whatever page it happens to be on.
 APPLICATION_PAGE_MARKER = "[data-test-id='text-pre-consent-page-title']"
+
+# The application mounts either the pre-consent screen (Next) or, if that step
+# is skipped, the consent screen (Create Application). Either one proves the
+# app is up and ready to be clicked.
+APPLICATION_ANY_ACTION = (
+    "[data-test-id='layout'] button:has-text('Next'), "
+    "[data-test-id='layout'] button:has-text('Create Application')"
+)
 APPLICATION_URL_MARKER = "/application/"
 
 
@@ -168,9 +192,9 @@ def unconfigured_detection() -> list[str]:
 def unconfigured_hold() -> list[str]:
     """Placeholders that stop the watcher from *clicking* through to a slot."""
     missing = [
-        f"HOLD_STEPS[{i}] {label}"
-        for i, (label, sel) in enumerate(HOLD_STEPS)
-        if sel == TODO
+        f"HOLD_STEPS[{i}] {step.label}"
+        for i, step in enumerate(HOLD_STEPS)
+        if step.selector == TODO
     ]
     if CREATE_APPLICATION == TODO:
         missing.append("CREATE_APPLICATION")
@@ -242,6 +266,10 @@ def _wait_for_new_page(context: Any, known: set, timeout_ms: int = 8000) -> Any 
     "Apply" opens the application in a new tab. Without following it the hold
     would keep clicking at the old page and time out with a misleading error
     about a missing button.
+
+    Only ever called for a step declared `opens_popup`. Calling it after a
+    step that opens nothing costs the entire timeout for no reason — which is
+    exactly the bug this signature comment now exists to prevent.
     """
     if context is None:
         return None
@@ -254,10 +282,53 @@ def _wait_for_new_page(context: Any, known: set, timeout_ms: int = 8000) -> Any 
                 except Exception as exc:  # noqa: BLE001 - a slow tab is still a tab
                     log.debug("new tab did not settle: %s", exc)
                 return candidate
-        context.pages[0].wait_for_timeout(250)
-        waited += 250
+        context.pages[0].wait_for_timeout(100)
+        waited += 100
     return None
 
+
+
+def _settle_after_popup(page: Any, timeout_ms: int = 20000) -> bool:
+    """Wait for the tab Apply opened to become the application.
+
+    It opens as about:blank, redirects through /application/?…&page=pre-consent
+    and only then mounts the React app. Clicking into it before that races the
+    mount — which is exactly what happened once the accidental 8-second waits
+    were removed: the Next button was not there yet and the hold failed 10s
+    later having done nothing.
+
+    Readiness, not a fixed sleep: this returns the moment the app is up, which
+    was 2.3s in the fast case and is allowed considerably longer in the slow
+    one, because a slow tab still holds a shift and a bailout holds nothing.
+    """
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except Exception as exc:  # noqa: BLE001 - a slow tab is still a tab
+        log.debug("popup did not reach domcontentloaded: %s", exc)
+
+    waited = 0
+    while waited < timeout_ms:
+        url = page.url or ""
+        # A signed-out session lands here instead of the application. Waiting
+        # the full timeout for an app that is never coming just delays the
+        # message telling you to log in.
+        if is_login_page(page):
+            log.warning("the application tab went to the login page")
+            return False
+        if APPLICATION_URL_MARKER in url and url != "about:blank":
+            try:
+                if page.locator(APPLICATION_ANY_ACTION).first.is_visible():
+                    return True
+            except Exception as exc:  # noqa: BLE001 - still mounting
+                log.debug("application not ready yet: %s", exc)
+        try:
+            page.wait_for_timeout(100)
+        except Exception:  # noqa: BLE001
+            return False
+        waited += 100
+
+    log.warning("application tab never settled within %dms (at %s)", timeout_ms, page.url)
+    return False
 
 def page_state(page: Any) -> tuple[str, str]:
     """Classify the current page.
@@ -549,6 +620,44 @@ def _hold_confirmation(page: Any, timeout_ms: int = 10000) -> str:
     return ""
 
 
+CONFIRMED = "confirmed"
+FAILED = "failed"
+UNCERTAIN = "uncertain"
+
+
+class HoldResult:
+    """What happened, in three states rather than two.
+
+    The middle state is the point. "Pressed Create Application but never saw
+    the holding banner" is neither success nor failure: the application may
+    well exist. Calling it held would send you to bed believing you have a
+    shift you do not; calling it failed would have you fight for one you
+    already hold. It gets its own status, and a message telling you to look.
+    """
+
+    def __init__(self, status, message, *, url="", banner="", timings=None):
+        self.status = status
+        self.message = message
+        self.url = url
+        self.banner = banner
+        self.timings = timings or []
+
+    @property
+    def held(self):
+        return self.status == CONFIRMED
+
+    @property
+    def needs_you(self):
+        """Should this interrupt the human right now?"""
+        return self.status in (FAILED, UNCERTAIN)
+
+    def timing_summary(self):
+        return ", ".join("{} {:.0f}ms".format(label, ms) for label, ms in self.timings)
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return "<HoldResult {}: {}>".format(self.status, self.message[:60])
+
+
 def hold_shift(
     page: Any,
     shift: Shift,
@@ -556,19 +665,26 @@ def hold_shift(
     stop_before_submit: bool = True,
     timeout_ms: int = 10000,
     screenshot_path: str | None = None,
-) -> tuple[bool, str]:
+) -> HoldResult:
     """Click through to hold the slot.
 
-    Returns (ok, message). Stops one step before the final submit unless
-    stop_before_submit is explicitly false.
+    Every step is timed, because the gap between spotting a shift and having
+    it reserved is the number this whole program exists to shrink.
     """
     if not selectors_ready():
-        return False, f"selectors not configured: {', '.join(unconfigured())}"
+        return HoldResult(FAILED, f"selectors not configured: {', '.join(unconfigured())}")
+
+    began = time.perf_counter()
+    timings: list[tuple[str, float]] = []
+
+    def mark(label: str) -> None:
+        timings.append((label, (time.perf_counter() - began) * 1000))
 
     # Must happen before any click: the consent modal's backdrop swallows
     # pointer events, and every step below would time out.
     dismiss_overlays(page, timeout_ms=min(timeout_ms, 3000))
 
+    mark("overlays dismissed")
     steps = list(HOLD_STEPS)
 
     if on_detail_page(page):
@@ -581,7 +697,10 @@ def hold_shift(
     else:
         card = find_matching_card(page, shift)
         if card is None:
-            return False, f"could not find the card for {shift.summary()!r} on the page"
+            return HoldResult(
+                FAILED, f"could not find the card for {shift.summary()!r} on the page",
+                url=getattr(page, "url", "") or "", timings=timings,
+            )
         try:
             card.scroll_into_view_if_needed(timeout=timeout_ms)
         except Exception as exc:  # noqa: BLE001 - non-fatal
@@ -593,39 +712,63 @@ def hold_shift(
     # "pick a shift" must be scoped to the schedule flyout: an unscoped Apply
     # selector could match a button elsewhere on a busy page.
     steps = [
-        (label, f"{SCHEDULE_FLYOUT} {selector}")
-        if label == "pick a shift" and not selector.startswith(SCHEDULE_FLYOUT)
-        else (label, selector)
-        for label, selector in steps
+        step._replace(selector=f"{SCHEDULE_FLYOUT} {step.selector}")
+        if step.label == "pick a shift" and not step.selector.startswith(SCHEDULE_FLYOUT)
+        else step
+        for step in steps
     ]
 
     context = getattr(page, "context", None)
 
-    for step_number, (label, selector) in enumerate(steps):
-        known_pages = set(context.pages) if context else set()
+    for step_number, step in enumerate(steps):
+        # Snapshot before the click, never after: the tab can exist before
+        # control comes back to us, and a listener armed afterwards misses it.
+        known_pages = set(context.pages) if (context and step.opens_popup) else set()
+        step_started = time.perf_counter()
         try:
-            target = scope.locator(selector).first
+            target = scope.locator(step.selector).first
             target.wait_for(state="visible", timeout=timeout_ms)
             target.click(timeout=timeout_ms)
-            log.info("hold step %d/%d ok: %s", step_number + 1, len(steps), label)
+            log.info(
+                "hold step %d/%d ok: %s (%.0fms)",
+                step_number + 1, len(steps), step.label,
+                (time.perf_counter() - step_started) * 1000,
+            )
+            mark(step.label)
         except Exception as exc:  # noqa: BLE001 - report which step died
-            return False, f"hold failed at step {step_number + 1} ({label}): {exc}"
+            return HoldResult(
+                FAILED, f"hold failed at step {step_number + 1} ({step.label}): {exc}",
+                url=getattr(page, "url", "") or "", timings=timings,
+            )
 
-        # "Apply" opens the application in a new tab. Follow it, or every
-        # later step would look for buttons on the page we just left.
-        popup = _wait_for_new_page(context, known_pages, timeout_ms=min(timeout_ms, 8000))
-        if popup is not None:
-            log.info("step %r opened a new tab: %s", label, popup.url[:80])
-            page = popup
+        # Only Apply opens a tab. Waiting after the others cost the full
+        # timeout each and bought nothing — 16 of the 28 seconds on a real
+        # hold. Everything after Apply runs in the tab it opened.
+        if step.opens_popup:
+            popup = _wait_for_new_page(context, known_pages, timeout_ms=min(timeout_ms, 8000))
+            if popup is not None:
+                log.info("step %r opened a new tab: %s", step.label, popup.url[:80])
+                page = popup
+                mark("new tab")
+                # The tab exists long before the application does. Wait for the
+                # app itself, generously — a slow tab still holds a shift.
+                if _settle_after_popup(page, timeout_ms=max(timeout_ms, 20000)):
+                    mark("application ready")
+            else:
+                # Not fatal: the site could start navigating in place instead,
+                # and the checks below still establish where we ended up.
+                log.warning("step %r was expected to open a tab and did not", step.label)
 
         # A login tab here means the hiring portal is signed out. Job search is
         # public, so detection kept working and nothing warned us until now.
         # Say so plainly instead of timing out on a button that will never come.
         if is_login_page(page):
-            return False, (
+            return HoldResult(
+                FAILED,
                 f"the apply flow needs a login (opened {page.url[:70]}). "
                 "Detection works signed out, holding does not — "
-                "run `python save_session.py` and log in to the hiring portal."
+                "run `python save_session.py` and log in to the hiring portal.",
+                url=page.url, timings=timings,
             )
 
         scope = page  # subsequent steps are page-wide
@@ -636,52 +779,80 @@ def hold_shift(
     # alert carrying a blank photo reads as a failure even when the hold worked.
     ready_error = None
     try:
+        # Readiness, not a fixed sleep: this returns the instant the button
+        # renders, which also proves the consent screen actually mounted.
         page.locator(CREATE_APPLICATION).first.wait_for(state="visible", timeout=timeout_ms)
+        mark("consent screen ready")
     except Exception as exc:  # noqa: BLE001 - the URL check below still applies
         ready_error = exc
 
     landed = APPLICATION_URL_MARKER in (page.url or "")
+    url = page.url or ""
 
     if stop_before_submit:
         _screenshot(page, screenshot_path)
         if ready_error is not None:
             if landed:
-                return True, (
-                    f"application open at {page.url} — but the Create "
-                    f"Application button was not found ({ready_error}). "
-                    "THE SPOT IS NOT HELD."
+                return HoldResult(
+                    UNCERTAIN,
+                    f"application open at {url} — but the Create Application "
+                    f"button was not found ({ready_error}). THE SPOT IS NOT HELD.",
+                    url=url, timings=timings,
                 )
-            return False, (
+            return HoldResult(
+                FAILED,
                 f"clicked through but never reached the application "
-                f"(still at {page.url}): {ready_error}"
+                f"(still at {url}): {ready_error}",
+                url=url, timings=timings,
             )
         # Deliberate: everything so far is reversible browsing. Create
         # Application accepts the drug-test and age declarations and is what
         # reserves the slot, so it is gated behind stop_before_submit: false.
-        return True, (
+        return HoldResult(
+            UNCERTAIN,
             "stopped at the consent screen — NOT held. Finish it yourself at "
-            f"{page.url}, or set hold.stop_before_submit: false to have the "
-            "watcher press Create Application for you."
+            f"{url}, or set hold.stop_before_submit: false to have the "
+            "watcher press Create Application for you.",
+            url=url, timings=timings,
         )
 
     if ready_error is not None:
         _screenshot(page, screenshot_path)
-        return False, f"could not find the Create Application button: {ready_error}"
+        return HoldResult(
+            FAILED if not landed else UNCERTAIN,
+            f"could not find the Create Application button: {ready_error}",
+            url=url, timings=timings,
+        )
 
     try:
         page.locator(CREATE_APPLICATION).first.click(timeout=timeout_ms)
+        mark("create application clicked")
     except Exception as exc:  # noqa: BLE001
         _screenshot(page, screenshot_path)
-        return False, f"Create Application click failed: {exc}"
+        return HoldResult(
+            FAILED, f"Create Application click failed: {exc}", url=url, timings=timings,
+        )
 
-    # Do not assume the click worked — the site says so itself, with a
-    # countdown. Read it back and pass it on.
+    # Never assume the click worked. The site states the hold itself, with a
+    # countdown — read it back rather than inferring success from a click that
+    # returned without throwing.
     confirmation = _hold_confirmation(page, timeout_ms=timeout_ms)
+    if confirmation:
+        mark("hold confirmed")
+    url = page.url or url
     _screenshot(page, screenshot_path)
+    mark("screenshot")
 
     if confirmation:
-        return True, f"SPOT HELD — {confirmation}\nFinish the steps at {page.url}"
-    return True, (
+        return HoldResult(
+            CONFIRMED,
+            f"SPOT HELD — {confirmation}\nFinish the steps at {url}",
+            url=url, banner=confirmation, timings=timings,
+        )
+    # Clicked, but unproven. Not held, not failed — look.
+    return HoldResult(
+        UNCERTAIN,
         "Create Application was clicked but the holding banner never appeared "
-        f"— check it by hand at {page.url}"
+        f"— check it by hand at {url}",
+        url=url, timings=timings,
     )

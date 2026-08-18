@@ -487,7 +487,7 @@ def test_hold_skips_the_card_click_when_already_on_the_detail_page(monkeypatch):
     """Regression: api mode navigates straight to the job URL, where no cards
     exist — attempting the card click there would always fail."""
     monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
-    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [("open job", ":scope"), ("sched", "#s")])
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [site_selectors.HoldStep("open job", ":scope"), site_selectors.HoldStep("sched", "#s")])
     monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
 
     clicked, searched = [], []
@@ -517,9 +517,9 @@ def test_hold_skips_the_card_click_when_already_on_the_detail_page(monkeypatch):
         site_selectors, "find_matching_card",
         lambda *a: searched.append(True) or None,
     )
-    ok, msg = site_selectors.hold_shift(Page(), Shift(id="X", title="t"))
+    result = site_selectors.hold_shift(Page(), Shift(id="X", title="t"))
     assert not searched, "must not hunt for a card on the detail page"
-    assert ok, msg
+    assert result.status != site_selectors.FAILED, result.message
 
 
 def test_no_results_selector_is_configured_from_the_live_site():
@@ -636,18 +636,18 @@ def test_every_selector_is_captured_from_the_live_site():
     assert site_selectors.selectors_ready()
     assert site_selectors.detection_ready()
 
-    labels = [label for label, _ in site_selectors.HOLD_STEPS]
+    labels = [step.label for step in site_selectors.HOLD_STEPS]
     assert labels == [
         "open job", "select schedule", "pick a shift", "open the consent screen",
     ]
-    assert "ScheduleCardSelectScheduleLink" in dict(site_selectors.HOLD_STEPS)["pick a shift"]
+    assert "ScheduleCardSelectScheduleLink" in {s.label: s.selector for s in site_selectors.HOLD_STEPS}["pick a shift"]
 
 
 def test_creating_the_application_is_not_one_of_the_automatic_steps():
     """Create Application accepts the age and drug-test declarations and is
     what actually reserves the slot. It stays behind stop_before_submit, so a
     default run can never commit you to anything."""
-    step_selectors = [selector for _, selector in site_selectors.HOLD_STEPS]
+    step_selectors = [step.selector for step in site_selectors.HOLD_STEPS]
     assert site_selectors.CREATE_APPLICATION not in step_selectors
     assert not any("Create Application" in s for s in step_selectors)
     assert "Create Application" in site_selectors.CREATE_APPLICATION
@@ -811,9 +811,9 @@ def test_hold_shift_refuses_when_selectors_are_placeholders(monkeypatch):
     """Load-bearing: a stale selector must stop the click path, not have it
     guess at buttons on a real application form."""
     monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", site_selectors.TODO)
-    ok, message = site_selectors.hold_shift(FakePage([]), Shift(title="x"))
-    assert not ok
-    assert "not configured" in message
+    result = site_selectors.hold_shift(FakePage([]), Shift(title="x"))
+    assert not result.held
+    assert "not configured" in result.message
 
 
 # ── hot mode ────────────────────────────────────────────────────────────────
@@ -1269,7 +1269,7 @@ def test_only_one_shift_is_held_per_poll(tmp_path):
     multiply the clicks that get an account flagged."""
     held = []
     w = _batch_watcher(tmp_path, _many(10), dry_run=False)
-    w._hold = held.append
+    w._hold = lambda shift, **kw: held.append(shift)
     w.poll_once()
     assert len(held) == 1
     assert held[0].pay_rate == 24  # the best of the batch
@@ -1278,7 +1278,7 @@ def test_only_one_shift_is_held_per_poll(tmp_path):
 def test_hold_cap_is_configurable(tmp_path):
     held = []
     w = _batch_watcher(tmp_path, _many(10), dry_run=False, hold={"max_per_poll": 3})
-    w._hold = held.append
+    w._hold = lambda shift, **kw: held.append(shift)
     w.poll_once()
     assert len(held) == 3
 
@@ -1286,7 +1286,7 @@ def test_hold_cap_is_configurable(tmp_path):
 def test_a_dry_run_batch_never_holds_anything(tmp_path):
     held = []
     w = _batch_watcher(tmp_path, _many(5))
-    w._hold = held.append
+    w._hold = lambda shift, **kw: held.append(shift)
     w.poll_once()
     assert held == []
 
@@ -1418,7 +1418,7 @@ def test_the_watcher_holds_the_top_ranked_shift_of_a_batch(tmp_path):
         filters=shipped["filters"],
         priority=shipped["priority"],
     )
-    w._hold = held.append
+    w._hold = lambda shift, **kw: held.append(shift)
     w.poll_once()
     assert len(held) == 1
     assert held[0].location.startswith("Brampton")
@@ -1487,9 +1487,8 @@ def test_a_login_tab_is_reported_as_a_login_problem(monkeypatch):
     nothing warns you until a hold is attempted."""
     monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
     # on_detail_page drops the leading "open job" step, so include it.
-    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
-        ("open job", ":scope"),
-        ("select schedule", "#sched"),
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [site_selectors.HoldStep("open job", ":scope"),
+        site_selectors.HoldStep("select schedule", "#sched", opens_popup=True),
     ])
 
     ctx = FakeTabContext()
@@ -1498,20 +1497,19 @@ def test_a_login_tab_is_reported_as_a_login_problem(monkeypatch):
     monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
     monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
 
-    ok, message = site_selectors.hold_shift(page, Shift(title="x"))
-    assert not ok
-    assert "login" in message.lower()
-    assert "save_session.py" in message
+    result = site_selectors.hold_shift(page, Shift(title="x"))
+    assert not result.held
+    assert "login" in result.message.lower()
+    assert "save_session.py" in result.message
 
 
 def test_the_flow_follows_the_tab_that_apply_opens(monkeypatch):
     """Without following it, later steps would hunt for buttons on the page we
     already left and fail with a misleading 'button not found'."""
     monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
-    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
-        ("open job", ":scope"),
-        ("select schedule", "#sched"),
-        ("create application", "#create"),
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [site_selectors.HoldStep("open job", ":scope"),
+        site_selectors.HoldStep("select schedule", "#sched", opens_popup=True),
+        site_selectors.HoldStep("create application", "#create"),
     ])
     monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
     monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
@@ -1527,8 +1525,8 @@ def test_the_flow_follows_the_tab_that_apply_opens(monkeypatch):
 
     first.spawns = spawn
 
-    ok, message = site_selectors.hold_shift(first, Shift(title="x"))
-    assert ok, message
+    result = site_selectors.hold_shift(first, Shift(title="x"))
+    assert result.status in (site_selectors.CONFIRMED, site_selectors.UNCERTAIN), result.message
     # The second step ran on the NEW tab, not the original page.
     assert application and "#create" in application[0].clicks
     assert "#create" not in first.clicks
@@ -1550,10 +1548,9 @@ def test_pick_a_shift_is_scoped_to_the_schedule_flyout(monkeypatch):
     """An unscoped Apply selector could match a button elsewhere on the page."""
     monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
     # The real steps, minus the one still behind the login wall.
-    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
-        ("open job", ":scope"),
-        ("select schedule", "[data-test-id='jobDetailSelectScheduleButton']"),
-        ("pick a shift", "[data-test-id='ScheduleCardSelectScheduleLink']"),
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [site_selectors.HoldStep("open job", ":scope"),
+        site_selectors.HoldStep("select schedule", "[data-test-id='jobDetailSelectScheduleButton']"),
+        site_selectors.HoldStep("pick a shift", "[data-test-id='ScheduleCardSelectScheduleLink']", opens_popup=True),
     ])
     monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
     monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
@@ -1596,16 +1593,16 @@ def test_the_screenshot_waits_for_the_application_to_render(monkeypatch, tmp_pat
         def wait_for_timeout(self, _ms):
             pass
 
-    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [("open job", ":scope")])
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [site_selectors.HoldStep("open job", ":scope")])
     monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
     monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
 
-    ok, message = site_selectors.hold_shift(
+    result = site_selectors.hold_shift(
         Page(), Shift(title="x"), screenshot_path=str(tmp_path / "shot.png")
     )
-    assert ok, message
+    assert result.status != site_selectors.FAILED, result.message
     assert events == ["waited-for-application", "screenshot"], events
-    assert "scheduleId=SCH-1" in message, "the alert must carry the link to finish"
+    assert "scheduleId=SCH-1" in result.message, "the alert must carry the link to finish"
 
 
 # ── the one click that actually holds the spot ──────────────────────────────
@@ -1654,7 +1651,7 @@ class ConsentPage:
 
 
 def _consent_flow(monkeypatch):
-    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [("open job", ":scope")])
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [site_selectors.HoldStep("open job", ":scope")])
     monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
     monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
 
@@ -1664,11 +1661,12 @@ def test_the_default_run_never_presses_create_application(monkeypatch):
     and drug-test declarations, so it must not happen by default."""
     _consent_flow(monkeypatch)
     page = ConsentPage()
-    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=True)
-    assert ok
+    result = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=True)
+    assert result.status == site_selectors.UNCERTAIN, "stopping short is not a hold"
+    assert not result.held
     assert page.clicked == [], "nothing may be clicked on the consent screen"
-    assert "NOT held" in message
-    assert "stop_before_submit" in message
+    assert "NOT held" in result.message
+    assert "stop_before_submit" in result.message
 
 
 def test_pressing_create_application_holds_the_spot_and_reads_the_banner(monkeypatch):
@@ -1676,37 +1674,39 @@ def test_pressing_create_application_holds_the_spot_and_reads_the_banner(monkeyp
     rather than assuming a click that appeared to work did work."""
     _consent_flow(monkeypatch)
     page = ConsentPage()
-    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=False)
-    assert ok
+    result = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=False)
+    assert result.held
     assert any("Create Application" in c for c in page.clicked)
-    assert "SPOT HELD" in message
-    assert "2 hours and 59 minutes" in message
-    assert "scheduleId=SCH-9" in message
+    assert "SPOT HELD" in result.message
+    assert "2 hours and 59 minutes" in result.message
+    assert "scheduleId=SCH-9" in result.message
 
 
 def test_a_missing_banner_is_reported_honestly_rather_than_claimed(monkeypatch):
     _consent_flow(monkeypatch)
     page = ConsentPage(banner_after_click=False)
-    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=False)
-    assert ok  # the click did happen
-    assert "never appeared" in message
-    assert "check it by hand" in message
+    result = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=False)
+    assert result.status == site_selectors.UNCERTAIN
+    assert not result.held, "an unconfirmed click must never read as held"
+    assert result.needs_you, "an unconfirmed hold has to interrupt somebody"
+    assert "never appeared" in result.message
+    assert "check it by hand" in result.message
 
 
 def test_a_missing_create_button_fails_instead_of_claiming_a_hold(monkeypatch):
     _consent_flow(monkeypatch)
     page = ConsentPage(has_button=False)
-    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=False)
-    assert not ok
-    assert "Create Application" in message
+    result = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=False)
+    assert not result.held
+    assert "Create Application" in result.message
 
 
 def test_stopping_early_still_says_the_spot_is_not_held(monkeypatch):
     """The dangerous failure is believing a shift is yours when it is not."""
     _consent_flow(monkeypatch)
     page = ConsentPage(has_button=False)
-    ok, message = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=True)
-    assert "NOT HELD" in message.upper()
+    result = site_selectors.hold_shift(page, Shift(title="x"), stop_before_submit=True)
+    assert "NOT HELD" in result.message.upper()
 
 
 # ── two environments: Canada for real, the US for testing ───────────────────
@@ -1904,3 +1904,155 @@ def test_the_doctor_names_the_jobs_it_finds():
 
     checks = doctor.check_api(Client(), Source())
     assert "Brampton" in checks[-1].detail
+
+
+# ── hold-first workflow: the 16 seconds of dead waiting ─────────────────────
+def test_only_the_apply_step_declares_a_popup():
+    """The measured bug: waiting for a tab after every step cost the full
+    timeout twice — 16 of the 28 seconds between spotting a shift and holding
+    it. Only Apply opens a tab, and only Apply may pay for one."""
+    popup_steps = [s.label for s in site_selectors.HOLD_STEPS if s.opens_popup]
+    assert popup_steps == ["pick a shift"]
+
+
+def test_no_popup_wait_happens_for_a_step_that_opens_nothing(monkeypatch):
+    """The regression that matters: a step with opens_popup=False must never
+    call the waiter at all, no matter how the loop is refactored."""
+    calls = []
+    monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
+    monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
+    monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
+    monkeypatch.setattr(
+        site_selectors, "_wait_for_new_page",
+        lambda ctx, known, timeout_ms=0: calls.append(timeout_ms) or None,
+    )
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
+        site_selectors.HoldStep("open job", ":scope"),
+        site_selectors.HoldStep("select schedule", "#sched"),
+        site_selectors.HoldStep("open the consent screen", "#next"),
+    ])
+
+    ctx = FakeTabContext()
+    site_selectors.hold_shift(FakeFlowPage(ctx), Shift(title="x"))
+    assert calls == [], "no step here opens a tab, so nothing may wait for one"
+
+
+def test_the_popup_wait_still_happens_for_apply(monkeypatch):
+    calls = []
+    monkeypatch.setattr(site_selectors, "CREATE_APPLICATION", "#create-app")
+    monkeypatch.setattr(site_selectors, "dismiss_overlays", lambda *a, **k: [])
+    monkeypatch.setattr(site_selectors, "on_detail_page", lambda _p: True)
+    monkeypatch.setattr(
+        site_selectors, "_wait_for_new_page",
+        lambda ctx, known, timeout_ms=0: calls.append(timeout_ms) or None,
+    )
+    monkeypatch.setattr(site_selectors, "HOLD_STEPS", [
+        site_selectors.HoldStep("open job", ":scope"),
+        site_selectors.HoldStep("pick a shift", "#apply", opens_popup=True),
+    ])
+
+    ctx = FakeTabContext()
+    site_selectors.hold_shift(FakeFlowPage(ctx), Shift(title="x"))
+    assert len(calls) == 1, "Apply does open a tab and must still be followed"
+
+
+def test_a_hold_records_step_timings():
+    """You cannot tune what you do not measure, and this is the number the
+    whole program exists to shrink."""
+    result = site_selectors.HoldResult(
+        site_selectors.CONFIRMED, "ok", timings=[("select schedule", 1500.0)],
+    )
+    assert "select schedule 1500ms" in result.timing_summary()
+
+
+def test_the_three_hold_states_are_distinct():
+    confirmed = site_selectors.HoldResult(site_selectors.CONFIRMED, "held")
+    uncertain = site_selectors.HoldResult(site_selectors.UNCERTAIN, "unsure")
+    failed = site_selectors.HoldResult(site_selectors.FAILED, "broke")
+
+    assert confirmed.held and not confirmed.needs_you
+    assert not uncertain.held and uncertain.needs_you
+    assert not failed.held and failed.needs_you
+
+
+# ── alerts must not sit on the critical path ────────────────────────────────
+class SlowNotifier(RecordingNotifier):
+    """A notifier that takes a second, like a cold Telegram connection."""
+
+    def __init__(self, order, delay=0.4):
+        super().__init__()
+        self.order = order
+        self.delay = delay
+
+    def notify_shift(self, shift, dry_run=True):
+        time.sleep(self.delay)
+        self.order.append("alert")
+        return super().notify_shift(shift, dry_run=dry_run)
+
+
+def test_the_hold_starts_before_the_alert_finishes(tmp_path):
+    """A Telegram send has been seen to take 10s on a cold connection. The
+    shift must not wait on it — the alert goes out in parallel."""
+    order = []
+    w = _batch_watcher(tmp_path, [Shift(id="1", title="Warehouse", location="Brampton, ON")],
+                       dry_run=False)
+    w.notifier = SlowNotifier(order)
+    w._hold = lambda shift, **kw: order.append("hold")
+
+    w.poll_once()
+    assert order and order[0] == "hold", (
+        "the hold must begin before a slow alert completes, got %r" % (order,)
+    )
+    w.drain_notifications(timeout=5)
+    assert "alert" in order, "the alert still has to go out"
+
+
+def test_the_alert_is_dispatched_even_though_the_hold_runs_first(tmp_path):
+    """Parallel, not deferred: if the hold hangs or the process dies, you must
+    still learn that a shift appeared."""
+    w = _batch_watcher(tmp_path, [Shift(id="1", title="Warehouse", location="Brampton, ON")],
+                       dry_run=False)
+    w._hold = lambda shift, **kw: None
+    w.poll_once()
+    w.drain_notifications(timeout=5)
+    assert w.notifier.shifts, "the matched shift was never alerted"
+
+
+def test_dry_run_still_alerts_without_clicking(tmp_path):
+    w = _batch_watcher(tmp_path, [Shift(id="1", title="Warehouse", location="Brampton, ON")],
+                       dry_run=True)
+    held = []
+    w._hold = lambda shift, **kw: held.append(shift)
+    w.poll_once()
+    w.drain_notifications(timeout=5)
+    assert w.notifier.shifts and not held
+
+
+def test_hold_disabled_still_alerts_without_clicking(tmp_path):
+    w = _batch_watcher(tmp_path, [Shift(id="1", title="Warehouse", location="Brampton, ON")],
+                       dry_run=False)
+    w.cfg["hold"]["enabled"] = False
+    held = []
+    w._hold = lambda shift, **kw: held.append(shift)
+    w.poll_once()
+    w.drain_notifications(timeout=5)
+    assert w.notifier.shifts and not held
+
+
+def test_settling_gives_up_immediately_on_a_login_page():
+    """A signed-out session lands on the login page instead of the
+    application. Waiting the full 20s for an app that is never coming only
+    delays the message telling you to log in."""
+    class LoginPage:
+        url = "https://auth.hiring.amazon.com/#/login"
+
+        def wait_for_load_state(self, *_a, **_kw):
+            pass
+
+        def wait_for_timeout(self, _ms):
+            raise AssertionError("must not wait once the login page is visible")
+
+        def locator(self, _selector):
+            raise AssertionError("must not probe for buttons on the login page")
+
+    assert site_selectors._settle_after_popup(LoginPage(), timeout_ms=20000) is False

@@ -80,11 +80,37 @@ class Watcher:
         self.consecutive_errors = 0
         self.polls = 0
         self.alerts = 0
+        # Telegram sends happen off the critical path. A send has been seen to
+        # take 10s on a cold connection, and every one of those seconds is a
+        # second the shift is not reserved. Deferring them until after the hold
+        # would be worse than either: if the hold hangs or the process dies,
+        # you would hear nothing at all. So they go out in parallel.
+        self._senders: list[threading.Thread] = []
 
         self.context = None
         self.page = None
         self.api_client: ApiClient | None = None
         self.token_source = None
+
+    # ── notifications, off the critical path ────────────────────────────────
+    def notify_async(self, method, *args, **kwargs) -> None:
+        """Fire a Telegram send on its own thread.
+
+        The notifier already swallows its own exceptions, so nothing here can
+        take the watcher down. Threads are tracked so a shutdown can give them
+        a moment to finish rather than cutting an alert off mid-flight.
+        """
+        thread = threading.Thread(
+            target=method, args=args, kwargs=kwargs, daemon=True,
+            name=f"notify-{getattr(method, '__name__', 'send')}",
+        )
+        thread.start()
+        self._senders = [t for t in self._senders if t.is_alive()]
+        self._senders.append(thread)
+
+    def drain_notifications(self, timeout: float = 10.0) -> None:
+        for thread in list(self._senders):
+            thread.join(timeout=timeout)
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def request_stop(self, signum, _frame) -> None:
@@ -133,6 +159,9 @@ class Watcher:
                 self._loop(once=once)
             finally:
                 self.state.save()
+                # Let any in-flight Telegram send finish. Without this a
+                # --once run can exit before the alert leaves the machine.
+                self.drain_notifications()
                 browser_launch.close_context(browser, self.context)
 
         log.info(
@@ -323,50 +352,71 @@ class Watcher:
         # shift you hear about and which one actually gets held.
         new_matches = self.ranker.sort(new_matches)
 
-        alert_cap = self.cfg["notifications"].get("max_alerts_per_poll") or len(new_matches)
-        for index, shift in enumerate(new_matches):
+        for shift in new_matches:
             self.state.log_detection(shift.stable_id, shift.summary())
             self.alerts += 1
             log.info("MATCH: %s [%s]", shift.summary(), self.ranker.explain(shift))
 
-            if index >= alert_cap:
-                continue
-            # Alert first, always. In api mode nothing has touched the browser
-            # yet, so this fires within milliseconds of the shift appearing.
-            self.notifier.notify_shift(shift, dry_run=self.dry_run)
+        holding = (
+            not self.dry_run
+            and self.cfg["hold"]["enabled"]
+            and site_selectors.detection_ready()
+        )
+        alert_cap = self.cfg["notifications"].get("max_alerts_per_poll") or len(new_matches)
+
+        if not holding:
+            # Nothing is going to be clicked, so there is no critical path to
+            # protect: alert normally, best first.
+            for shift in new_matches[:alert_cap]:
+                self.notifier.notify_shift(shift, dry_run=self.dry_run)
+            self._send_digest(len(new_matches) - alert_cap)
             log.info(
-                "alert sent %.0fms after poll start",
-                (time.perf_counter() - started) * 1000,
+                "dry run — not clicking" if self.dry_run else "hold disabled — alert only"
             )
-
-        # One digest instead of a hundred pings. Telegram rate-limits a single
-        # chat, so an unfiltered batch would arrive slowly, out of order, and
-        # bury the one shift that mattered.
-        held_back = len(new_matches) - alert_cap
-        if held_back > 0:
-            log.info("%d further match(es) summarised rather than sent individually", held_back)
-            self.notifier.send_text(
-                f"➕ <b>{held_back} more match(es)</b> this poll — "
-                f"see the log, or tighten <code>filters</code> in config.yaml."
-            )
-
-        if self.dry_run:
-            log.info("dry run — not clicking")
-            return
-        if not self.cfg["hold"]["enabled"]:
-            log.info("hold disabled — alert only")
             return
 
         # You need to win ONE shift. Trying to hold a whole batch would race
         # itself, and every extra click is another chance to be flagged.
         hold_cap = max(1, int(self.cfg["hold"].get("max_per_poll", 1)))
-        for shift in new_matches[:hold_cap]:
-            self._hold(shift)
-        if len(new_matches) > hold_cap:
+        to_hold = new_matches[:hold_cap]
+
+        for shift in to_hold:
+            # In flight while the hold runs — not before it, not after. You
+            # learn a shift appeared even if the hold then hangs, and the hold
+            # never waits on Telegram.
+            self.notify_async(self.notifier.notify_shift, shift, dry_run=False)
+
+        log.info(
+            "holding %s — %.0fms after poll start",
+            to_hold[0].summary(), (time.perf_counter() - started) * 1000,
+        )
+        for shift in to_hold:
+            self._hold(shift, poll_started=started)
+
+        # Everything below is off the critical path: by now the shift is either
+        # reserved or already gone.
+        for shift in new_matches[len(to_hold):alert_cap]:
+            self.notify_async(self.notifier.notify_shift, shift, dry_run=True)
+        self._send_digest(len(new_matches) - alert_cap)
+
+        if len(new_matches) > len(to_hold):
             log.info(
                 "%d other match(es) alerted but not held (hold.max_per_poll=%d)",
-                len(new_matches) - hold_cap, hold_cap,
+                len(new_matches) - len(to_hold), hold_cap,
             )
+
+    def _send_digest(self, held_back: int) -> None:
+        """One digest instead of a hundred pings. Telegram rate-limits a single
+        chat, so an unfiltered batch would arrive slowly, out of order, and
+        bury the one shift that mattered."""
+        if held_back <= 0:
+            return
+        log.info("%d further match(es) summarised rather than sent individually", held_back)
+        self.notify_async(
+            self.notifier.send_text,
+            f"➕ <b>{held_back} more match(es)</b> this poll — "
+            f"see the log, or tighten <code>filters</code> in config.yaml.",
+        )
 
     def _fetch_shifts(self):
         if self.mode == "api":
@@ -427,17 +477,18 @@ class Watcher:
             )
 
     # ── holding ─────────────────────────────────────────────────────────────
-    def _hold(self, shift) -> None:
+    def _hold(self, shift, poll_started: float | None = None) -> None:
         missing = site_selectors.unconfigured_hold()
         if missing:
             # Bail before navigating: opening the listing and then failing on
             # the first click wastes the seconds that matter most, and lands
             # the browser on a job page the next poll has to navigate back off.
             log.error("cannot hold — unconfigured: %s", ", ".join(missing))
-            self.notifier.notify_error(
+            self.notify_async(
+                self.notifier.notify_error,
                 "Matched a shift but cannot hold it — the apply-flow selectors "
                 f"are still placeholders ({', '.join(missing)}). Open the "
-                "listing yourself."
+                "listing yourself.",
             )
             return
 
@@ -452,14 +503,16 @@ class Watcher:
             page.goto(target, wait_until="domcontentloaded")
         except PlaywrightError as exc:
             log.error("could not open %s: %s", target, exc)
-            self.notifier.notify_error(f"Could not open the listing: {exc}")
+            self.notify_async(
+                self.notifier.notify_error, f"Could not open the listing: {exc}"
+            )
             return
 
         SCREENSHOT_DIR.mkdir(exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         shot = SCREENSHOT_DIR / f"hold-{stamp}.png"
 
-        ok, message = site_selectors.hold_shift(
+        result = site_selectors.hold_shift(
             page,
             shift,
             stop_before_submit=self.cfg["hold"]["stop_before_submit"],
@@ -467,15 +520,39 @@ class Watcher:
             screenshot_path=str(shot),
         )
 
-        if ok:
-            log.info("hold succeeded: %s", message)
-            self.notifier.notify_held(
-                shift, self.cfg["hold"]["stop_before_submit"], detail=message
+        if result.timings:
+            log.info("hold timings: %s", result.timing_summary())
+        if poll_started is not None:
+            # The number that decides whether you get the shift: how long from
+            # the poll that spotted it to Amazon confirming the reservation.
+            log.info(
+                "detection -> %s in %.1fs",
+                result.status, time.perf_counter() - poll_started,
             )
-            self.notifier.send_photo(shot, caption=message[:1000])
-        else:
-            log.error("hold failed: %s", message)
-            self.notifier.notify_error(f"Hold failed for {shift.summary()}\n{message}")
+
+        if result.held:
+            log.info("hold succeeded: %s", result.message)
+            self.notify_async(
+                self.notifier.notify_held,
+                shift, self.cfg["hold"]["stop_before_submit"], detail=result.message,
+            )
+            self.notify_async(self.notifier.send_photo, shot, caption=result.message[:1000])
+            return
+
+        # Failed or uncertain both need a human, and quickly — an uncertain
+        # hold may be a real reservation ticking down its three hours.
+        log.error("hold %s: %s", result.status, result.message)
+        urgency = (
+            "⚠️ <b>CHECK THIS NOW</b>" if result.status == site_selectors.UNCERTAIN
+            else "❌ <b>Hold failed</b>"
+        )
+        link = f"\n{result.url}" if result.url else ""
+        self.notify_async(
+            self.notifier.notify_error,
+            f"{urgency}\n{shift.summary()}\n{result.message}{link}",
+        )
+        if shot.exists():
+            self.notify_async(self.notifier.send_photo, shot, caption=result.message[:1000])
 
 
 def _use_utf8_console() -> None:
