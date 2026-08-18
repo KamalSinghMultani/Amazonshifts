@@ -274,3 +274,36 @@ def choose_card(cards: list[dict], prefs: dict | None = None) -> tuple[int | Non
         f"{', '.join(card.get('days') or []) or 'days unknown'}"
     )
 
+def rank_cards(cards: list[dict], prefs: dict | None = None) -> list[int]:
+    """Every acceptable schedule, best first, as flyout indexes.
+
+    choose_card answers "which one"; this answers "and then which". They are
+    separate because the first choice frequently loses — a competing service
+    takes the slot between the flyout rendering and the Apply landing — and the
+    second schedule on the same job is a far cheaper thing to try than another
+    job in another city.
+    """
+    acceptable: list[tuple[int, dict]] = []
+    for index, card in enumerate(cards):
+        ok, reason = card_is_acceptable(card, prefs)
+        if ok:
+            acceptable.append((index, card))
+        else:
+            log.debug("schedule #%d unacceptable: %s", index + 1, reason)
+
+    acceptable.sort(
+        key=lambda pair: (-(pair[1].get("pay_rate") or 0),
+                          -(pair[1].get("hours_per_week") or 0),
+                          pair[0])
+    )
+    return [index for index, _ in acceptable]
+
+
+def describe_card(card: dict, index: int, total: int) -> str:
+    return (
+        f"schedule #{index + 1} of {total}: "
+        f"{card.get('starts') or '?'}-{card.get('ends') or '?'}, "
+        f"{card.get('hours_per_week') or '?'}h/week, "
+        f"{', '.join(card.get('days') or []) or 'days unknown'}"
+    )
+

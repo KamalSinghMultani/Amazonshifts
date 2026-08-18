@@ -854,13 +854,44 @@ class Watcher:
             self._report_hold(shift, result, shot, poll_started)
             return
 
-        result = site_selectors.hold_shift(
-            page,
-            shift,
-            stop_before_submit=self.cfg["hold"]["stop_before_submit"],
-            timeout_ms=self.cfg["browser"]["action_timeout_ms"],
-            screenshot_path=str(shot),
-        )
+        # Try each schedule on this job before giving up on it. A slot is
+        # frequently gone between the flyout rendering and the Apply landing —
+        # a competing service taking it — and the next schedule on the same job
+        # is far cheaper to attempt than another job in another city.
+        hold_cfg = self.cfg["hold"]
+        attempts = max(1, int(hold_cfg.get("schedule_attempts", 3)))
+        budget = float(hold_cfg.get("attempt_budget_seconds", 45))
+        started_attempts = time.monotonic()
+        result = None
+
+        for attempt in range(attempts):
+            if attempt and time.monotonic() - started_attempts > budget:
+                log.info("out of time for further schedules (%.0fs budget)", budget)
+                break
+            if attempt:
+                log.info("schedule %d did not stick — trying the next one", attempt)
+            result = site_selectors.hold_shift(
+                page,
+                shift,
+                stop_before_submit=hold_cfg["stop_before_submit"],
+                timeout_ms=self.cfg["browser"]["action_timeout_ms"],
+                screenshot_path=str(shot),
+                schedule_index=attempt,
+                schedule_prefs=self.cfg.get("schedule_preferences"),
+            )
+            if result.status != site_selectors.FAILED:
+                break
+            if not result.worth_retrying():
+                log.info("not retrying: %s", result.message[:120])
+                break
+            # Back to the flyout for the next schedule.
+            try:
+                page.goto(shift.url or self.cfg["site"]["job_search_url"],
+                          wait_until="domcontentloaded")
+                page.wait_for_timeout(1500)
+            except PlaywrightError as exc:
+                log.warning("could not return to the listing: %s", exc)
+                break
 
         self._report_hold(shift, result, shot, poll_started)
 

@@ -102,7 +102,16 @@ DEFAULTS: dict[str, Any] = {
         "stop_before_submit": True,
         "max_per_poll": 1,
         "direct_apply": False,
+        # A slot is often gone between the flyout rendering and Apply landing.
+        # Try the next schedule on the same job rather than abandoning the job.
+        "schedule_attempts": 3,
+        # ...but not forever: a posting lasts about a minute, and time spent
+        # retrying a dead job is time not spent on the next one.
+        "attempt_budget_seconds": 45,
     },
+    # Empty means "any schedule will do". Populate to constrain which one gets
+    # taken: available_days, min_hours_per_week, avoid_overnight.
+    "schedule_preferences": {},
     # The hiring portal session expires on its own — measured at roughly two
     # hours. Detection keeps working when it does, which is precisely the
     # danger: the watcher looks healthy and cannot hold a thing.

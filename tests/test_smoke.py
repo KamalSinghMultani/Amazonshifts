@@ -2881,3 +2881,51 @@ def test_with_no_preferences_the_first_schedule_still_wins():
     cards = [schedules_mod.parse_card_text(CARD_A), schedules_mod.parse_card_text(CARD_B)]
     assert schedules_mod.choose_card(cards, None)[0] == 0
     assert schedules_mod.choose_card(cards, {})[0] == 0
+
+
+# ── the fallback cascade: next schedule, then next city ─────────────────────
+def test_a_sniped_slot_is_worth_another_schedule():
+    """The competitor frequently takes the slot between the flyout rendering
+    and the Apply landing. The next schedule on the same job is far cheaper to
+    try than another job in another city."""
+    sniped = site_selectors.HoldResult(
+        site_selectors.FAILED, "hold failed at step 2 (pick a shift): Timeout"
+    )
+    assert sniped.worth_retrying() is True
+
+
+def test_a_dead_session_is_not_worth_retrying():
+    """It would fail identically three times while the posting disappears."""
+    for message in (
+        "the apply flow needs a login (opened https://auth.hiring.amazon.com)",
+        "selectors not configured: FINAL_SUBMIT",
+        "no schedule left to try: 2 acceptable of 2 on offer",
+        "could not find the card for 'x' on the page",
+    ):
+        result = site_selectors.HoldResult(site_selectors.FAILED, message)
+        assert result.worth_retrying() is False, message
+
+
+def test_a_success_is_never_retried():
+    for status in (site_selectors.CONFIRMED, site_selectors.UNCERTAIN):
+        assert site_selectors.HoldResult(status, "done").worth_retrying() is False
+
+
+def test_ranked_order_is_what_gets_tried_in_sequence():
+    """Attempt 0 takes the best schedule, attempt 1 the next best — not the
+    flyout's render order."""
+    cards = [
+        schedules_mod.parse_card_text("$20.00/hr | Schedule (20h per week) | Mon 7:00 AM - 12:00 PM"),
+        schedules_mod.parse_card_text("$26.00/hr | Schedule (40h per week) | Tue 7:00 AM - 3:30 PM"),
+        schedules_mod.parse_card_text("$23.00/hr | Schedule (30h per week) | Wed 7:00 AM - 1:30 PM"),
+    ]
+    order = schedules_mod.rank_cards(cards, None)
+    assert order == [1, 2, 0], "best pay first, then hours, then render order"
+
+
+def test_the_shipped_config_retries_but_within_a_budget():
+    cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    assert cfg["hold"]["schedule_attempts"] >= 2
+    assert 10 <= cfg["hold"]["attempt_budget_seconds"] <= 120, (
+        "a posting lasts about a minute — an unbounded retry loop spends it"
+    )

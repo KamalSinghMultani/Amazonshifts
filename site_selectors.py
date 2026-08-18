@@ -21,6 +21,7 @@ import time
 from typing import Any, NamedTuple
 from urllib.parse import urljoin
 
+import schedules
 from shift_matcher import Shift
 
 log = logging.getLogger(__name__)
@@ -646,6 +647,26 @@ class HoldResult:
     def held(self):
         return self.status == CONFIRMED
 
+    # Failures that another schedule might survive, versus ones where trying
+    # again is pointless or harmful.
+    NOT_WORTH_RETRYING = (
+        "needs a login",          # session is dead; every schedule will fail
+        "not configured",         # selectors are placeholders
+        "no schedule left",       # already exhausted the flyout
+        "could not find the card",
+    )
+
+    def worth_retrying(self) -> bool:
+        """Would the next schedule plausibly do better?
+
+        A sniped slot is worth another attempt; a dead session is not — it
+        would fail identically three times while the posting disappears.
+        """
+        if self.status != FAILED:
+            return False
+        low = (self.message or "").lower()
+        return not any(marker in low for marker in self.NOT_WORTH_RETRYING)
+
     @property
     def needs_you(self):
         """Should this interrupt the human right now?"""
@@ -739,6 +760,38 @@ def hold_at_application(
     )
 
 
+
+def schedule_card_texts(page: Any) -> list[str]:
+    """Visible text of each schedule card in the flyout, in render order.
+
+    One entry per Apply button, so the index lines up with what a click on
+    that Apply would take.
+    """
+    try:
+        return page.evaluate(
+            """(flyoutSel) => {
+                const flyout = document.querySelector(flyoutSel);
+                if (!flyout) return [];
+                const applies = flyout.querySelectorAll(
+                    "[data-test-id='ScheduleCardSelectScheduleLink']");
+                const out = [];
+                for (const apply of applies) {
+                    let node = apply;
+                    for (let i = 0; i < 8 && node.parentElement; i++) {
+                        node = node.parentElement;
+                        if ((node.innerText || '').length > 40) break;
+                    }
+                    out.push((node.innerText || '').trim());
+                }
+                return out;
+            }""",
+            SCHEDULE_FLYOUT,
+        ) or []
+    except Exception as exc:  # noqa: BLE001 - never fatal, we fall back to first
+        log.debug("could not read the schedule cards: %s", exc)
+        return []
+
+
 def hold_shift(
     page: Any,
     shift: Shift,
@@ -746,6 +799,8 @@ def hold_shift(
     stop_before_submit: bool = True,
     timeout_ms: int = 10000,
     screenshot_path: str | None = None,
+    schedule_index: int = 0,
+    schedule_prefs: dict | None = None,
 ) -> HoldResult:
     """Click through to hold the slot.
 
@@ -807,7 +862,35 @@ def hold_shift(
         known_pages = set(context.pages) if (context and step.opens_popup) else set()
         step_started = time.perf_counter()
         try:
-            target = scope.locator(step.selector).first
+            if step.label == "pick a shift":
+                # Which Apply button, not just the first one. A job can offer
+                # several schedules and the render order is an accident — see
+                # schedules.rank_cards. schedule_index selects among them, so a
+                # caller can retry with the next one when a slot is sniped.
+                texts = schedule_card_texts(page)
+                order = schedules.rank_cards(
+                    [schedules.parse_card_text(text) for text in texts], schedule_prefs
+                ) if texts else []
+                if order:
+                    if schedule_index >= len(order):
+                        return HoldResult(
+                            FAILED,
+                            f"no schedule left to try: {len(order)} acceptable of "
+                            f"{len(texts)} on offer, already tried {schedule_index}",
+                            url=getattr(page, "url", "") or "", timings=timings,
+                        )
+                    wanted = order[schedule_index]
+                    log.info(
+                        "taking %s",
+                        schedules.describe_card(
+                            schedules.parse_card_text(texts[wanted]), wanted, len(texts)
+                        ),
+                    )
+                    target = scope.locator(step.selector).nth(wanted)
+                else:
+                    target = scope.locator(step.selector).first
+            else:
+                target = scope.locator(step.selector).first
             target.wait_for(state="visible", timeout=timeout_ms)
             target.click(timeout=timeout_ms)
             log.info(
