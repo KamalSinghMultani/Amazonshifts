@@ -3098,3 +3098,22 @@ def test_an_uncertain_hold_counts_and_is_not_retried(tmp_path):
     w._hold = _failing_hold([maybe])
     w.poll_once()
     assert len(w._hold.calls) == 1
+
+
+def test_the_country_is_resolved_for_both_sites():
+    """A typo in COUNTRY_BY_HOST ("hirring") made every lookup miss, and
+    country_for falls back to Canada — so the US login silently picked the
+    wrong country and failed at a step that looks nothing like a typo."""
+    assert relogin.country_for("https://hiring.amazon.ca") == "Canada"
+    assert relogin.country_for("https://hiring.amazon.com") == "United States"
+    assert set(relogin.COUNTRY_BY_HOST) == {"hiring.amazon.ca", "hiring.amazon.com"}
+
+
+def test_every_configured_site_resolves_to_a_country():
+    """The real guard: whatever base_url the configs carry must be found in
+    the map, not silently defaulted."""
+    root = Path(__file__).resolve().parent.parent
+    for name, expected in (("config.yaml", "Canada"), ("config.us.yaml", "United States")):
+        base = config_mod.load_config(root / name)["site"]["base_url"]
+        assert any(host in base for host in relogin.COUNTRY_BY_HOST), base
+        assert relogin.country_for(base) == expected, name
