@@ -3025,3 +3025,76 @@ def test_the_gta_list_stops_at_the_radius():
     matcher = ShiftMatcher(_shipped()["filters"])
     for far in ("Ottawa", "Barrie", "London", "Kingston", "Windsor"):
         assert not matcher.matches(_gta(FULFILLMENT, far))[0], far
+
+
+# ── falling through to the next job, not just the next schedule ─────────────
+def _failing_hold(results):
+    """A _hold stand-in that returns queued outcomes in order."""
+    queue = list(results)
+    calls = []
+
+    def hold(shift, **_kw):
+        calls.append(shift)
+        return queue.pop(0) if queue else site_selectors.HoldResult(
+            site_selectors.FAILED, "hold failed at step 2 (pick a shift): Timeout"
+        )
+
+    hold.calls = calls
+    return hold
+
+
+def _sniped():
+    return site_selectors.HoldResult(
+        site_selectors.FAILED, "hold failed at step 2 (pick a shift): Timeout"
+    )
+
+
+def _confirmed():
+    return site_selectors.HoldResult(site_selectors.CONFIRMED, "SPOT HELD")
+
+
+def test_a_sniped_job_falls_through_to_the_next_one(tmp_path):
+    """Asked for directly: "go to the other city". Losing the first job to a
+    faster service should cost that job, not the whole batch."""
+    w = _batch_watcher(tmp_path, _many(4), dry_run=False)
+    w._hold = _failing_hold([_sniped(), _sniped(), _confirmed()])
+    w.poll_once()
+    assert len(w._hold.calls) == 3, "should have walked down to the third job"
+
+
+def test_it_stops_at_the_first_job_that_sticks(tmp_path):
+    w = _batch_watcher(tmp_path, _many(4), dry_run=False)
+    w._hold = _failing_hold([_confirmed()])
+    w.poll_once()
+    assert len(w._hold.calls) == 1, "no reason to hold a second shift"
+
+
+def test_a_dead_session_stops_the_cascade_immediately(tmp_path):
+    """Every other job in the batch would fail identically, and the batch
+    lasts about a minute."""
+    dead = site_selectors.HoldResult(
+        site_selectors.FAILED, "the session needs a login before anything can be held"
+    )
+    w = _batch_watcher(tmp_path, _many(4), dry_run=False)
+    w._hold = _failing_hold([dead])
+    w.poll_once()
+    assert len(w._hold.calls) == 1
+
+
+def test_the_cascade_respects_job_attempts(tmp_path):
+    w = _batch_watcher(tmp_path, _many(9), dry_run=False, hold={"job_attempts": 2})
+    w._hold = _failing_hold([_sniped(), _sniped(), _sniped()])
+    w.poll_once()
+    assert len(w._hold.calls) == 2
+
+
+def test_an_uncertain_hold_counts_and_is_not_retried(tmp_path):
+    """"Pressed Create Application but never saw the banner" may well be a
+    held shift. Trying the next job could book you two."""
+    maybe = site_selectors.HoldResult(
+        site_selectors.UNCERTAIN, "clicked but the banner never appeared"
+    )
+    w = _batch_watcher(tmp_path, _many(4), dry_run=False)
+    w._hold = _failing_hold([maybe])
+    w.poll_once()
+    assert len(w._hold.calls) == 1

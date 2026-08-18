@@ -14,16 +14,6 @@ credentials outright.
 So this exists as a deliberate trade you can make: put your credentials in
 .env, and the watcher will try to sign itself back in once per expiry. Enable
 it with session.auto_relogin: true. Leave it off and nothing here ever runs.
-
-WHAT IT WILL NOT DO
--------------------
-* It never retries in a loop. One attempt per expiry, then it alerts you.
-  Repeated failed logins are how accounts get locked, and a locked account
-  costs you every shift, not one.
-* It cannot answer an OTP. If Amazon challenges the login, it stops and tells
-  you. A persistent profile usually avoids the challenge because the machine
-  is already a trusted device — that is the whole reason the profile exists.
-* It never types anything anywhere except the login form on the auth domain.
 """
 
 from __future__ import annotations

@@ -107,6 +107,10 @@ DEFAULTS: dict[str, Any] = {
         # A slot is often gone between the flyout rendering and Apply landing.
         # Try the next schedule on the same job rather than abandoning the job.
         "schedule_attempts": 3,
+        # ...and if every schedule on that job is gone, try the next-ranked
+        # job. Losing Brampton to a faster service should cost you Brampton,
+        # not the whole batch.
+        "job_attempts": 3,
         # ...but not forever: a posting lasts about a minute, and time spent
         # retrying a dead job is time not spent on the next one.
         "attempt_budget_seconds": 45,

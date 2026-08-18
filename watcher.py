@@ -695,9 +695,45 @@ class Watcher:
         # Fence the whole hold: the scheduled re-login must not start signing
         # in halfway through the clicks that reserve a shift.
         self.holding = True
+        held = 0
+        tried: list[str] = []
         try:
-            for shift in to_hold:
-                self._hold(shift, poll_started=started)
+            # Walk DOWN the ranking until one sticks. Losing the Brampton job
+            # to a faster service should cost you Brampton, not the whole
+            # batch — the Mississauga job in the same drop is still yours to
+            # take, and the ranking already knows it comes next.
+            job_attempts = max(1, int(self.cfg["hold"].get("job_attempts", 3)))
+            budget = float(self.cfg["hold"].get("attempt_budget_seconds", 45))
+            # Enough candidates to satisfy the cap AND to fall back past
+            # failures: the two are different reasons to look at another job.
+            candidates = new_matches[:max(job_attempts, hold_cap)]
+
+            for position, shift in enumerate(candidates):
+                if held >= hold_cap:
+                    break
+                if position and (time.perf_counter() - started) > budget:
+                    log.info(
+                        "out of budget after %d job(s) — not trying %s",
+                        position, shift.summary(),
+                    )
+                    break
+                if position:
+                    log.info("moving on to %s", shift.summary())
+                    self.notify_async(self.notifier.notify_shift, shift, dry_run=False)
+
+                outcome = self._hold(shift, poll_started=started)
+                tried.append(shift.summary())
+
+                # None comes only from a caller that replaced _hold; treat it
+                # as done, since there is no result to reason about.
+                if outcome is None or outcome.held or (
+                    outcome.status == site_selectors.UNCERTAIN
+                ):
+                    held += 1
+                    continue
+                if not outcome.worth_retrying():
+                    log.info("not trying another job: %s", outcome.message[:120])
+                    break
         finally:
             self.holding = False
 
@@ -707,10 +743,10 @@ class Watcher:
             self.notify_async(self.notifier.notify_shift, shift, dry_run=True)
         self._send_digest(len(new_matches) - alert_cap)
 
-        if len(new_matches) > len(to_hold):
+        if len(new_matches) > len(tried):
             log.info(
-                "%d other match(es) alerted but not held (hold.max_per_poll=%d)",
-                len(new_matches) - len(to_hold), hold_cap,
+                "%d other match(es) alerted but not attempted (tried %d)",
+                len(new_matches) - len(tried), len(tried),
             )
 
     def _send_digest(self, held_back: int) -> None:
@@ -785,7 +821,9 @@ class Watcher:
             )
 
     # ── holding ─────────────────────────────────────────────────────────────
-    def _hold(self, shift, poll_started: float | None = None) -> None:
+    def _hold(self, shift, poll_started: float | None = None):
+        """Attempt one shift. Always returns a HoldResult so the caller
+        can decide whether another job is worth trying."""
         if self.session_ok is False:
             # Measured on the Etobicoke miss: with a dead session the flyout
             # never renders an Apply button, so the attempt burns 11.5 seconds
@@ -803,7 +841,11 @@ class Watcher:
                 "<i>Then run</i> <code>python save_session.py</code> "
                 "<i>so the next one is automatic.</i>",
             )
-            return
+            # "needs a login" marks this unretryable: every other job in the
+            # batch would fail identically, and the batch lasts a minute.
+            return site_selectors.HoldResult(
+                site_selectors.FAILED, "the session needs a login before anything can be held"
+            )
 
         missing = site_selectors.unconfigured_hold()
         if missing:
@@ -817,7 +859,9 @@ class Watcher:
                 f"are still placeholders ({', '.join(missing)}). Open the "
                 "listing yourself.",
             )
-            return
+            return site_selectors.HoldResult(
+                site_selectors.FAILED, f"selectors not configured: {', '.join(missing)}"
+            )
 
         page = self.page
         if page is None:
@@ -833,7 +877,11 @@ class Watcher:
             self.notify_async(
                 self.notifier.notify_error, f"Could not open the listing: {exc}"
             )
-            return
+            # Deliberately retryable: this listing would not open, but the next
+            # job in the batch is a different URL and may well be fine.
+            return site_selectors.HoldResult(
+                site_selectors.FAILED, f"could not open the listing: {exc}"
+            )
 
         SCREENSHOT_DIR.mkdir(exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -852,7 +900,7 @@ class Watcher:
                 screenshot_path=str(shot),
             )
             self._report_hold(shift, result, shot, poll_started)
-            return
+            return result
 
         # Try each schedule on this job before giving up on it. A slot is
         # frequently gone between the flyout rendering and the Apply landing —
@@ -894,6 +942,7 @@ class Watcher:
                 break
 
         self._report_hold(shift, result, shot, poll_started)
+        return result
 
     def _application_url(self, shift) -> str | None:
         """The direct application URL for the best schedule on this job.
@@ -941,6 +990,7 @@ class Watcher:
                 result.status, time.perf_counter() - poll_started,
             )
 
+        self.last_hold = result
         if result.held:
             log.info("hold succeeded: %s", result.message)
             self.notify_async(
