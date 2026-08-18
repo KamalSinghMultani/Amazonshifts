@@ -70,7 +70,9 @@ DEFAULTS: dict[str, Any] = {
         "auth_header": "authorization",
         "auth_storage_key": "sessionToken",
     },
-    "filters": {},
+    # warehouse_types / shift_types mirror Amazon's own onboarding choices.
+    # Empty means every type, which is where its wizard starts too.
+    "filters": {"warehouse_types": [], "shift_types": []},
     # Which acceptable shift you want most. See ShiftRanker.
     "priority": {
         "order": ["location", "title", "pay"],

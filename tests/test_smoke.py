@@ -26,7 +26,7 @@ import relogin
 import schedules as schedules_mod
 import site_selectors
 from notifier import TelegramNotifier
-from shift_matcher import Shift, ShiftMatcher, ShiftRanker
+from shift_matcher import Shift, ShiftMatcher, ShiftRanker, warehouse_type
 from state_store import StateStore
 
 
@@ -1358,14 +1358,20 @@ def test_an_unlisted_but_acceptable_city_ranks_after_the_listed_ones():
     assert ranked[0].location.startswith("Toronto")
 
 
-def test_delivery_sinks_below_every_other_role_in_the_same_city():
+def test_within_one_city_the_preferred_title_leads_but_nothing_is_demoted():
+    """Delivery Station used to sink to the bottom on the assumption it needed
+    a driving licence. It does not, so it now competes normally: the title
+    preferences still put Fulfillment first, and the rest fall in behind on
+    pay rather than being pushed to last."""
     ranker = ShiftRanker(_shipped()["priority"])
     ranked = ranker.sort([
-        _gta(DELIVERY, "Brampton"),
-        _gta(SORT, "Brampton"),
-        _gta(FULFILLMENT, "Brampton"),
+        _gta(DELIVERY, "Brampton", pay=24.0),
+        _gta(SORT, "Brampton", pay=22.0),
+        _gta(FULFILLMENT, "Brampton", pay=23.0),
     ])
-    assert [s.title for s in ranked] == [FULFILLMENT, SORT, DELIVERY]
+    assert ranked[0].title == FULFILLMENT, "an explicitly preferred title still leads"
+    assert ranked[1].title == DELIVERY, "then the better-paid of the rest"
+    assert ranked[2].title == SORT
 
 
 def test_pay_only_breaks_a_tie_nothing_more():
@@ -2929,3 +2935,50 @@ def test_the_shipped_config_retries_but_within_a_budget():
     assert 10 <= cfg["hold"]["attempt_budget_seconds"] <= 120, (
         "a posting lasts about a minute — an unbounded retry loop spends it"
     )
+
+
+# ── Amazon's own preference model: warehouse type and shift type ────────────
+def test_the_four_warehouse_types_are_recognised():
+    """From the onboarding flow: Delivery Station, Fulfillment Centre,
+    Sortation Centre, XL Warehouse."""
+    assert warehouse_type("Delivery Station Warehouse Associate") == "delivery station"
+    assert warehouse_type("Fulfillment Center Warehouse Associate") == "fulfillment centre"
+    assert warehouse_type("Sortation Centre Warehouse Associate") == "sortation centre"
+    assert warehouse_type("XL Warehouse Associate") == "xl warehouse"
+    assert warehouse_type("Robotics Warehouse Associate") == ""
+
+
+def test_delivery_station_is_an_associate_job_not_a_driving_one():
+    """It was demoted on the assumption it needed a licence. It does not — it
+    is the same associate role in a different building type, and Amazon's own
+    onboarding lists it alongside the other three."""
+    cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    assert cfg["priority"]["demote_titles"] == []
+
+    ranker = ShiftRanker(cfg["priority"])
+    delivery_close = Shift(id="1", title="Delivery Station Warehouse Associate",
+                           location="Brampton, ON", pay_rate=23.10)
+    fulfilment_far = Shift(id="2", title="Fulfillment Center Warehouse Associate",
+                           location="Toronto, ON", pay_rate=23.50)
+    assert ranker.sort([fulfilment_far, delivery_close])[0].id == "1", (
+        "with location first, the closer Delivery job should now win"
+    )
+
+
+def test_warehouse_types_filter_when_set_and_are_open_when_not():
+    everything = ShiftMatcher({})
+    assert everything.matches(Shift(title="Sortation Centre Warehouse Associate"))[0]
+
+    picky = ShiftMatcher({"warehouse_types": ["delivery station", "fulfillment centre"]})
+    assert picky.matches(Shift(title="Delivery Station Warehouse Associate"))[0]
+    ok, reason = picky.matches(Shift(title="Sortation Centre Warehouse Associate"))
+    assert not ok and "sortation centre" in reason
+
+
+def test_shift_types_filter_on_what_the_api_actually_returns():
+    """jobType arrives as PART_TIME / FULL_TIME / FLEX_TIME / REDUCED_TIME."""
+    picky = ShiftMatcher({"shift_types": ["part time", "flex time"]})
+    assert picky.matches(Shift(title="A", schedule="PART_TIME"))[0]
+    assert picky.matches(Shift(title="A", schedule="PART_TIME;REDUCED_TIME"))[0]
+    ok, reason = picky.matches(Shift(title="A", schedule="FULL_TIME"))
+    assert not ok and "FULL_TIME" in reason

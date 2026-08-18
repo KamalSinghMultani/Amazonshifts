@@ -282,6 +282,18 @@ filters:
   include_schedules: []
   exclude_schedules: []
 
+  # ── Amazon's own preference model ─────────────────────────────────────────
+  # Its onboarding asks for warehouse type and shift type separately, and both
+  # start with every box ticked. Empty here means the same: take anything.
+  #
+  # warehouse_types: delivery station, fulfillment centre, sortation centre,
+  #                  xl warehouse
+  # All four are the same associate job in different buildings — Delivery
+  # Station needs no licence, it is only a different place to commute to.
+  warehouse_types: []
+  # shift_types: full time, part time, flex time, reduced time
+  shift_types: []
+
   # No pay filter: these all pay about the same, so a threshold would only
   # ever risk silently dropping a shift you wanted.
   min_pay_rate: null
@@ -308,11 +320,12 @@ priority:
     - "fulfillment center warehouse associate"
     - "fulfillment"
 
-  # Sinks to the bottom of the batch, below every non-demoted role in the
-  # same city. Still alerted — just never the one that gets auto-held while
-  # something better is on the table.
-  demote_titles:
-    - "delivery"
+  # Nothing is demoted. "Delivery Station Warehouse Associate" was down here
+  # on the assumption it involved driving; it does not — it is the same
+  # associate job in a different building type, and no licence is required.
+  # Amazon's own onboarding treats Delivery Station as one warehouse type
+  # among four, not as a lesser role.
+  demote_titles: []
 
 notifications:
   telegram:

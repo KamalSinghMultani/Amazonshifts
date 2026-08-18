@@ -97,6 +97,28 @@ class Shift:
         return " — ".join(bits)
 
 
+
+# Amazon's four building types, as its own onboarding presents them. Matching
+# on the title is how you tell them apart: a "Delivery Station Warehouse
+# Associate" and a "Fulfillment Center Warehouse Associate" are the same job in
+# different buildings — neither needs a licence, and the distinction is about
+# where you commute to, not what you do.
+WAREHOUSE_TYPES: dict[str, tuple[str, ...]] = {
+    "delivery station": ("delivery station", "delivery centre", "delivery center"),
+    "fulfillment centre": ("fulfillment cent", "fulfilment cent"),
+    "sortation centre": ("sortation", "sort centre", "sort center"),
+    "xl warehouse": ("xl ",),
+}
+
+
+def warehouse_type(title: str) -> str:
+    """Which of Amazon's building types a title belongs to, or ''."""
+    low = (title or "").lower()
+    for name, markers in WAREHOUSE_TYPES.items():
+        if any(marker in low for marker in markers):
+            return name
+    return ""
+
 def _contains_any(haystack: str, needles: Iterable[str]) -> str | None:
     """Return the first needle found in haystack, else None. Case-insensitive."""
     low = haystack.lower()
@@ -119,6 +141,15 @@ class ShiftMatcher:
         self.include_schedules = list(filters.get("include_schedules") or [])
         self.exclude_schedules = list(filters.get("exclude_schedules") or [])
         self.min_pay_rate = _to_float(filters.get("min_pay_rate"))
+        # Both empty means "any" — the same convention as the include_ lists,
+        # and the same default Amazon's own onboarding starts from with every
+        # box ticked.
+        self.warehouse_types = [
+            str(t).strip().lower() for t in (filters.get("warehouse_types") or [])
+        ]
+        self.shift_types = [
+            str(t).strip().lower() for t in (filters.get("shift_types") or [])
+        ]
 
     def matches(self, shift: Shift) -> tuple[bool, str]:
         """Return (matched, reason). The reason is logged, which makes the
@@ -135,6 +166,20 @@ class ShiftMatcher:
                 return False, f"{name} excluded by {hit!r}"
             if includes and not _contains_any(value, includes):
                 return False, f"{name} {value!r} matched no include filter"
+
+        if self.warehouse_types:
+            found = warehouse_type(shift.title)
+            if not found:
+                return False, f"could not tell the warehouse type of {shift.title!r}"
+            if found not in self.warehouse_types:
+                return False, f"{found} is not one of the warehouse types you want"
+
+        if self.shift_types:
+            # jobType comes through as PART_TIME / FULL_TIME / FLEX_TIME /
+            # REDUCED_TIME, sometimes several joined together.
+            haystack = f"{shift.schedule} {shift.title}".lower().replace("_", " ")
+            if not any(wanted.replace("_", " ") in haystack for wanted in self.shift_types):
+                return False, f"shift type {shift.schedule!r} is not one you want"
 
         if self.min_pay_rate is not None:
             if shift.pay_rate is None:
