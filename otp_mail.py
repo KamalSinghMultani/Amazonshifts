@@ -67,11 +67,26 @@ CODE_PATTERN = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 # Lines that contain a six-digit number which is NOT the code.
 NOT_A_CODE = ("job-", "req", "phone", "©", "amazon.com, inc")
 
+# Amazon's code mail is titled "Your Amazon Jobs verification code". Requiring
+# that is not fussiness: a marketing email ("You're on the list. Welcome to job
+# alerts.") sitting in the same inbox yielded a plausible six-digit number, and
+# typing the wrong code costs the whole attempt — the real one expires in three
+# minutes and resend is blocked for 55 seconds.
+CODE_SUBJECTS = ("verification code", "security code", "one-time", "one time")
+
+
+def subject_is_a_code_email(subject: str) -> bool:
+    low = (subject or "").lower()
+    return any(marker in low for marker in CODE_SUBJECTS)
+
 
 def configured() -> tuple[str, str, str] | None:
     """(host, user, app password) or None if the feature is not set up."""
     user = os.getenv("OTP_IMAP_USER", "").strip()
-    password = os.getenv("OTP_IMAP_PASSWORD", "").strip()
+    # Google shows app passwords as "abcd efgh ijkl mnop" and people paste them
+    # exactly that way. Google itself ignores the spaces; strip them anyway so
+    # a stricter server cannot turn a correct password into an auth failure.
+    password = "".join(os.getenv("OTP_IMAP_PASSWORD", "").split())
     host = os.getenv("OTP_IMAP_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
     if not user or not password:
         return None
@@ -182,9 +197,12 @@ def _code_from(client, num: bytes, since_epoch: float) -> str | None:
     message = email.message_from_bytes(raw[0][1])
     if not is_from_amazon(_decoded(message.get("From"))):
         return None
+    subject = _decoded(message.get("Subject"))
+    if not subject_is_a_code_email(subject):
+        return None
     if not message_is_new_enough(message, since_epoch):
         return None
-    return extract_code(_decoded(message.get("Subject")) + chr(10) + body_text(message))
+    return extract_code(subject + chr(10) + body_text(message))
 
 
 def fetch_code(since_epoch: float, *, timeout_s: float = 100, poll_s: float = 5) -> str | None:
@@ -292,12 +310,16 @@ def check(lookback_days: int = 3) -> tuple[bool, list[str]]:
                 message = email.message_from_bytes(raw[0][1])
                 subject = _decoded(message.get("Subject"))[:52]
                 when = _decoded(message.get("Date"))[:31]
-                code = extract_code(subject + chr(10) + body_text(message))
+                if subject_is_a_code_email(subject):
+                    code = extract_code(subject + chr(10) + body_text(message))
+                else:
+                    code = None
                 # The code itself is not printed: it is a live credential
                 # while it lasts.
-                lines.append(
-                    f"  {when} | {'CODE FOUND' if code else 'no code   '} | {subject}"
+                verdict = "CODE FOUND" if code else (
+                    "no code   " if subject_is_a_code_email(subject) else "not a code email"
                 )
+                lines.append(f"  {when} | {verdict} | {subject}")
             return True, lines
     except imaplib.IMAP4.error as exc:
         # Only an IMAP-level refusal points at the credentials. A socket error

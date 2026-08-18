@@ -21,6 +21,7 @@ import browser_launch
 import config as config_mod
 import doctor
 import drop_report
+import otp_mail
 import relogin
 import site_selectors
 from notifier import TelegramNotifier
@@ -2678,3 +2679,43 @@ def test_an_unjudgeable_pair_says_so_rather_than_guessing():
     assert relogin.mailbox_matches("", "someone@gmail.com") is None
     assert relogin.mailbox_matches("t***n@gmail.com", "") is None
     assert relogin.mailbox_matches("not-an-address", "someone@gmail.com") is None
+
+
+def test_an_app_password_pasted_with_spaces_still_works(monkeypatch):
+    """Google displays them as "abcd efgh ijkl mnop" and that is how people
+    paste them. Google ignores the spaces; a stricter server might not."""
+    monkeypatch.setenv("OTP_IMAP_USER", "someone@gmail.com")
+    monkeypatch.setenv("OTP_IMAP_PASSWORD", "abcd efgh ijkl mnop")
+    host, user, password = otp_mail.configured()
+    assert password == "abcdefghijklmnop"
+    assert host == "imap.gmail.com"
+
+
+def test_only_a_code_email_can_supply_a_code():
+    """Found live: a marketing email in the same inbox — "You're on the list.
+    Welcome to job alerts." — yielded a plausible six-digit number. Typing a
+    wrong code costs the whole attempt, since the real one expires in three
+    minutes and resend is blocked for 55 seconds."""
+    assert otp_mail.subject_is_a_code_email("Your Amazon Jobs verification code")
+    assert otp_mail.subject_is_a_code_email("Your security code")
+    assert not otp_mail.subject_is_a_code_email(
+        "You’re on the list. Welcome to job alerts."
+    )
+    assert not otp_mail.subject_is_a_code_email("Warehouse jobs near you")
+    assert not otp_mail.subject_is_a_code_email("")
+
+
+def test_the_code_is_read_out_of_amazons_real_wording():
+    """Wording taken from the live email, not invented for the test."""
+    body = (
+        "Your Amazon Jobs verification code\n"
+        "Use this code to verify your account: 485469\n"
+        "It will expire in 3 minutes.\n"
+        "Job ID: JOB-CA-0000123456\n"
+        "© 1996-2026 Amazon.com, Inc."
+    )
+    assert otp_mail.extract_code(body) == "485469"
+
+
+def test_a_job_id_is_not_mistaken_for_a_code():
+    assert otp_mail.extract_code("Job-CA-0000123456 was posted") is None
