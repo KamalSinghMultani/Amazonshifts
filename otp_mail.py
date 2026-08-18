@@ -208,3 +208,72 @@ def fetch_code(since_epoch: float, *, timeout_s: float = 100, poll_s: float = 5)
 
     log.warning("no verification code arrived within %.0fs", timeout_s)
     return None
+
+def check(lookback_days: int = 3) -> tuple[bool, list[str]]:
+    """Verify the mailbox setup without triggering a real login.
+
+    Returns (ok, lines). Connects, looks for recent Amazon mail, and reports
+    whether a 6-digit code could be pulled out of it. Reads nothing else and
+    changes nothing.
+    """
+    creds = configured()
+    if creds is None:
+        return False, [
+            "OTP_IMAP_USER / OTP_IMAP_PASSWORD are not set in .env",
+            "Without them a re-login stops at the verification code and waits "
+            "for you.",
+        ]
+    host, user, password = creds
+    lines = [f"host   : {host}", f"mailbox: {user}"]
+
+    try:
+        with imaplib.IMAP4_SSL(host) as client:
+            client.login(user, password)
+            lines.append("login  : ok")
+            client.select("INBOX", readonly=True)
+
+            since = time.strftime(
+                "%d-%b-%Y", time.localtime(time.time() - lookback_days * 86400)
+            )
+            numbers: list[bytes] = []
+            for sender in SEARCH_SENDERS:
+                status, data = client.search(None, f'(SINCE {since} FROM "{sender}")')
+                if status == "OK":
+                    numbers.extend((data[0] or b"").split())
+
+            unique = list(dict.fromkeys(reversed(numbers)))
+            lines.append(
+                f"amazon mail in the last {lookback_days} day(s): {len(unique)}"
+            )
+            if not unique:
+                lines += [
+                    "",
+                    "Nothing from Amazon yet — expected if forwarding was only just",
+                    "set up, since Gmail filters apply to NEW mail only. The next",
+                    "code Amazon sends is the real test.",
+                ]
+                return True, lines
+
+            for num in unique[:MAX_MESSAGES]:
+                status, raw = client.fetch(num, "(BODY.PEEK[])")
+                if status != "OK" or not raw or not raw[0]:
+                    continue
+                message = email.message_from_bytes(raw[0][1])
+                subject = _decoded(message.get("Subject"))[:52]
+                when = _decoded(message.get("Date"))[:31]
+                code = extract_code(subject + chr(10) + body_text(message))
+                # The code itself is not printed: it is a live credential
+                # while it lasts.
+                lines.append(
+                    f"  {when} | {'CODE FOUND' if code else 'no code   '} | {subject}"
+                )
+            return True, lines
+    except imaplib.IMAP4.error as exc:
+        return False, lines + [
+            f"login  : FAILED ({exc})",
+            "",
+            "Gmail needs an APP PASSWORD here, not the account password:",
+            "Google Account -> Security -> 2-Step Verification -> App passwords.",
+        ]
+    except Exception as exc:  # noqa: BLE001
+        return False, lines + [f"error  : {exc}"]

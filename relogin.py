@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -172,6 +173,39 @@ def credentials() -> tuple[str, str] | None:
     return email, pin
 
 
+# Amazon states where it is sending the code, masked: "Email verification code
+# to t*********n@gmail.com". Capturing it turns the single most likely setup
+# mistake — reading the wrong mailbox — from a silent timeout into a message
+# that names both addresses.
+CODE_DESTINATION = re.compile(r"code to ([a-z0-9._%+*-]+@[a-z0-9.-]+)", re.I)
+
+
+def code_destination(text: str) -> str:
+    match = CODE_DESTINATION.search(text or "")
+    return match.group(1) if match else ""
+
+
+def mailbox_matches(destination: str, mailbox: str) -> bool | None:
+    """Could a code sent to `destination` land in `mailbox`?
+
+    Amazon masks the middle of the address, so this compares only what is
+    visible: the first character, the last character before the @, and the
+    domain. Returns None when there is not enough to judge — forwarding also
+    makes a mismatch perfectly workable, so this only ever warns.
+    """
+    if not destination or not mailbox or "@" not in destination:
+        return None
+    local, _, domain = destination.partition("@")
+    box_local, _, box_domain = mailbox.partition("@")
+    if not local or not box_local or domain.lower() != box_domain.lower():
+        return False
+    if local[0].lower() != box_local[0].lower():
+        return False
+    if local[-1] != "*" and local[-1].lower() != box_local[-1].lower():
+        return False
+    return True
+
+
 def _page_text(page: Any) -> str:
     try:
         return (page.inner_text("body") or "").lower()
@@ -282,6 +316,11 @@ def _solve_email_code(page: Any, *, timeout_ms: int = 20000) -> tuple[str, str] 
     if otp_mail.configured() is None:
         return None
 
+    destination = code_destination(_page_text(page))
+    mailbox = (otp_mail.configured() or ("", "", ""))[1]
+    if destination:
+        log.info("Amazon will send the code to %s", destination)
+
     requested_at = time.time()
     try:
         send = page.locator(SEND_CODE_BUTTON).first
@@ -295,9 +334,21 @@ def _solve_email_code(page: Any, *, timeout_ms: int = 20000) -> tuple[str, str] 
     # Only a code that arrives AFTER this moment counts — see otp_mail.
     code = otp_mail.fetch_code(requested_at)
     if not code:
+        # Name both addresses. The commonest setup mistake is reading a
+        # different mailbox from the one Amazon mails, and a bare timeout gives
+        # no hint of that at all.
+        where = f" Amazon sent it to {destination}." if destination else ""
+        reading = f" We are reading {mailbox}." if mailbox else ""
+        hint = ""
+        if mailbox_matches(destination, mailbox) is False:
+            hint = (
+                " Those are different mailboxes — either point OTP_IMAP_USER at "
+                "the one Amazon mails, or forward Amazon's code mail from it to "
+                "the one being read."
+            )
         return OTP_REQUIRED, (
-            "the code was requested but never arrived within the wait — check "
-            "OTP_IMAP_USER / OTP_IMAP_PASSWORD, or enter it yourself"
+            "the code was requested but never arrived within the wait."
+            f"{where}{reading}{hint}"
         )
 
     if not _enter_code(page, code, timeout_ms=timeout_ms):

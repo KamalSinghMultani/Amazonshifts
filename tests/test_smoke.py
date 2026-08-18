@@ -2643,3 +2643,38 @@ def test_the_shipped_config_signs_in_inside_the_observed_window():
     every = cfg["session"]["relogin_every_seconds"]
     assert 600 <= every <= 7200, every
     assert cfg["session"]["max_relogins_per_day"] >= 86400 / every / 2
+
+
+# ── the code goes to one mailbox; we might be reading another ────────────────
+def test_the_code_destination_is_read_off_the_screen():
+    """Amazon states it, masked: "Email verification code to t****n@gmail.com".
+    Capturing it turns the commonest setup mistake — reading the wrong mailbox
+    — from a silent timeout into a message that names both addresses."""
+    assert relogin.code_destination(
+        "Email verification code to t*********n@gmail.com"
+    ) == "t*********n@gmail.com"
+    assert relogin.code_destination("no address here") == ""
+
+
+def test_a_masked_address_matches_its_own_mailbox():
+    assert relogin.mailbox_matches("t*********n@gmail.com", "tapppamain@gmail.com") is True
+
+
+def test_a_different_mailbox_is_detected():
+    """The live case: codes went to tapppamain@, IMAP was reading
+    singkamal2670@, and the only symptom was a 100-second wait."""
+    assert relogin.mailbox_matches(
+        "t*********n@gmail.com", "singkamal2670@gmail.com"
+    ) is False
+
+
+def test_a_different_domain_is_a_mismatch():
+    assert relogin.mailbox_matches("t*****n@gmail.com", "tapppamain@outlook.com") is False
+
+
+def test_an_unjudgeable_pair_says_so_rather_than_guessing():
+    """Forwarding makes a mismatch perfectly workable, so this only ever
+    warns — and with nothing to compare it must not claim a verdict."""
+    assert relogin.mailbox_matches("", "someone@gmail.com") is None
+    assert relogin.mailbox_matches("t***n@gmail.com", "") is None
+    assert relogin.mailbox_matches("not-an-address", "someone@gmail.com") is None

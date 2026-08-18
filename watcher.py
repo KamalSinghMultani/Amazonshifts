@@ -32,6 +32,7 @@ from api_client import ApiClient
 from auth_token import TokenSource
 import doctor
 import drop_report
+import otp_mail
 import relogin
 import schedules as schedules_mod
 from config import (
@@ -1033,6 +1034,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--live", action="store_true", help="override dry_run for this run")
     parser.add_argument("--check-selectors", action="store_true")
     parser.add_argument(
+        "--check-otp",
+        action="store_true",
+        help="verify the verification-code mailbox without triggering a login",
+    )
+    parser.add_argument(
         "--doctor",
         action="store_true",
         help="check this environment end to end — session, login, API, "
@@ -1049,6 +1055,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check_selectors:
         return check_selectors()
+
+    if args.check_otp:
+        load_dotenv()
+        ok, lines = otp_mail.check()
+        print(chr(10) + "Verification-code mailbox")
+        print("=" * 25)
+        for line in lines:
+            print(line)
+        print(chr(10) + ("OK" if ok else "NOT WORKING"))
+        return 0 if ok else 1
 
     load_dotenv()
     cfg = load_config(args.config)
