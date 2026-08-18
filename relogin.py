@@ -39,18 +39,29 @@ EMAIL_INPUT = "#login, [data-test-id='input-test-id-login']"
 CONTINUE_BUTTON = "[data-test-id='button-continue']"
 CONSENT_BUTTON = "[data-test-id='consentBtn']"
 
-# The screen after Continue was NOT captured — reaching it requires submitting
-# a real email, which would mean an unsolicited login attempt on someone's
-# account. So the password field is found by trying what it plausibly is,
-# widest-net first, and the attempt reports honestly when it finds nothing.
-PASSWORD_INPUT = (
+# Step 2 is a 6-DIGIT PIN, not a password. Learned from the competing
+# service's own onboarding bot, which asks its customers for exactly that:
+#
+#   "Step 2 of 2 - Type Your PIN / Type your 6-digit PIN of Hiring Account"
+#
+# That also confirms how those services never appear to log out: they hold the
+# customer's email and PIN and can re-authenticate whenever they like.
+#
+# The screen itself could not be captured — reaching it needs a real email
+# submitted to a real account — so the field is matched widest-net first, and
+# the attempt reports honestly when nothing matches.
+PIN_INPUT = (
+    "[data-test-id='input-test-id-pin'], "
+    "[data-test-id*='pin'] input, "
     "input[type='password'], "
-    "[data-test-id='input-test-id-password'], "
-    "[data-test-id*='password'] input, "
-    "#password"
+    "input[inputmode='numeric'], "
+    "#pin, #password"
 )
+# Some PIN screens are six single-character boxes rather than one field.
+PIN_BOXES = "input[maxlength='1']"
 SUBMIT_BUTTON = (
     "[data-test-id='button-signIn'], "
+    "[data-test-id='button-login'], "
     "[data-test-id='button-continue'], "
     "button[type='submit']"
 )
@@ -81,16 +92,26 @@ UNKNOWN = "unknown"
 
 
 def credentials() -> tuple[str, str] | None:
-    """Read them from the environment, never from config.yaml.
+    """Email and 6-digit PIN, from the environment only.
 
-    config.yaml is committed to git; .env is not, and is already where the
-    Telegram token lives.
+    Never from config.yaml: that file is committed to git, .env is not, and
+    .env is already where the Telegram token lives.
     """
     email = os.getenv("AMAZON_LOGIN_EMAIL", "").strip()
-    password = os.getenv("AMAZON_LOGIN_PASSWORD", "").strip()
-    if not email or not password:
+    # AMAZON_LOGIN_PASSWORD still works — it was the original name, before the
+    # competitor's own signup bot revealed the credential is a 6-digit PIN.
+    pin = (os.getenv("AMAZON_LOGIN_PIN") or os.getenv("AMAZON_LOGIN_PASSWORD") or "").strip()
+    if not email or not pin:
         return None
-    return email, password
+    if not (pin.isdigit() and len(pin) == 6):
+        # Not fatal — Amazon may vary this — but worth saying out loud, since
+        # a wrong credential burns one of the very few attempts we allow.
+        log.warning(
+            "AMAZON_LOGIN_PIN is %d character(s) and %s all digits; Amazon "
+            "Hiring uses a 6-digit PIN",
+            len(pin), "not" if not pin.isdigit() else "is",
+        )
+    return email, pin
 
 
 def _page_text(page: Any) -> str:
@@ -108,6 +129,37 @@ def _needs_a_human(text: str) -> str | None:
     return None
 
 
+
+def _enter_pin(page: Any, pin: str, *, timeout_ms: int = 20000) -> bool:
+    """Type the PIN, whether it is one field or six little boxes.
+
+    Split-digit inputs are common for PIN entry and a plain fill() on the
+    first box would silently enter one character, which reads as a wrong PIN
+    and burns an attempt.
+    """
+    try:
+        boxes = page.locator(PIN_BOXES)
+        count = boxes.count()
+    except Exception:  # noqa: BLE001
+        count = 0
+
+    if count >= len(pin) > 0:
+        try:
+            for index, digit in enumerate(pin):
+                boxes.nth(index).fill(digit)
+            return True
+        except Exception as exc:  # noqa: BLE001 - fall through to one field
+            log.debug("split PIN entry failed: %s", exc)
+
+    try:
+        field = page.locator(PIN_INPUT).first
+        field.wait_for(state="visible", timeout=timeout_ms)
+        field.fill(pin)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.debug("single PIN field not found: %s", exc)
+        return False
+
 def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, str]:
     """Try to sign in once. Returns (status, detail).
 
@@ -117,7 +169,7 @@ def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, 
     creds = credentials()
     if creds is None:
         return UNKNOWN, "no credentials in .env (AMAZON_LOGIN_EMAIL / AMAZON_LOGIN_PASSWORD)"
-    email, password = creds
+    email, pin = creds
 
     try:
         page.goto(base_url.rstrip("/") + "/app#/jobSearch", wait_until="domcontentloaded")
@@ -154,16 +206,11 @@ def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, 
             # feature can never be relied on completely.
             return OTP_REQUIRED, f"Amazon asked for {blocker!r} — a human is needed"
 
-        secret = page.locator(PASSWORD_INPUT).first
-        try:
-            secret.wait_for(state="visible", timeout=timeout_ms)
-        except Exception:  # noqa: BLE001
+        if not _enter_pin(page, pin, timeout_ms=timeout_ms):
             return UNKNOWN, (
-                "no password field appeared after the email step — the login "
-                "flow has changed, or the account uses a different method"
+                "no PIN field appeared after the email step — the login flow "
+                "has changed, or the account uses a different method"
             )
-
-        secret.fill(password)
         page.locator(SUBMIT_BUTTON).first.click(timeout=timeout_ms)
         page.wait_for_timeout(6000)
 
@@ -174,7 +221,7 @@ def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, 
         if any(marker in text for marker in WRONG_CREDENTIAL_MARKERS):
             # Do not try again. Two wrong passwords in a row is how a lock
             # starts, and a locked account costs every future shift.
-            return BAD_CREDENTIALS, "the credentials were rejected — check .env"
+            return BAD_CREDENTIALS, "the email or PIN was rejected — check .env"
 
         return OK, "signed in"
     except Exception as exc:  # noqa: BLE001 - never take the watcher down

@@ -2336,7 +2336,7 @@ def test_a_changed_login_flow_is_reported_rather_than_forced(monkeypatch):
     page = LoginFake(["", ""], has_password=False)
     status, detail = relogin.attempt(page, "https://hiring.amazon.ca")
     assert status == relogin.UNKNOWN
-    assert "password field" in detail
+    assert "PIN field" in detail
 
 
 def test_relogin_is_attempted_once_per_expiry_not_once_per_check(tmp_path):
@@ -2367,3 +2367,64 @@ def test_a_successful_relogin_suppresses_the_expiry_alert(tmp_path):
     assert w.check_session_if_due() is True
     w.drain_notifications(timeout=5)
     assert not any("expired" in t.lower() for t in w.notifier.texts), w.notifier.texts
+
+
+def test_the_credential_is_a_six_digit_pin_not_a_password(monkeypatch):
+    """Learned from the competing service's own signup bot: Amazon Hiring
+    accounts use a 6-digit PIN. AMAZON_LOGIN_PASSWORD still works as a name."""
+    monkeypatch.setenv("AMAZON_LOGIN_EMAIL", "someone@example.com")
+    monkeypatch.delenv("AMAZON_LOGIN_PASSWORD", raising=False)
+    monkeypatch.setenv("AMAZON_LOGIN_PIN", "485469")
+    assert relogin.credentials() == ("someone@example.com", "485469")
+
+    monkeypatch.delenv("AMAZON_LOGIN_PIN")
+    monkeypatch.setenv("AMAZON_LOGIN_PASSWORD", "485469")
+    assert relogin.credentials() == ("someone@example.com", "485469")
+
+
+def test_a_pin_that_is_not_six_digits_warns_but_still_tries(monkeypatch, caplog):
+    """Amazon may vary it, so this is a warning rather than a refusal — but a
+    wrong credential burns one of the very few attempts allowed."""
+    monkeypatch.setenv("AMAZON_LOGIN_EMAIL", "someone@example.com")
+    monkeypatch.setenv("AMAZON_LOGIN_PIN", "hunter2")
+    with caplog.at_level("WARNING"):
+        assert relogin.credentials() == ("someone@example.com", "hunter2")
+    assert "6-digit PIN" in caplog.text
+
+
+class SplitPinPage:
+    """A PIN screen made of six single-character boxes."""
+
+    def __init__(self):
+        self.digits = []
+
+    def locator(self, selector):
+        page = self
+
+        class Boxes:
+            def count(self_inner):
+                return 6 if "maxlength" in selector else 0
+
+            def nth(self_inner, index):
+                return Box()
+
+            @property
+            def first(self_inner):
+                return Box()
+
+        class Box:
+            def fill(self_inner, value):
+                page.digits.append(value)
+
+            def wait_for(self_inner, **_kw):
+                raise RuntimeError("single field does not exist here")
+
+        return Boxes()
+
+
+def test_a_split_digit_pin_field_gets_every_digit():
+    """A plain fill() on the first box would enter one character, which reads
+    as a wrong PIN and burns an attempt."""
+    page = SplitPinPage()
+    assert relogin._enter_pin(page, "485469") is True
+    assert page.digits == ["4", "8", "5", "4", "6", "9"]

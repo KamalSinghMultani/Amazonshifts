@@ -382,7 +382,8 @@ session:
   # 3am expiry unattended, which is the one thing the paid services have that
   # this does not (they hold their customers' credentials outright).
   #
-  # Needs AMAZON_LOGIN_EMAIL and AMAZON_LOGIN_PASSWORD in .env.
+  # Needs AMAZON_LOGIN_EMAIL and AMAZON_LOGIN_PIN in .env (the hiring
+  # portal uses a 6-digit PIN, not a password).
   # Attempts ONCE per expiry, and stops if Amazon asks for a verification
   # code — repeated failed logins are how accounts get locked. A persistent
   # profile usually avoids the challenge, since the machine is already trusted.
