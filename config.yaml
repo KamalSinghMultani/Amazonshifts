@@ -396,6 +396,20 @@ session:
   # AMAZON_LOGIN_PIN are set in .env — it warns rather than pretending.
   auto_relogin: true
 
+  # ── Sign in BEFORE the session dies ─────────────────────────────────────
+  # The competing service's own FAQ: "To stay active, the bot auto-logs in
+  # every 2 hours." They do not keep sessions alive — they replace them. Our
+  # own measurements agree ~2h is the ceiling, so 100 minutes lands inside it
+  # with room for a slow attempt.
+  #
+  # Set to 0 to go back to re-logging in only once an expiry has been noticed,
+  # which leaves every shift dropping in the gap unholdable.
+  relogin_every_seconds: 6000
+  # A 100-minute cycle needs ~15 sign-ins a day. This cap is for the case where
+  # they are all FAILING: something is rejecting them, and hammering the
+  # account is how a recoverable problem becomes a flagged one.
+  max_relogins_per_day: 12
+
 state:
   path: "state/seen_shifts.json"
   # Forget a shift id after this long, so a genuinely re-posted shift

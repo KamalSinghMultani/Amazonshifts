@@ -103,6 +103,19 @@ class Watcher:
         # locked, and a locked account costs every shift, not one.
         self.relogin_tried = False
 
+        # Sign in again BEFORE the session dies rather than after. The
+        # competing service's FAQ describes exactly this — "the bot auto-logs
+        # in every 2 hours" — and it is the difference between a watcher that
+        # can hold a 6am shift and one that discovers at 6am that it cannot.
+        self.relogin_every = float(session_cfg.get("relogin_every_seconds") or 0)
+        self.max_relogins_per_day = int(session_cfg.get("max_relogins_per_day") or 0)
+        self.next_relogin = 0.0
+        self.relogins_today = 0
+        self.relogin_day = datetime.now().date()
+        self.relogin_blocked = False   # set by a CAPTCHA or the daily cap
+        # Never sign in during the seconds that decide a shift.
+        self.holding = False
+
         self.context = None
         self.page = None
         self.api_client: ApiClient | None = None
@@ -266,6 +279,7 @@ class Watcher:
                     self._trip_circuit_breaker(exc)
 
             self.check_session_if_due()
+            self.relogin_if_due()
 
             if once or self.stop_event.is_set():
                 break
@@ -304,6 +318,74 @@ class Watcher:
             # costs nothing and does not deserve an alert.
             return False
         return (now if now is not None else time.monotonic()) >= self.next_session_check
+
+    # ── scheduled re-login ──────────────────────────────────────────────────
+    def relogin_due(self, now: float | None = None) -> bool:
+        """Is it time to replace the session before it expires?"""
+        if self.relogin_every <= 0 or self.dry_run or not self.auto_relogin:
+            return False
+        # Roll the day FIRST. Checking the block before the rollover left a
+        # watcher that hit yesterday's cap disabled forever — it would poll
+        # all night and never sign in again.
+        self._roll_relogin_day()
+        if self.relogin_blocked:
+            return False
+        if self.holding:
+            # A re-login in the seconds that decide a shift would be the worst
+            # possible trade. The cycle can wait; the shift cannot.
+            return False
+        return (now if now is not None else time.monotonic()) >= self.next_relogin
+
+    def _roll_relogin_day(self) -> None:
+        """A new day restores the budget, and clears a cap-imposed block."""
+        today = datetime.now().date()
+        if today != self.relogin_day:
+            self.relogin_day = today
+            self.relogins_today = 0
+            self.relogin_blocked = False
+
+    def _relogin_budget_left(self) -> bool:
+        """Day-capped, so a failing cycle cannot hammer the account."""
+        self._roll_relogin_day()
+
+        if not self.max_relogins_per_day:
+            return True
+        if self.relogins_today < self.max_relogins_per_day:
+            return True
+
+        log.error(
+            "re-login budget for today is spent (%d) — not signing in again "
+            "until tomorrow", self.max_relogins_per_day,
+        )
+        self.relogin_blocked = True
+        self.notify_async(
+            self.notifier.notify_error,
+            f"Stopped re-logging in after {self.max_relogins_per_day} attempts "
+            "today. Something is rejecting them — check the log, and expect "
+            "holding to fail until it is fixed.",
+        )
+        return False
+
+    def relogin_if_due(self) -> bool | None:
+        """Replace the session on a timer, before it can expire.
+
+        Returns True/False for an attempt made, None when none was due. The
+        expiry-triggered path in check_session_if_due stays as the safety net
+        for a session that dies early.
+        """
+        if not self.relogin_due():
+            return None
+
+        self.next_relogin = time.monotonic() + self.relogin_every
+        if not self._relogin_budget_left():
+            return None
+
+        self.relogins_today += 1
+        log.info(
+            "scheduled re-login (%d today, every %.0f min)",
+            self.relogins_today, self.relogin_every / 60,
+        )
+        return self.try_relogin()
 
     def check_session_if_due(self) -> bool | None:
         """Confirm the hiring portal is still signed in, and say so if not.
@@ -424,6 +506,20 @@ class Watcher:
             page = self.context.new_page()
             status, detail = relogin.attempt(page, self.cfg["site"]["base_url"])
             log.info("re-login attempt: %s (%s)", status, detail)
+
+            if status == relogin.CAPTCHA:
+                # Stop the cycle entirely. Retrying a CAPTCHA on a timer turns
+                # a recoverable state into a flagged account, and nothing here
+                # is going to solve one.
+                self.relogin_blocked = True
+                log.error("a CAPTCHA blocked the re-login — scheduled attempts disabled")
+                self.notify_async(
+                    self.notifier.notify_error,
+                    f"A CAPTCHA blocked the automated login: {detail}\n"
+                    "Automatic re-login is now OFF until the watcher restarts. "
+                    "Run <code>python save_session.py</code> to clear it.",
+                )
+                return False
 
             if status != relogin.OK:
                 self.notify_async(
@@ -595,8 +691,14 @@ class Watcher:
             "holding %s — %.0fms after poll start",
             to_hold[0].summary(), (time.perf_counter() - started) * 1000,
         )
-        for shift in to_hold:
-            self._hold(shift, poll_started=started)
+        # Fence the whole hold: the scheduled re-login must not start signing
+        # in halfway through the clicks that reserve a shift.
+        self.holding = True
+        try:
+            for shift in to_hold:
+                self._hold(shift, poll_started=started)
+        finally:
+            self.holding = False
 
         # Everything below is off the critical path: by now the shift is either
         # reserved or already gone.

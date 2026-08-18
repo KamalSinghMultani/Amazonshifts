@@ -106,10 +106,24 @@ DEFAULTS: dict[str, Any] = {
     # The hiring portal session expires on its own — measured at roughly two
     # hours. Detection keeps working when it does, which is precisely the
     # danger: the watcher looks healthy and cannot hold a thing.
+    #
+    # The competing service's own FAQ says how they live with this: "To stay
+    # active, the bot auto-logs in every 2 hours." They do not try to keep a
+    # session alive; they replace it before it dies. So do we.
     "session": {
         "check_every_seconds": 600,
         "keepalive": True,
         "alert_on_expiry": True,
+        # 100 minutes: inside the observed ~2h window with room for a slow
+        # attempt. 0 disables the cycle and falls back to re-logging in only
+        # once an expiry has been noticed — by which point a shift may already
+        # have been missed.
+        "relogin_every_seconds": 6000,
+        # Repeated logins are the one way this can do harm. A 100-minute cycle
+        # needs about 15 a day; 12 leaves the cycle intact while capping a
+        # runaway loop, and Amazon challenging us repeatedly is exactly when
+        # backing off matters most.
+        "max_relogins_per_day": 12,
         # Opt-in. Needs AMAZON_LOGIN_EMAIL / AMAZON_LOGIN_PASSWORD in .env.
         # See relogin.py for why this is off by default.
         "auto_relogin": False,
@@ -297,6 +311,20 @@ def validate_config(cfg: dict) -> None:
                 "session.check_every_seconds below 60 loads a page far more "
                 "often than a session can plausibly expire"
             )
+
+    relogin_every = int(session.get("relogin_every_seconds") or 0)
+    if relogin_every and relogin_every < 600:
+        # A login is not a health check. Signing in every few minutes would
+        # earn a challenge, and a challenged account holds no shifts at all.
+        raise ValueError(
+            "session.relogin_every_seconds below 600 signs in far more often "
+            "than any session expires, and invites a challenge"
+        )
+    if relogin_every and not session.get("auto_relogin"):
+        log.warning(
+            "session.relogin_every_seconds is set but auto_relogin is false — "
+            "no scheduled re-login will happen"
+        )
 
     # Parse for the side effect: a malformed window must fail at startup.
     polling["hot_windows_parsed"] = parse_hot_windows(polling.get("hot_windows"))

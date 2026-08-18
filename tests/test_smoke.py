@@ -2518,3 +2518,128 @@ def test_a_broken_probe_is_never_fatal():
     status, meaning = doctor.probe_authorize(Broken(), "https://hiring.amazon.ca")
     assert status is None
     assert "probe failed" in meaning
+
+
+# ── re-login on a cycle, not on failure ─────────────────────────────────────
+def _cycle_watcher(tmp_path, **overrides):
+    """A watcher with the scheduled re-login armed and try_relogin stubbed."""
+    overrides.setdefault("dry_run", False)
+    w = _batch_watcher(tmp_path, [], **overrides)
+    w.auto_relogin = True
+    w.relogin_every = 6000
+    w.next_relogin = 0.0
+    w.attempts = []
+    w.try_relogin = lambda: w.attempts.append(1) or True
+    return w
+
+
+def test_a_relogin_becomes_due_and_then_waits_its_turn(tmp_path):
+    """The competitor's FAQ says their bot signs in every 2 hours. Ours does
+    the same on a 100-minute cycle, rather than waiting to discover at 6am
+    that the session died at 3."""
+    w = _cycle_watcher(tmp_path)
+    assert w.relogin_if_due() is True
+    assert len(w.attempts) == 1
+    assert w.relogin_if_due() is None, "not due again until the interval passes"
+
+
+def test_no_relogin_while_a_hold_is_in_progress(tmp_path):
+    """Signing in during the seconds that decide a shift would be the worst
+    possible trade — the cycle can wait, the shift cannot."""
+    w = _cycle_watcher(tmp_path)
+    w.holding = True
+    assert w.relogin_if_due() is None
+    assert w.attempts == []
+
+    w.holding = False
+    assert w.relogin_if_due() is True
+
+
+def test_the_cycle_is_off_in_dry_run_and_when_relogin_is_disabled(tmp_path):
+    dry = _cycle_watcher(tmp_path, dry_run=True)
+    assert dry.relogin_if_due() is None
+
+    off = _cycle_watcher(tmp_path)
+    off.auto_relogin = False
+    assert off.relogin_if_due() is None
+
+    unset = _cycle_watcher(tmp_path)
+    unset.relogin_every = 0
+    assert unset.relogin_if_due() is None
+
+
+def test_a_failing_cycle_cannot_hammer_the_account(tmp_path):
+    """Repeated logins are the one way this plan can do harm."""
+    w = _cycle_watcher(tmp_path)
+    w.max_relogins_per_day = 3
+    w.try_relogin = lambda: w.attempts.append(1) or False
+
+    for _ in range(8):
+        w.next_relogin = 0.0
+        w.relogin_if_due()
+
+    assert len(w.attempts) == 3, "the daily cap has to hold"
+    w.drain_notifications(timeout=5)
+    assert sum("Stopped re-logging in" in t for t in w.notifier.texts) == 1
+
+
+def test_the_budget_resets_the_next_day(tmp_path):
+    from datetime import timedelta
+
+    w = _cycle_watcher(tmp_path)
+    w.max_relogins_per_day = 2
+    w.relogins_today = 2
+    w.relogin_blocked = True
+    w.relogin_day = datetime.now().date() - timedelta(days=1)
+
+    w.next_relogin = 0.0
+    assert w.relogin_if_due() is True
+    assert w.relogins_today == 1
+
+
+def test_a_captcha_disables_the_cycle_rather_than_retrying(tmp_path, monkeypatch):
+    """Retrying a CAPTCHA on a timer turns a recoverable state into a flagged
+    account, and nothing here is going to solve one."""
+    monkeypatch.setenv("AMAZON_LOGIN_EMAIL", "someone@example.com")
+    monkeypatch.setenv("AMAZON_LOGIN_PIN", "123456")
+
+    w = _batch_watcher(tmp_path, [], dry_run=False)
+    w.auto_relogin = True
+    w.relogin_every = 6000
+    w.next_relogin = 0.0
+
+    class Ctx:
+        pages = []
+
+        def new_page(self_inner):
+            return FakeCheckPage("https://auth.hiring.amazon.com/#/login")
+
+    w.context = Ctx()
+    monkey = lambda page, base_url, **kw: (relogin.CAPTCHA, "a 'captcha' is on screen")
+    original, relogin.attempt = relogin.attempt, monkey
+    try:
+        assert w.try_relogin() is False
+    finally:
+        relogin.attempt = original
+
+    assert w.relogin_blocked is True
+    assert w.relogin_if_due() is None, "the cycle must stop after a CAPTCHA"
+    w.drain_notifications(timeout=5)
+    assert any("CAPTCHA" in t for t in w.notifier.texts)
+
+
+def test_a_silly_relogin_interval_is_rejected():
+    cfg = config_mod._deep_merge(
+        config_mod.DEFAULTS, {"session": {"relogin_every_seconds": 60}}
+    )
+    with pytest.raises(ValueError, match="relogin_every_seconds"):
+        config_mod.validate_config(cfg)
+
+
+def test_the_shipped_config_signs_in_inside_the_observed_window():
+    """Sessions were measured dying at roughly two hours, twice. A cycle
+    longer than that would be a cycle that arrives late."""
+    cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    every = cfg["session"]["relogin_every_seconds"]
+    assert 600 <= every <= 7200, every
+    assert cfg["session"]["max_relogins_per_day"] >= 86400 / every / 2

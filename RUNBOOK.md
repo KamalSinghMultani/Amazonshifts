@@ -58,7 +58,45 @@ Skipping this makes it hang on a profile lock and look broken when it is not.
 
 ---
 
-## 4. When the session expires
+## 4. Staying logged in (how it works now)
+
+The Amazon Hiring session dies after roughly **two hours**. Measured twice
+here, and the competing service engineers around the same limit — their FAQ
+says their bot "auto-logs in every 2 hours".
+
+So the watcher does the same:
+
+| Every | What happens |
+|---|---|
+| 5 minutes | checks the session is alive, and renews the page token |
+| 100 minutes | signs in again with your email + PIN, before it can expire |
+| on expiry | signs in immediately, as a safety net |
+
+Amazon usually emails a 6-digit code during that sign-in. **Without a way to
+read it the cycle stops there and Telegram tells you.** Two ways to give it
+one — the second is what the competitor's own guide tells its customers to do:
+
+**A. Read the inbox directly.** In `.env`:
+
+    OTP_IMAP_USER=the-gmail-that-gets-amazon-mail@gmail.com
+    OTP_IMAP_PASSWORD=<a Google APP PASSWORD, not your normal one>
+
+App password: Google Account -> Security -> 2-Step Verification -> App passwords.
+
+**B. Forward to a dedicated inbox.** In Gmail: Settings -> Forwarding and
+POP/IMAP -> Add a forwarding address -> a throwaway address you own -> then
+point `OTP_IMAP_USER` at THAT inbox. A script never touches your main mail.
+
+Either way it only reads while a login is in progress, only accepts a code
+that arrived after that login started, opens the mailbox read-only, and never
+marks or deletes anything.
+
+⚠️ **The code expires in 3 minutes** and resend is blocked for 55 seconds, so
+a mailbox it cannot reach promptly is no better than none.
+
+---
+
+## 5. When the session expires anyway
 
 You will be told: the watcher checks every 10 minutes and Telegram says
 **"Amazon session expired"**, or `--doctor` reports `signed OUT`.
@@ -84,7 +122,7 @@ Then:
 
 ---
 
-## 5. Testing (US site — never for real shifts)
+## 6. Testing (US site — never for real shifts)
 
 The US site always has jobs, so it is where the code gets exercised. It has its
 own profile, state and log.
@@ -110,7 +148,7 @@ for a US hold test, check Canada afterwards:
 
 ---
 
-## 6. What it does when a shift appears
+## 7. What it does when a shift appears
 
 1. Detects it within ~5 seconds (3 when hot); each poll takes ~150 ms
 2. Telegram alert immediately
@@ -123,7 +161,7 @@ Mississauga, then Toronto, and Fulfillment ahead of Delivery.
 
 ---
 
-## 7. Changing what it looks for
+## 8. Changing what it looks for
 
 All in `config.yaml`:
 

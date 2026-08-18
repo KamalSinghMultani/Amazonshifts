@@ -234,3 +234,49 @@ session refreshed when it expires. Not built yet — flag it when the basics wor
   point, not a tuned value.
 - **`raw` on every `Shift`** holds the original API payload. When a field maps
   wrong, that's where to look.
+
+---
+
+## What the competitor's own guide told us (2026-08-18)
+
+`full_competer_workflow.pdf` is their published setup guide, and it answered
+questions our own testing could not:
+
+- **"To stay active, the bot auto-logs in every 2 hours."** The ~2h session
+  ceiling is real, not an artefact of our own tests. Keeping a session alive
+  is not the strategy — replacing it before it dies is. That is now
+  `session.relogin_every_seconds`, at 100 minutes.
+- **"For OTP, you can set auto-forwarding (best)."** They forward Amazon's mail
+  to `otp@amazonwarehousejobs.ca`, a domain they own. So they need the inbox
+  too — there is no secret that avoids the emailed code. `otp_mail.py` is the
+  same mechanism, minus the forwarding hop.
+- **They fill in basic info and the assessment after picking**, leaving the
+  human 3 hours for the background check and interview slot. We deliberately
+  stop at the hold: those steps are SIN, date of birth and address history.
+
+## Deferred: schedule-aware matching
+
+Their onboarding collects preferences we cannot express yet:
+
+| They filter on | We have |
+|---|---|
+| warehouse type (Delivery / Fulfilment / Sortation / XL) | title substrings only |
+| minimum shift hours (3h / 7h / 10h) | nothing |
+| availability by day and time | nothing |
+| shift type (Flex / Part / Reduced / Full) | matched loosely via title |
+
+**There is a real bug hiding behind this.** `HOLD_STEPS`' "pick a shift" step
+clicks the FIRST Apply button in the schedule flyout. A job with several
+schedules can therefore hand you the wrong one — their own pick message shows
+`Sat, Sun, Mon, Tue 8:00 PM - 6:30 AM (40h)`, which is exactly the sort of
+overnight block someone wanting days would not want.
+
+Everything needed to fix it already exists: `schedules.py` fetches
+`searchScheduleCards` for a jobId, which returns `scheduleId`, real shift text,
+`hoursPerWeek`, `siteId` and `laborDemandAvailableCount`. The work is to filter
+those against preferences and click the matching card's Apply rather than the
+first one.
+
+Not attempted: deep-linking to `/application/?jobId=…&scheduleId=…`. Tested six
+ways on 2026-08-18 and every one bounces to the login page. See the comment on
+`hold.direct_apply` in `config.py` before trying again.
