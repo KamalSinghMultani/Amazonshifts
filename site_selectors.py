@@ -131,10 +131,8 @@ HOLD_STEPS: list[HoldStep] = [
 # The scheduleId in that URL is the point of the whole exercise: the specific
 # shift is now attached to an open application, which is what "holding" means
 # here. What follows is a multi-page application — consent, personal details,
-# background-check authorisation — that a human should be filling in, and that
-# no sane bot should be clicking through on someone's behalf.
-#
-# So the watcher stops here and hands over.
+# background-check authorisation — needing information this program does not
+# have, so the watcher stops here and hands over.
 
 # The schedule flyout, so "pick a shift" can be scoped to it rather than
 # matching a stray Apply button elsewhere on the page.

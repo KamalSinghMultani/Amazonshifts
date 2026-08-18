@@ -1,19 +1,22 @@
-"""Optional automated re-login, for when the session dies at 3am.
+"""Automated re-login, for when the session dies while nobody is watching.
 
-WHY THIS IS OPT-IN AND OFF BY DEFAULT
--------------------------------------
-Every other part of this project is built so that no code path ever reads your
-password — you log in by hand, once, and the session is reused. That is a real
-security property and it is worth keeping if you can.
+The hiring-portal session lasts about two hours — measured, and consistent
+with the competing service re-authenticating on a timer rather than trying to
+keep one alive. Detection carries on working when it expires, which is the
+trap: the watcher looks healthy and cannot hold a thing.
 
-The cost of keeping it: when a session expires overnight, the watcher keeps
-detecting and alerting but cannot hold anything until you sit down and log in.
-The paid services do not have this problem because they hold their customers'
-credentials outright.
+Needs AMAZON_LOGIN_EMAIL and AMAZON_LOGIN_PIN in .env, and
+session.auto_relogin: true. Without either, nothing here runs.
 
-So this exists as a deliberate trade you can make: put your credentials in
-.env, and the watcher will try to sign itself back in once per expiry. Enable
-it with session.auto_relogin: true. Leave it off and nothing here ever runs.
+Operational notes worth keeping in mind:
+
+* One attempt per expiry, never a loop. Repeated failed logins are how
+  accounts get locked, and a locked account costs every future shift.
+* The login flow is email -> country -> 6-digit PIN, then sometimes a
+  challenge. An emailed code can be finished automatically when a mailbox is
+  configured (see otp_mail); an image challenge returns CAPTCHA and stops.
+* Success is verified by re-checking the portal afterwards, never inferred
+  from a click that did not raise.
 """
 
 from __future__ import annotations
@@ -108,13 +111,10 @@ EMAIL_CODE_MARKERS = (
     "check your email",
 )
 
-# A CAPTCHA cannot, ever. Solving image challenges is not something this
-# project does — it is the line between automating your own login and
-# impersonating a human to a system that asked whether you were one.
-#
-# Keeping these separate matters practically too: routing a CAPTCHA into the
-# email path would click a "send code" button that is not there, then sit for
-# two minutes waiting on mail that was never sent.
+# A CAPTCHA is not answerable from a mailbox, so it must never be routed into
+# the email path: that would click a "send code" button which is not there,
+# then sit for two minutes waiting on mail nobody sent, and burn the one
+# attempt allowed per expiry.
 HUMAN_ONLY_MARKERS = (
     "puzzle",
     "captcha",
@@ -242,14 +242,12 @@ def _needs_a_human(text: str) -> str | None:
 
 
 def _is_captcha(text: str) -> str | None:
-    """A challenge nothing here will answer.
+    """An image challenge, as opposed to an emailed code.
 
-    Solving image puzzles is not something this project does: it is the line
-    between automating your own login and impersonating a human to a system
-    that just asked whether you were one. Keeping it separate matters
-    practically too — routing a CAPTCHA into the emailed-code path would click
-    a send button that is not there, then wait two minutes for mail nobody
-    sent, and burn the single attempt allowed per expiry.
+    Kept separate because the two need completely different handling: one can
+    be finished from the mailbox, the other cannot. Routing a CAPTCHA into the
+    emailed-code path clicks a send button that is not there, waits two minutes
+    for mail nobody sent, and burns the single attempt allowed per expiry.
     """
     for marker in HUMAN_ONLY_MARKERS:
         if marker in text:
@@ -363,8 +361,7 @@ def _solve_email_code(page: Any, *, timeout_ms: int = 20000) -> tuple[str, str] 
         after = _page_text(page)
         blocker = _is_captcha(after)
         if blocker or captcha_on_screen(page):
-            # This is where it actually stops. Nothing here solves image
-            # challenges, and pretending otherwise would burn attempts.
+            # No code was sent, so waiting on the mailbox is pointless.
             return CAPTCHA, (
                 f"a CAPTCHA appeared when asking for the code "
                 f"({blocker or 'challenge widget on screen'}). No code was "
