@@ -238,26 +238,43 @@ filters:
 
   # Brampton, Mississauga, Toronto, Oakville, and the sites within ~30km of
   # Brampton. Matching is substring, so "toronto" also catches "Toronto, ON".
+  # The GTA — roughly a 30km radius from Toronto. Amazon labels sites by
+  # district as often as by city ("Etobicoke, ON", "North York, ON"), so the
+  # districts are listed individually; matching "toronto" alone would miss
+  # them.
   include_locations:
+    # Toronto and its districts
+    - "toronto"
+    - "etobicoke"
+    - "scarborough"
+    - "north york"
+    - "east york"
+    - "rexdale"
+    - "downsview"
+    # Peel
     - "brampton"
     - "mississauga"
-    - "toronto"
-    - "oakville"
-    - "etobicoke"
     - "malton"
-    - "rexdale"
-    - "north york"
+    - "bolton"
+    - "caledon"
+    # York
     - "vaughan"
     - "woodbridge"
     - "concord"
     - "maple"
+    - "thornhill"
+    - "markham"
+    - "richmond hill"
     - "kleinburg"
-    - "bolton"
-    - "caledon"
+    # Halton
+    - "oakville"
+    - "milton"
     - "georgetown"
     - "halton hills"
     - "norval"
-    - "milton"
+    # Durham — the eastern edge of the radius
+    - "pickering"
+    - "ajax"
 
   # Substring matching is blunt: "maple" would also match "Maple Ridge, BC".
   # Excluding the other provinces costs nothing and stops a 3,000km commute

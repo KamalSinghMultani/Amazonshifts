@@ -2982,3 +2982,46 @@ def test_shift_types_filter_on_what_the_api_actually_returns():
     assert picky.matches(Shift(title="A", schedule="PART_TIME;REDUCED_TIME"))[0]
     ok, reason = picky.matches(Shift(title="A", schedule="FULL_TIME"))
     assert not ok and "FULL_TIME" in reason
+
+
+# ── place names must match whole words ──────────────────────────────────────
+def test_milton_does_not_match_hamilton():
+    """Found the moment the GTA list was widened: "milton" is inside
+    "Hamilton", so a substring match accepted a posting 70km away."""
+    matcher = ShiftMatcher(_shipped()["filters"])
+    assert matcher.matches(_gta(FULFILLMENT, "Milton"))[0]
+    assert not matcher.matches(_gta(FULFILLMENT, "Hamilton"))[0]
+
+
+def test_the_province_excludes_still_work_after_the_word_boundaries():
+    """A leading word-boundary guard on ", bc" would demand a non-letter before
+    the comma — never true — and would silently disable every province
+    exclude. That regression lasted one test run."""
+    matcher = ShiftMatcher(_shipped()["filters"])
+    assert matcher.matches(_gta(FULFILLMENT, "Maple"))[0]
+    assert not matcher.matches(Shift(title=FULFILLMENT, location="Maple Ridge, BC"))[0]
+    assert not matcher.matches(Shift(title=FULFILLMENT, location="Nisku, AB"))[0]
+
+
+def test_titles_still_match_on_substrings():
+    """Deliberately different from locations. Amazon spells it both ways —
+    "Fulfillment Center" on the US site, "Fulfilment Centre" on the CA one —
+    and a partial needle has to catch both, which whole-word matching would
+    not."""
+    matcher = ShiftMatcher({"include_titles": ["fulfillment cent"]})
+    assert matcher.matches(Shift(title="Fulfillment Center Warehouse Associate"))[0]
+    assert matcher.matches(Shift(title="Fulfillment Centre Warehouse Associate"))[0]
+
+
+def test_the_gta_list_covers_torontos_districts():
+    """Amazon labels sites by district as often as by city, so matching
+    "toronto" alone would miss Etobicoke, Scarborough and North York."""
+    matcher = ShiftMatcher(_shipped()["filters"])
+    for district in ("Etobicoke", "Scarborough", "North York", "East York"):
+        assert matcher.matches(_gta(FULFILLMENT, district))[0], district
+
+
+def test_the_gta_list_stops_at_the_radius():
+    matcher = ShiftMatcher(_shipped()["filters"])
+    for far in ("Ottawa", "Barrie", "London", "Kingston", "Windsor"):
+        assert not matcher.matches(_gta(FULFILLMENT, far))[0], far

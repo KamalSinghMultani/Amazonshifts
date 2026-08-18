@@ -129,6 +129,33 @@ def _contains_any(haystack: str, needles: Iterable[str]) -> str | None:
     return None
 
 
+def _contains_any_word(haystack: str, needles: Iterable[str]) -> str | None:
+    """Like _contains_any, but only on whole words.
+
+    Place names demand this. "milton" is inside "Hamilton", so a plain
+    substring match on a Milton filter accepted a Hamilton posting — 70km away
+    and not somewhere you can work. The same trap caught "maple" matching
+    "Maple Ridge, BC" earlier, which the province excludes were papering over.
+
+    Titles deliberately still use substrings: "fulfillment cent" has to match
+    both "Fulfillment Center" and "Fulfillment Centre".
+    """
+    low = haystack.lower()
+    for needle in needles:
+        needle = _norm(needle).lower()
+        if not needle:
+            continue
+        # Guard only the ends that are letters. The province excludes are
+        # written as ", bc" — a leading guard there would demand a non-letter
+        # before the comma, which is never true, and would silently disable
+        # every one of them.
+        prefix = r"(?<![a-z])" if needle[0].isalpha() else ""
+        suffix = r"(?![a-z])" if needle[-1].isalpha() else ""
+        if re.search(prefix + re.escape(needle) + suffix, low):
+            return needle
+    return None
+
+
 class ShiftMatcher:
     """Decides whether a Shift is one the user actually wants."""
 
@@ -161,10 +188,12 @@ class ShiftMatcher:
         )
 
         for name, value, includes, excludes in checks:
-            hit = _contains_any(value, excludes)
+            # Place names match on whole words; titles on substrings.
+            match = _contains_any_word if name == "location" else _contains_any
+            hit = match(value, excludes)
             if hit:
                 return False, f"{name} excluded by {hit!r}"
-            if includes and not _contains_any(value, includes):
+            if includes and not match(value, includes):
                 return False, f"{name} {value!r} matched no include filter"
 
         if self.warehouse_types:
