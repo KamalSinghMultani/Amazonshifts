@@ -23,6 +23,7 @@ import doctor
 import drop_report
 import otp_mail
 import relogin
+import schedules as schedules_mod
 import site_selectors
 from notifier import TelegramNotifier
 from shift_matcher import Shift, ShiftMatcher, ShiftRanker
@@ -2819,3 +2820,64 @@ def test_a_sentinel_pay_rate_ranks_last_not_first():
     junk = Shift(id="junk", title="A", location="Nisku, AB", pay_rate=1.7976931348623157e308)
     real = Shift(id="real", title="B", location="Brampton, ON", pay_rate=23.10)
     assert ranker.sort([junk, real])[0].id == "real"
+
+
+# ── choosing WHICH schedule, not just the first one ─────────────────────────
+CARD_A = "$24.00/hr | Featured | Schedule (26h per week) | Wed, Thu, Fri, Sat 9:30 PM - 4:00 AM"
+CARD_B = "$24.00/hr | Featured | Schedule (26h per week) | Sun, Mon, Tue, Wed 9:30 PM - 4:00 AM"
+
+
+def test_a_schedule_card_is_parsed_from_its_visible_text():
+    """Wording taken from the live flyout, not invented."""
+    card = schedules_mod.parse_card_text(CARD_A)
+    assert card["hours_per_week"] == 26.0
+    assert card["pay_rate"] == 24.0
+    assert card["days"] == ["wed", "thu", "fri", "sat"]
+    assert card["starts"] == "9:30 PM" and card["ends"] == "4:00 AM"
+
+
+def test_a_shift_running_past_midnight_is_overnight():
+    assert schedules_mod.is_overnight(schedules_mod.parse_card_text(CARD_A)) is True
+    day = schedules_mod.parse_card_text("Mon, Tue 7:00 AM - 3:30 PM")
+    assert schedules_mod.is_overnight(day) is False
+
+
+def test_availability_decides_between_otherwise_identical_schedules():
+    """The live case: same pay, same hours, different days. Whichever renders
+    first is an accident, and you have to work whichever one it takes."""
+    cards = [schedules_mod.parse_card_text(CARD_A), schedules_mod.parse_card_text(CARD_B)]
+    index, why = schedules_mod.choose_card(cards, {"available_days": ["sun", "mon", "tue", "wed"]})
+    assert index == 1, why
+    index, _ = schedules_mod.choose_card(cards, {"available_days": ["wed", "thu", "fri", "sat"]})
+    assert index == 0
+
+
+def test_a_schedule_you_can_only_half_work_is_refused():
+    card = schedules_mod.parse_card_text(CARD_A)
+    ok, reason = schedules_mod.card_is_acceptable(card, {"available_days": ["wed", "thu"]})
+    assert not ok
+    assert "fri" in reason and "sat" in reason
+
+
+def test_minimum_hours_and_overnight_are_enforced():
+    card = schedules_mod.parse_card_text(CARD_A)
+    ok, reason = schedules_mod.card_is_acceptable(card, {"min_hours_per_week": 30})
+    assert not ok and "below" in reason
+
+    ok, reason = schedules_mod.card_is_acceptable(card, {"avoid_overnight": True})
+    assert not ok and "overnight" in reason
+
+
+def test_no_acceptable_schedule_says_why_rather_than_picking_one():
+    cards = [schedules_mod.parse_card_text(CARD_A), schedules_mod.parse_card_text(CARD_B)]
+    index, why = schedules_mod.choose_card(cards, {"min_hours_per_week": 40})
+    assert index is None
+    assert "below" in why
+
+
+def test_with_no_preferences_the_first_schedule_still_wins():
+    """Unchanged behaviour when nothing is configured — the feature must not
+    quietly start making choices for someone who never asked it to."""
+    cards = [schedules_mod.parse_card_text(CARD_A), schedules_mod.parse_card_text(CARD_B)]
+    assert schedules_mod.choose_card(cards, None)[0] == 0
+    assert schedules_mod.choose_card(cards, {})[0] == 0

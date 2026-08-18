@@ -25,6 +25,7 @@ Confirmed live 2026-08-18 by capturing what the site itself calls.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -162,3 +163,114 @@ def application_url(base_url: str, job_id: str, schedule_id: str) -> str:
         f"{base_url.rstrip('/')}/application/"
         f"?jobId={quote(job_id)}&page=pre-consent&scheduleId={quote(schedule_id)}"
     )
+
+# ── choosing WHICH schedule, from the flyout ────────────────────────────────
+# The flyout renders one card per schedule and the hold used to click the
+# first. Confirmed live 2026-08-18, a single job offered:
+#
+#   $24.00/hr | Featured | Schedule (26h per week) | Wed, Thu, Fri, Sat 9:30 PM - 4:00 AM
+#   $24.00/hr | Featured | Schedule (26h per week) | Sun, Mon, Tue, Wed 9:30 PM - 4:00 AM
+#
+# Same pay, same hours, different days. Whichever renders first is not a
+# choice, it is an accident — and you have to work whichever one it takes.
+
+DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+HOURS_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*h(?:ours?)?\s*per\s*week", re.I)
+PAY_PATTERN = re.compile(r"\$\s*(\d+(?:\.\d+)?)", re.I)
+TIME_RANGE = re.compile(
+    r"(\d{1,2}:\d{2}\s*[AP]M)\s*[-–—]\s*(\d{1,2}:\d{2}\s*[AP]M)", re.I
+)
+
+
+def parse_card_text(text: str) -> dict:
+    """Pull the facts out of one schedule card's visible text."""
+    low = (text or "").lower()
+
+    hours = HOURS_PATTERN.search(low)
+    pay = PAY_PATTERN.search(low)
+    times = TIME_RANGE.search(text or "")
+
+    return {
+        "hours_per_week": float(hours.group(1)) if hours else None,
+        "pay_rate": float(pay.group(1)) if pay else None,
+        "days": [day for day in DAY_NAMES if day in low],
+        "starts": times.group(1).strip() if times else "",
+        "ends": times.group(2).strip() if times else "",
+        "text": " ".join((text or "").split())[:160],
+    }
+
+
+def _to_minutes(clock: str) -> int | None:
+    match = re.match(r"(\d{1,2}):(\d{2})\s*([AP])M", (clock or "").strip(), re.I)
+    if not match:
+        return None
+    hour, minute, meridiem = int(match.group(1)), int(match.group(2)), match.group(3).upper()
+    hour = 0 if hour == 12 else hour
+    if meridiem == "P":
+        hour += 12
+    return hour * 60 + minute
+
+
+def is_overnight(card: dict) -> bool:
+    """Does the shift run past midnight? 9:30 PM - 4:00 AM does."""
+    start, end = _to_minutes(card.get("starts", "")), _to_minutes(card.get("ends", ""))
+    if start is None or end is None:
+        return False
+    return end <= start
+
+
+def card_is_acceptable(card: dict, prefs: dict | None) -> tuple[bool, str]:
+    """Filter one schedule against the preferences. Returns (ok, reason)."""
+    prefs = prefs or {}
+
+    minimum = prefs.get("min_hours_per_week")
+    if minimum is not None and card.get("hours_per_week") is not None:
+        if card["hours_per_week"] < float(minimum):
+            return False, f"{card['hours_per_week']}h/week below the {minimum}h minimum"
+
+    available = [d.lower()[:3] for d in (prefs.get("available_days") or [])]
+    if available and card.get("days"):
+        # Every day of the shift has to be one you are free — a schedule you
+        # can only half-work is one you cannot take.
+        clashes = [day for day in card["days"] if day not in available]
+        if clashes:
+            return False, f"needs {', '.join(clashes)}, which you are not available"
+
+    if prefs.get("avoid_overnight") and is_overnight(card):
+        return False, f"overnight ({card.get('starts')} - {card.get('ends')})"
+
+    return True, "acceptable"
+
+
+def choose_card(cards: list[dict], prefs: dict | None = None) -> tuple[int | None, str]:
+    """Index of the schedule to take, and why. None when none are acceptable.
+
+    Among acceptable schedules: more pay first, then more hours. Both are
+    tie-breaks that only run after the hard preferences have been applied.
+    """
+    acceptable: list[tuple[int, dict]] = []
+    reasons: list[str] = []
+    for index, card in enumerate(cards):
+        ok, reason = card_is_acceptable(card, prefs)
+        if ok:
+            acceptable.append((index, card))
+        else:
+            reasons.append(f"#{index + 1} {reason}")
+
+    if not acceptable:
+        return None, "; ".join(reasons) or "no schedules on offer"
+
+    acceptable.sort(
+        key=lambda pair: (-(pair[1].get("pay_rate") or 0),
+                          -(pair[1].get("hours_per_week") or 0),
+                          pair[0])
+    )
+    index, card = acceptable[0]
+    return index, (
+        f"schedule #{index + 1} of {len(cards)}: "
+        f"{card.get('starts') or '?'}-{card.get('ends') or '?'}, "
+        f"{card.get('hours_per_week') or '?'}h/week, "
+        f"{', '.join(card.get('days') or []) or 'days unknown'}"
+    )
+
