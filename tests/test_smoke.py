@@ -2470,7 +2470,7 @@ def test_the_country_code_follows_the_site():
     assert doctor.country_code("https://hiring.amazon.com") == "US"
 
 
-class FakeRequestContext:
+class FakeAuthRequestContext:
     def __init__(self, csrf_status=200, authorize_status=200, token="tok"):
         self.csrf_status, self.authorize_status, self.token = csrf_status, authorize_status, token
         self.posted = []
@@ -2495,16 +2495,16 @@ class FakeRequestContext:
 
 
 def test_the_authorize_probe_reports_both_outcomes():
-    ok = FakeRequestContext(authorize_status=200)
+    ok = FakeAuthRequestContext(authorize_status=200)
     assert doctor.probe_authorize(ok, "https://hiring.amazon.ca") == (200, "authenticated")
 
-    out = FakeRequestContext(authorize_status=401)
+    out = FakeAuthRequestContext(authorize_status=401)
     status, meaning = doctor.probe_authorize(out, "https://hiring.amazon.ca")
     assert status == 401 and meaning == "not authenticated"
 
 
 def test_the_probe_sends_the_csrf_token():
-    ctx = FakeRequestContext(token="abc123")
+    ctx = FakeAuthRequestContext(token="abc123")
     doctor.probe_authorize(ctx, "https://hiring.amazon.ca")
     _, headers = ctx.posted[0]
     assert headers.get("anti-csrftoken-a2z") == "abc123"
