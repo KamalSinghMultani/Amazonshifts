@@ -145,11 +145,16 @@ def message_is_new_enough(message: Any, since_epoch: float) -> bool:
         return False
 
 
-def fetch_code(since_epoch: float, *, timeout_s: float = 120, poll_s: float = 10) -> str | None:
+def fetch_code(since_epoch: float, *, timeout_s: float = 100, poll_s: float = 5) -> str | None:
     """Wait for Amazon's verification code to arrive, and return it.
 
     Returns None rather than raising: a failed re-login must leave the watcher
     detecting and alerting exactly as it was.
+
+    The timings are set by Amazon, not chosen: the code expires after THREE
+    MINUTES and resend is blocked for 55 seconds, so this polls every 5s and
+    gives up at 100s — early enough to leave the code usable, late enough to
+    outlast normal mail delay.
     """
     creds = configured()
     if creds is None:

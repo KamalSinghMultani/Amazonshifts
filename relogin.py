@@ -47,15 +47,22 @@ CONSENT_BUTTON = "[data-test-id='consentBtn']"
 # It is only ever clicked when a mailbox is configured to read the reply —
 # otherwise this would just mail a code to an inbox nobody is watching.
 SEND_CODE_BUTTON = "[data-test-id='button-submit']"
+# CONFIRMED live 2026-08-18 by walking to the code screen: the field sits
+# inside [data-test-id='input-test-id-confirmOtp'] as a plain input with
+# maxlength=6 and no test-id of its own, and the button is verifyAccount.
+#
+# Also learned there: the code EXPIRES IN 3 MINUTES and resend is blocked for
+# 55 seconds — so reading it from email has to be prompt, and a retry costs
+# most of a minute.
 CODE_INPUT = (
-    "[data-test-id='input-test-id-pin'], "
-    "[data-test-id*='code'] input, "
+    "[data-test-id='input-test-id-confirmOtp'] input, "
+    "[data-test-id='input-test-id-confirmOtp'], "
+    "input[maxlength='6'], "
     "[data-test-id*='otp'] input, "
     "input[inputmode='numeric'], "
-    "input[type='tel'], "
-    "input[type='password'], "
-    "#otp, #code, #pin"
+    "input[type='tel']"
 )
+VERIFY_BUTTON = "[data-test-id='button-test-id-verifyAccount']"
 
 # The login form has a REQUIRED country selector, and skipping it fails in a
 # way that looks like something else entirely: Continue simply never becomes
@@ -297,7 +304,10 @@ def _solve_email_code(page: Any, *, timeout_ms: int = 20000) -> tuple[str, str] 
         return UNKNOWN, "the code arrived but no field appeared to type it into"
 
     try:
-        page.locator(SUBMIT_BUTTON).first.click(timeout=timeout_ms)
+        verify = page.locator(VERIFY_BUTTON).first
+        if not verify.count():
+            verify = page.locator(SUBMIT_BUTTON).first
+        verify.click(timeout=timeout_ms)
         page.wait_for_timeout(6000)
     except Exception as exc:  # noqa: BLE001
         return UNKNOWN, f"could not submit the verification code: {str(exc)[:120]}"
