@@ -786,6 +786,25 @@ class Watcher:
 
     # ── holding ─────────────────────────────────────────────────────────────
     def _hold(self, shift, poll_started: float | None = None) -> None:
+        if self.session_ok is False:
+            # Measured on the Etobicoke miss: with a dead session the flyout
+            # never renders an Apply button, so the attempt burns 11.5 seconds
+            # timing out and then reports a failure. Those seconds are the only
+            # ones that matter. Say so immediately instead, with the link, so a
+            # human can still take it.
+            log.error("session is dead — not attempting a hold that cannot work")
+            link = shift.url or self.cfg['site']['job_search_url']
+            self.notify_async(
+                self.notifier.send_text,
+                "🚨 <b>SHIFT FOUND — but the session is dead</b>\n"
+                f"{self.notifier.describe(shift)}\n\n"
+                "<b>You have to grab this one by hand, now.</b>\n"
+                f'<a href="{link}">Open the listing</a>\n'
+                "<i>Then run</i> <code>python save_session.py</code> "
+                "<i>so the next one is automatic.</i>",
+            )
+            return
+
         missing = site_selectors.unconfigured_hold()
         if missing:
             # Bail before navigating: opening the listing and then failing on

@@ -1205,6 +1205,11 @@ class RecordingNotifier:
         self.texts.append(message)
         return True
 
+    def describe(self, shift):
+        # Same shape as the real one, so a message built from it can be
+        # asserted on without pulling in HTML escaping.
+        return shift.summary()
+
     def notify_held(self, shift, stopped_before_submit=True):
         return True
 
@@ -2762,3 +2767,36 @@ class CaptchaPage:
 def test_a_captcha_widget_is_caught_even_if_the_wording_changes():
     assert relogin.captcha_on_screen(CaptchaPage(True)) is True
     assert relogin.captcha_on_screen(CaptchaPage(False)) is False
+
+
+def test_a_dead_session_alerts_instead_of_attempting_a_doomed_hold(tmp_path):
+    """From the Etobicoke miss: with a dead session the schedule flyout never
+    renders an Apply button, so the attempt spent 11.5 seconds timing out
+    before reporting failure. Those are the only seconds that matter."""
+    shipped = _shipped()
+    w = _batch_watcher(
+        tmp_path,
+        [Shift(id="1", title="Amazon Delivery Station Warehouse Associate",
+               location="Etobicoke, ON", pay_rate=23.10,
+               url="https://hiring.amazon.ca/app#/jobDetail?jobId=JOB-CA-1")],
+        dry_run=False,
+        filters=shipped["filters"],
+        priority=shipped["priority"],
+    )
+    w.session_ok = False
+    attempted = []
+    w.holding_attempts = attempted
+
+    original = site_selectors.hold_shift
+    site_selectors.hold_shift = lambda *a, **kw: attempted.append(1) or (False, "should not run")
+    try:
+        w.poll_once()
+    finally:
+        site_selectors.hold_shift = original
+    w.drain_notifications(timeout=5)
+
+    assert attempted == [], "no hold should be attempted with a dead session"
+    urgent = [t for t in w.notifier.texts if "session is dead" in t.lower()]
+    assert urgent, w.notifier.texts
+    assert "jobDetail" in urgent[0], "the alert must carry the link to grab by hand"
+    assert "save_session.py" in urgent[0]

@@ -116,6 +116,18 @@ class TelegramNotifier:
             log.warning("could not read screenshot %s: %s", path, exc)
             return False
 
+    def describe(self, shift) -> str:
+        """One-line HTML summary, shared by every message about a shift."""
+        esc = html.escape
+        bits = [f"<b>{esc(shift.title or '(untitled)')}</b>"]
+        if shift.location:
+            bits.append(f"📍 {esc(shift.location)}")
+        if shift.schedule:
+            bits.append(f"🕒 {esc(shift.schedule)}")
+        if shift.pay_rate is not None:
+            bits.append(f"💵 ${shift.pay_rate:.2f}/hr")
+        return chr(10).join(bits)
+
     def notify_shift(self, shift, dry_run: bool = True) -> bool:
         """The alert that matters. Sent as early as possible — before any page
         load or click — so the user hears about it at the same moment the bot
