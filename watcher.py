@@ -320,6 +320,24 @@ class Watcher:
             page = self.context.new_page()
             check = doctor.check_portal_login(page, self.cfg["site"]["base_url"])
             signed_in = check.state == doctor.OK
+
+            if signed_in and self.session_keepalive:
+                # Loading /application/ proves the session; reloading the job
+                # page renews it. The SPA re-mints its access token on load,
+                # and in api mode that page otherwise sits untouched for hours
+                # while we poll around it through context.request. An idle
+                # session is the kind that expires.
+                try:
+                    if self.page is not None:
+                        self.page.reload(wait_until="domcontentloaded")
+                        self.page.wait_for_timeout(
+                            self.cfg["polling"].get("render_wait_ms", 5000)
+                        )
+                        if self.token_source is not None:
+                            self.token_source.refresh()
+                        log.debug("keepalive: renewed the page token")
+                except Exception as exc:  # noqa: BLE001 - never fatal
+                    log.debug("keepalive reload failed: %s", exc)
         except Exception as exc:  # noqa: BLE001 - a check must never kill the loop
             log.warning("session check failed: %s", exc)
             return None

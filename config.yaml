@@ -369,7 +369,12 @@ hold:
 # keepalive, since it is an idle session that expires, and it is the same page
 # the hold flow needs anyway.
 session:
-  check_every_seconds: 600   # 10 minutes
+  # 5 minutes. This is the closest thing we have to the "stay logged in"
+  # trick: a session that is used does not go idle, and idle is what expires.
+  # Each pass loads /application/ (proving the session) and reloads the job
+  # page (renewing the SPA's access token, which otherwise sits untouched for
+  # hours while api mode polls around it).
+  check_every_seconds: 300
   keepalive: true
   # One alert per expiry, not one per check — an hourly nag is one you learn
   # to ignore. You also get a message when the session comes back.
