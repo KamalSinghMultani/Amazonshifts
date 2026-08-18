@@ -52,6 +52,14 @@ SEARCH_SENDERS = ("amazon.com", "amazon.ca", "hiring.amazon.com")
 # asked for, so there is no reason to trawl further back.
 MAX_MESSAGES = 10
 
+# Forwarded mail frequently lands in Spam rather than the inbox — Gmail is
+# suspicious of a message that arrives via a redirect. Reading INBOX alone
+# would leave a perfectly working forward looking like a broken one, so the
+# folders are searched in order and the first hit wins.
+# All Mail is deliberately NOT here: it is a superset of both, enormous, and
+# searching it made Gmail drop the connection mid-session.
+MAILBOX_FOLDERS = ("INBOX", "[Gmail]/Spam")
+
 # The code itself: six digits, standing alone. Bounded so it cannot pick up
 # part of a longer number such as a job id or a phone number.
 CODE_PATTERN = re.compile(r"(?<!\d)(\d{6})(?!\d)")
@@ -145,6 +153,40 @@ def message_is_new_enough(message: Any, since_epoch: float) -> bool:
         return False
 
 
+def _search_amazon(client, since: str) -> list[bytes]:
+    """Message numbers for recent Amazon mail in the selected folder.
+
+    The sender filter is applied SERVER-SIDE, deliberately: a client-side
+    filter would still download every recent message before discarding it.
+    This way non-Amazon mail is never fetched at all, and the only bodies that
+    reach this process are Amazon's own.
+    """
+    numbers: list[bytes] = []
+    for sender in SEARCH_SENDERS:
+        try:
+            status, data = client.search(None, f'(SINCE {since} FROM "{sender}")')
+        except Exception as exc:  # noqa: BLE001
+            log.debug("search for %s failed: %s", sender, exc)
+            continue
+        if status == "OK":
+            numbers.extend((data[0] or b"").split())
+    return list(dict.fromkeys(reversed(numbers)))[:MAX_MESSAGES]
+
+
+def _code_from(client, num: bytes, since_epoch: float) -> str | None:
+    # BODY.PEEK rather than RFC822: belt and braces against marking mail read,
+    # even though every select here is readonly.
+    status, raw = client.fetch(num, "(BODY.PEEK[])")
+    if status != "OK" or not raw or not raw[0]:
+        return None
+    message = email.message_from_bytes(raw[0][1])
+    if not is_from_amazon(_decoded(message.get("From"))):
+        return None
+    if not message_is_new_enough(message, since_epoch):
+        return None
+    return extract_code(_decoded(message.get("Subject")) + chr(10) + body_text(message))
+
+
 def fetch_code(since_epoch: float, *, timeout_s: float = 100, poll_s: float = 5) -> str | None:
     """Wait for Amazon's verification code to arrive, and return it.
 
@@ -166,41 +208,22 @@ def fetch_code(since_epoch: float, *, timeout_s: float = 100, poll_s: float = 5)
         try:
             with imaplib.IMAP4_SSL(host) as client:
                 client.login(user, password)
-                # readonly=True: the server will not set \Seen, so nothing in
-                # the mailbox changes just because this looked.
-                client.select("INBOX", readonly=True)
-
                 since = time.strftime("%d-%b-%Y", time.localtime(since_epoch - 86400))
-                # The sender filter is applied SERVER-SIDE, deliberately. A
-                # client-side filter would still download every recent message
-                # before discarding it; this way non-Amazon mail is never
-                # fetched at all, and the only bodies that ever reach this
-                # process are Amazon's own.
-                numbers: list[bytes] = []
-                for sender in SEARCH_SENDERS:
-                    status, data = client.search(None, f'(SINCE {since} FROM "{sender}")')
-                    if status == "OK":
-                        numbers.extend((data[0] or b"").split())
 
-                # Newest first, and a hard cap: a code that is not in the last
-                # few Amazon messages is not the one we just asked for.
-                for num in list(dict.fromkeys(reversed(numbers)))[:MAX_MESSAGES]:
-                    # BODY.PEEK rather than RFC822: belt and braces against
-                    # marking mail read, even though the select is readonly.
-                    status, raw = client.fetch(num, "(BODY.PEEK[])")
-                    if status != "OK" or not raw or not raw[0]:
+                for folder in MAILBOX_FOLDERS:
+                    try:
+                        status, _ = client.select(folder, readonly=True)
+                    except Exception as exc:  # noqa: BLE001 - folder may not exist
+                        log.debug("could not open %s: %s", folder, exc)
                         continue
-                    message = email.message_from_bytes(raw[0][1])
-                    if not is_from_amazon(_decoded(message.get("From"))):
-                        continue  # the server filter is broad; verify anyway
-                    if not message_is_new_enough(message, since_epoch):
+                    if status != "OK":
                         continue
-                    code = extract_code(
-                        _decoded(message.get("Subject")) + "\n" + body_text(message)
-                    )
-                    if code:
-                        log.info("verification code received by email")
-                        return code
+
+                    for num in _search_amazon(client, since):
+                        code = _code_from(client, num, since_epoch)
+                        if code:
+                            log.info("verification code found in %s", folder)
+                            return code
         except Exception as exc:  # noqa: BLE001 - mail is best effort
             log.warning("could not read the verification code: %s", exc)
 
@@ -208,6 +231,7 @@ def fetch_code(since_epoch: float, *, timeout_s: float = 100, poll_s: float = 5)
 
     log.warning("no verification code arrived within %.0fs", timeout_s)
     return None
+
 
 def check(lookback_days: int = 3) -> tuple[bool, list[str]]:
     """Verify the mailbox setup without triggering a real login.
@@ -230,21 +254,26 @@ def check(lookback_days: int = 3) -> tuple[bool, list[str]]:
         with imaplib.IMAP4_SSL(host) as client:
             client.login(user, password)
             lines.append("login  : ok")
-            client.select("INBOX", readonly=True)
 
             since = time.strftime(
                 "%d-%b-%Y", time.localtime(time.time() - lookback_days * 86400)
             )
-            numbers: list[bytes] = []
-            for sender in SEARCH_SENDERS:
-                status, data = client.search(None, f'(SINCE {since} FROM "{sender}")')
-                if status == "OK":
-                    numbers.extend((data[0] or b"").split())
+            # Same folders fetch_code searches, and reported separately:
+            # forwarded mail landing in Spam is a working forward that looks
+            # broken, and the difference matters when diagnosing one.
+            found: list[tuple[str, bytes]] = []
+            for folder in MAILBOX_FOLDERS:
+                try:
+                    status, _ = client.select(folder, readonly=True)
+                except Exception:  # noqa: BLE001 - folder may not exist
+                    continue
+                if status != "OK":
+                    continue
+                in_folder = _search_amazon(client, since)
+                lines.append(f"{folder:<16}: {len(in_folder)} amazon message(s)")
+                found.extend((folder, num) for num in in_folder)
 
-            unique = list(dict.fromkeys(reversed(numbers)))
-            lines.append(
-                f"amazon mail in the last {lookback_days} day(s): {len(unique)}"
-            )
+            unique = found
             if not unique:
                 lines += [
                     "",
@@ -254,7 +283,9 @@ def check(lookback_days: int = 3) -> tuple[bool, list[str]]:
                 ]
                 return True, lines
 
-            for num in unique[:MAX_MESSAGES]:
+            for folder, num in unique[:MAX_MESSAGES]:
+                if client.select(folder, readonly=True)[0] != "OK":
+                    continue
                 status, raw = client.fetch(num, "(BODY.PEEK[])")
                 if status != "OK" or not raw or not raw[0]:
                     continue
@@ -269,6 +300,12 @@ def check(lookback_days: int = 3) -> tuple[bool, list[str]]:
                 )
             return True, lines
     except imaplib.IMAP4.error as exc:
+        # Only an IMAP-level refusal points at the credentials. A socket error
+        # mid-session does not, and saying "use an app password" there sends
+        # you to fix something that is not broken.
+        signed_in = any(line.startswith("login  : ok") for line in lines)
+        if signed_in:
+            return False, lines + [f"error  : {exc} (after a successful login)"]
         return False, lines + [
             f"login  : FAILED ({exc})",
             "",
