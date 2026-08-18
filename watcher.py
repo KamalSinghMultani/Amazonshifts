@@ -269,6 +269,29 @@ class Watcher:
             self.stop_event.wait(delay)
 
     # ── session watch ───────────────────────────────────────────────────────
+    def session_age(self) -> float | None:
+        """Seconds since the last login, or None if it cannot be told.
+
+        Taken from the mtime of the saved session, which save_session.py writes
+        when you finish logging in. Approximate by nature, and still the only
+        way to answer the question that decides whether this thing can run
+        overnight: how long does a session actually last?
+        """
+        try:
+            path = Path(self.cfg["browser"]["storage_state"])
+            if path.exists():
+                return time.time() - path.stat().st_mtime
+        except OSError as exc:  # noqa: BLE001 - diagnostics only
+            log.debug("could not read session age: %s", exc)
+        return None
+
+    @staticmethod
+    def format_age(seconds: float | None) -> str:
+        if seconds is None:
+            return "unknown age"
+        hours, remainder = divmod(int(seconds), 3600)
+        return f"{hours}h{remainder // 60:02d}m old"
+
     def session_check_due(self, now: float | None = None) -> bool:
         if self.session_check_every <= 0 or self.dry_run:
             # In dry run nothing will be held anyway, so an expired session
@@ -313,16 +336,23 @@ class Watcher:
                         "\u2705 <b>Session restored</b> — holding works again.",
                     )
             else:
-                log.debug("session check: still signed in")
+                # At INFO, not DEBUG: this line accumulating in the log is the
+                # measurement of how long a session survives.
+                log.info("session check: signed in (%s)", self.format_age(self.session_age()))
             return True
 
-        log.error("hiring portal session has EXPIRED — detection works, holding will not")
+        age = self.format_age(self.session_age())
+        log.error(
+            "hiring portal session has EXPIRED after %s — detection works, "
+            "holding will not", age,
+        )
         # Once per expiry, not once per check: an hourly nag you learn to
         # ignore is worse than no alert at all.
         if was is not False and self.alert_on_expiry:
             self.notify_async(
                 self.notifier.send_text,
                 "\u26a0\ufe0f <b>Amazon session expired</b>\n"
+                f"It lasted <b>{age}</b>.\n"
                 "Shifts will still be detected and alerted, but the watcher "
                 "<b>cannot hold one</b> until you log in again:\n"
                 "<code>python save_session.py</code>",

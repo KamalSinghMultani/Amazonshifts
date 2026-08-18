@@ -2209,3 +2209,24 @@ def test_a_silly_session_check_interval_is_rejected():
     )
     with pytest.raises(ValueError, match="check_every_seconds"):
         config_mod.validate_config(cfg)
+
+
+def test_session_age_is_reported_so_expiry_can_be_measured(tmp_path):
+    """Every "it expired after about two hours" so far has been an estimate
+    from log timestamps. The next one should be a measurement."""
+    import watcher as watcher_mod
+
+    assert watcher_mod.Watcher.format_age(None) == "unknown age"
+    assert watcher_mod.Watcher.format_age(7 * 3600 + 5 * 60) == "7h05m old"
+    assert watcher_mod.Watcher.format_age(90) == "0h01m old"
+
+
+def test_the_expiry_alert_says_how_long_it_lasted(tmp_path):
+    w = _session_watcher(tmp_path, signed_in=False)
+    session_file = tmp_path / "session.json"
+    session_file.write_text("{}", encoding="utf-8")
+    w.cfg["browser"]["storage_state"] = str(session_file)
+
+    w.check_session_if_due()
+    w.drain_notifications(timeout=5)
+    assert any("lasted" in t for t in w.notifier.texts), w.notifier.texts
