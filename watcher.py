@@ -348,6 +348,21 @@ class Watcher:
                 except Exception:  # noqa: BLE001
                     pass
 
+        # Recorded, never acted on — see doctor.probe_authorize. Logged every
+        # pass so the overnight run answers two things by itself: when the
+        # session actually died, and whether this probe agrees with the page
+        # check that has already been caught lying once.
+        try:
+            status, meaning = doctor.probe_authorize(
+                self.context.request, self.cfg["site"]["base_url"]
+            )
+            log.info(
+                "session probe: page=%s authorize=%s (%s)",
+                "in" if signed_in else "OUT", status, meaning,
+            )
+        except Exception as exc:  # noqa: BLE001 - a probe is never fatal
+            log.debug("authorize probe failed: %s", exc)
+
         was = self.session_ok
         self.session_ok = signed_in
 

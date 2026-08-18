@@ -2462,3 +2462,59 @@ def test_an_emailed_verification_code_stops_the_attempt(monkeypatch):
     assert relogin._needs_a_human("where should we send your verification code?")
     assert relogin._needs_a_human("check your email for the code")
     assert not relogin._needs_a_human("welcome back")
+
+
+# ── a session check that does not lie (candidate) ───────────────────────────
+def test_the_country_code_follows_the_site():
+    assert doctor.country_code("https://hiring.amazon.ca") == "CA"
+    assert doctor.country_code("https://hiring.amazon.com") == "US"
+
+
+class FakeRequestContext:
+    def __init__(self, csrf_status=200, authorize_status=200, token="tok"):
+        self.csrf_status, self.authorize_status, self.token = csrf_status, authorize_status, token
+        self.posted = []
+
+    def get(self, url, **_kw):
+        page = self
+
+        class R:
+            status = page.csrf_status
+
+            def json(self_inner):
+                return {"token": page.token}
+        return R()
+
+    def post(self, url, **kw):
+        self.posted.append((url, kw.get("headers", {})))
+        page = self
+
+        class R:
+            status = page.authorize_status
+        return R()
+
+
+def test_the_authorize_probe_reports_both_outcomes():
+    ok = FakeRequestContext(authorize_status=200)
+    assert doctor.probe_authorize(ok, "https://hiring.amazon.ca") == (200, "authenticated")
+
+    out = FakeRequestContext(authorize_status=401)
+    status, meaning = doctor.probe_authorize(out, "https://hiring.amazon.ca")
+    assert status == 401 and meaning == "not authenticated"
+
+
+def test_the_probe_sends_the_csrf_token():
+    ctx = FakeRequestContext(token="abc123")
+    doctor.probe_authorize(ctx, "https://hiring.amazon.ca")
+    _, headers = ctx.posted[0]
+    assert headers.get("anti-csrftoken-a2z") == "abc123"
+
+
+def test_a_broken_probe_is_never_fatal():
+    class Broken:
+        def get(self, *a, **kw):
+            raise RuntimeError("network is down")
+
+    status, meaning = doctor.probe_authorize(Broken(), "https://hiring.amazon.ca")
+    assert status is None
+    assert "probe failed" in meaning

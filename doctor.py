@@ -107,6 +107,47 @@ def check_portal_login(page: Any, base_url: str, settle_ms: int = 7000) -> Check
     )
 
 
+
+def country_code(base_url: str) -> str:
+    return "CA" if ".ca" in (base_url or "") else "US"
+
+
+def probe_authorize(request_context: Any, base_url: str) -> tuple[int | None, str]:
+    """Ask the auth API whether this session is really authenticated.
+
+    Why bother, when there is already a login check: /application/ turned out
+    to load in a context with NO COOKIES AT ALL, so that check can pass for a
+    browser that has never signed in. This one returned a clean 401 when
+    signed out, which makes it a candidate for a check that does not lie.
+
+    It is NOT trusted yet — the signed-in side has never been observed, and a
+    false "signed out" would fire an automated re-login against a healthy
+    session and burn attempts on OTP for nothing. So for now it is recorded,
+    not acted on. Every session check logs it, and the first run against a
+    live session settles it.
+    """
+    base = base_url.rstrip("/")
+    code = country_code(base_url)
+    try:
+        csrf = request_context.get(f"{base}/authorize/api/csrf?countryCode={code}", timeout=15000)
+        token = ""
+        try:
+            token = (csrf.json() or {}).get("token") or ""
+        except Exception:  # noqa: BLE001
+            pass
+
+        headers = {"content-type": "application/json"}
+        if token:
+            headers["anti-csrftoken-a2z"] = token
+        response = request_context.post(
+            f"{base}/authorize/api/authorize?countryCode={code}",
+            data="{}", headers=headers, timeout=15000,
+        )
+        return response.status, ("authenticated" if response.status == 200
+                                 else "not authenticated")
+    except Exception as exc:  # noqa: BLE001 - a probe must never be fatal
+        return None, f"probe failed: {str(exc)[:80]}"
+
 def check_job_search(page: Any, job_search_url: str, settle_ms: int = 6000) -> Check:
     try:
         page.goto(job_search_url, wait_until="domcontentloaded")
