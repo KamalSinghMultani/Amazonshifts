@@ -2256,9 +2256,21 @@ def test_credentials_come_from_the_environment_not_config(monkeypatch):
     assert "AMAZON_LOGIN_PASSWORD" not in shipped or "password:" not in shipped.lower()
 
 
-def test_the_default_config_keeps_auto_relogin_off():
-    cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
-    assert cfg["session"]["auto_relogin"] is False
+def test_the_testing_config_never_logs_itself_in():
+    """The CA config may enable auto-relogin deliberately. The US test
+    environment must not: a test run signing itself into the shared account is
+    exactly the interference the two-environment split exists to prevent."""
+    _, us = _both_configs()
+    assert us["session"]["auto_relogin"] is False
+
+
+def test_auto_relogin_is_inert_without_credentials(monkeypatch):
+    """Turning the flag on is safe on its own — the credentials are a separate,
+    deliberate step, and without them nothing is ever typed anywhere."""
+    monkeypatch.delenv("AMAZON_LOGIN_EMAIL", raising=False)
+    monkeypatch.delenv("AMAZON_LOGIN_PIN", raising=False)
+    monkeypatch.delenv("AMAZON_LOGIN_PASSWORD", raising=False)
+    assert relogin.credentials() is None
 
 
 class LoginFake:

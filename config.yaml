@@ -387,7 +387,9 @@ session:
   # Attempts ONCE per expiry, and stops if Amazon asks for a verification
   # code — repeated failed logins are how accounts get locked. A persistent
   # profile usually avoids the challenge, since the machine is already trusted.
-  auto_relogin: false
+  # ON as of 2026-08-17. Inert until AMAZON_LOGIN_EMAIL and
+  # AMAZON_LOGIN_PIN are set in .env — it warns rather than pretending.
+  auto_relogin: true
 
 state:
   path: "state/seen_shifts.json"

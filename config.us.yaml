@@ -123,3 +123,10 @@ hold:
   enabled: true
   stop_before_submit: true
   max_per_poll: 1
+
+# Never, in the testing environment. `extends` would otherwise inherit this
+# from config.yaml, and a test run signing itself into the shared Amazon
+# account is exactly the interference the two-environment split exists to
+# prevent. Real re-logins belong to the Canadian watcher alone.
+session:
+  auto_relogin: false
