@@ -2719,3 +2719,46 @@ def test_the_code_is_read_out_of_amazons_real_wording():
 
 def test_a_job_id_is_not_mistaken_for_a_code():
     assert otp_mail.extract_code("Job-CA-0000123456 was posted") is None
+
+
+# ── the CAPTCHA that actually stops the re-login ────────────────────────────
+def test_amazons_real_captcha_wording_is_recognised():
+    """CONFIRMED live 2026-08-18: clicking "Send verification code" produced
+    "Let's confirm you are human / Choose all the clocks". The marker list said
+    "verify you are human", which missed it — so four attempts sat behind a
+    CAPTCHA that stopped the mail being sent, and blamed the mailbox."""
+    assert relogin._is_captcha("let's confirm you are human")
+    assert relogin._is_captcha("choose all the clocks")
+    assert relogin._is_captcha("select each image with a bus")
+
+
+def test_a_code_challenge_is_still_not_a_captcha():
+    """The two must never be confused: one can be finished from the mailbox,
+    the other never can."""
+    assert relogin._is_captcha("enter the verification code we sent") is None
+    assert relogin._needs_a_human("enter the verification code we sent")
+
+
+class CaptchaPage:
+    """A page whose CAPTCHA is structural rather than worded."""
+
+    def __init__(self, has_widget):
+        self.has_widget = has_widget
+
+    def locator(self, selector):
+        page = self
+
+        class L:
+            @property
+            def first(self_inner):
+                return self_inner
+
+            def count(self_inner):
+                return 1 if page.has_widget and "captcha" in selector.lower() else 0
+
+        return L()
+
+
+def test_a_captcha_widget_is_caught_even_if_the_wording_changes():
+    assert relogin.captcha_on_screen(CaptchaPage(True)) is True
+    assert relogin.captcha_on_screen(CaptchaPage(False)) is False

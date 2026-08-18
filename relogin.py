@@ -131,8 +131,37 @@ HUMAN_ONLY_MARKERS = (
     "solve this",
     "select all images",
     "are you a robot",
+    # CONFIRMED live 2026-08-18, and the wording matters: the screen says
+    # "Let's confirm you are human / Choose all the clocks". The list used to
+    # say "verify you are human", which missed it — so four attempts clicked
+    # Send, sat behind a CAPTCHA that stopped the mail ever being sent, and
+    # reported "the code never arrived" as though the mailbox were at fault.
+    "confirm you are human",
     "verify you are human",
+    "choose all the",
+    "select each image",
 )
+
+# The AWS WAF challenge renders in its own container regardless of wording,
+# which survives Amazon rephrasing the text.
+CAPTCHA_SELECTORS = (
+    "[id*='captcha' i]",
+    "[class*='captcha' i]",
+    "iframe[src*='captcha' i]",
+    "iframe[title*='challenge' i]",
+    "[data-test-id*='captcha' i]",
+)
+
+
+def captcha_on_screen(page: Any) -> bool:
+    """Structural check, for when the wording changes but the block does not."""
+    for selector in CAPTCHA_SELECTORS:
+        try:
+            if page.locator(selector).first.count():
+                return True
+        except Exception:  # noqa: BLE001 - a bad selector must not be fatal
+            continue
+    return False
 
 OTP_MARKERS = EMAIL_CODE_MARKERS + HUMAN_ONLY_MARKERS
 WRONG_CREDENTIAL_MARKERS = (
@@ -324,10 +353,39 @@ def _solve_email_code(page: Any, *, timeout_ms: int = 20000) -> tuple[str, str] 
     requested_at = time.time()
     try:
         send = page.locator(SEND_CODE_BUTTON).first
-        if send.count():
-            send.click(timeout=timeout_ms)
-            page.wait_for_timeout(2000)
-            log.info("asked Amazon to email a verification code")
+        if not send.count():
+            # Never wait for mail nobody asked for. Four attempts reported "the
+            # code never arrived" when the truth was that it was never
+            # requested — the button was not found and the click was skipped,
+            # which is a completely different problem to diagnose.
+            snippet = " | ".join(_page_text(page).split(chr(10)))[:220]
+            return UNKNOWN, (
+                f"could not find the button that sends the code "
+                f"({SEND_CODE_BUTTON}). The screen says: {snippet}"
+            )
+        send.click(timeout=timeout_ms)
+        page.wait_for_timeout(2500)
+        log.info("asked Amazon to email a verification code")
+
+        # Confirm Amazon acted on it. The code-entry screen says "A
+        # verification code has been sent to …"; without that, waiting is
+        # pointless and the real problem is on this screen.
+        after = _page_text(page)
+        blocker = _is_captcha(after)
+        if blocker or captcha_on_screen(page):
+            # This is where it actually stops. Nothing here solves image
+            # challenges, and pretending otherwise would burn attempts.
+            return CAPTCHA, (
+                f"a CAPTCHA appeared when asking for the code "
+                f"({blocker or 'challenge widget on screen'}). No code was "
+                "sent, so no mailbox setting would have helped."
+            )
+        if "has been sent" not in after and "enter the verification code" not in after:
+            snippet = " | ".join(after.split(chr(10)))[:220]
+            return UNKNOWN, (
+                "the send button was clicked but Amazon never confirmed sending "
+                f"a code. The screen says: {snippet}"
+            )
     except Exception as exc:  # noqa: BLE001
         return UNKNOWN, f"could not request the verification code: {str(exc)[:120]}"
 
