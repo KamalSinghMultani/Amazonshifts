@@ -88,7 +88,21 @@ DEFAULTS: dict[str, Any] = {
     },
     # max_per_poll: you only need to win one shift; holding a whole batch
     # would race itself and multiply the clicks.
-    "hold": {"enabled": True, "stop_before_submit": True, "max_per_poll": 1},
+    # direct_apply: OFF, and the comment is the point. Deep-linking into
+    # /application/?jobId=…&scheduleId=… looked like the big win — five page
+    # loads collapsing into one — and it does not work. Tested 2026-08-18:
+    # plain navigation, after warming /application/, with a Referer, via
+    # window.open from the authenticated page, the post-redirect URL form, and
+    # the consent stage directly. Every one bounces to the login page while
+    # the same session loads /application/ fine. The app needs state that only
+    # the click flow establishes. Left in place, and off, so nobody spends
+    # another evening rediscovering this.
+    "hold": {
+        "enabled": True,
+        "stop_before_submit": True,
+        "max_per_poll": 1,
+        "direct_apply": False,
+    },
     # The hiring portal session expires on its own — measured at roughly two
     # hours. Detection keeps working when it does, which is precisely the
     # danger: the watcher looks healthy and cannot hold a thing.

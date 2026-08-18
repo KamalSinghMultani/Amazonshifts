@@ -119,6 +119,13 @@ class ApiClient:
         self.timeout_ms = timeout_ms
         self.token_provider = token_provider
         self.on_unauthorized = on_unauthorized
+        # Taken from the search payload rather than configured twice: the
+        # schedule query has to ask for the same country and locale, and two
+        # sources of that truth would eventually disagree.
+        search = ((api_cfg.get("payload") or {}).get("variables") or {}).get(
+            "searchJobRequest") or {}
+        self.country = search.get("country") or "Canada"
+        self.locale = search.get("locale") or "en-CA"
 
     def _headers(self) -> dict:
         headers = {"accept": "application/json", **self.extra_headers}
@@ -129,6 +136,52 @@ class ApiClient:
             else:
                 log.warning("no auth token available for this poll")
         return headers
+
+    def _post_json(self, payload: dict) -> dict:
+        """POST a GraphQL document, refreshing the token once on a 401."""
+        def send() -> Any:
+            response = self.request.post(
+                self.endpoint_url,
+                data=payload,
+                headers={"content-type": "application/json", **self._headers()},
+                timeout=self.timeout_ms,
+            )
+            if not response.ok:
+                body = ""
+                try:
+                    body = response.text()[:300]
+                except Exception:  # noqa: BLE001
+                    pass
+                if response.status in (401, 403):
+                    raise Unauthorized(f"API returned {response.status}: {body}")
+                raise RuntimeError(f"API returned {response.status}: {body}")
+            return response.json()
+
+        try:
+            return send()
+        except Unauthorized:
+            if not self.on_unauthorized:
+                raise
+            log.info("token rejected (401) — refreshing it and retrying once")
+            self.on_unauthorized()
+            return send()
+
+    def fetch_schedules(self, job_id: str) -> list:
+        """The bookable shifts behind one job card.
+
+        Separate from fetch_shifts because Amazon models them separately: a
+        card is a posting, a schedule is a shift you can actually take, and
+        only the schedule carries the id the application URL needs.
+        """
+        import schedules as schedules_mod
+
+        payload = schedules_mod.build_request(
+            job_id,
+            country=self.country or "Canada",
+            locale=self.locale or "en-CA",
+        )
+        response = self._post_json(payload)
+        return schedules_mod.parse(response)
 
     def fetch_shifts(self) -> list[Shift]:
         """One poll. Raises on transport/HTTP failure so the watcher's circuit

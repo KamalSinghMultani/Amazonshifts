@@ -30,7 +30,10 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
+
+import otp_mail
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +41,21 @@ log = logging.getLogger(__name__)
 EMAIL_INPUT = "#login, [data-test-id='input-test-id-login']"
 CONTINUE_BUTTON = "[data-test-id='button-continue']"
 CONSENT_BUTTON = "[data-test-id='consentBtn']"
+
+# CONFIRMED live: the challenge screen reads "Where should we send your
+# verification code?" and offers a single [data-test-id='button-submit'].
+# It is only ever clicked when a mailbox is configured to read the reply —
+# otherwise this would just mail a code to an inbox nobody is watching.
+SEND_CODE_BUTTON = "[data-test-id='button-submit']"
+CODE_INPUT = (
+    "[data-test-id='input-test-id-pin'], "
+    "[data-test-id*='code'] input, "
+    "[data-test-id*='otp'] input, "
+    "input[inputmode='numeric'], "
+    "input[type='tel'], "
+    "input[type='password'], "
+    "#otp, #code, #pin"
+)
 
 # The login form has a REQUIRED country selector, and skipping it fails in a
 # way that looks like something else entirely: Continue simply never becomes
@@ -80,17 +98,35 @@ SUBMIT_BUTTON = (
     "button[type='submit']"
 )
 
-# Text that means a human is required. Checked before anything is typed.
-OTP_MARKERS = (
+# Two kinds of challenge, and they must not be confused.
+#
+# An emailed code CAN be finished automatically, if a mailbox is configured.
+EMAIL_CODE_MARKERS = (
     "verification code",
     "one-time password",
     "one time password",
     "we sent a code",
     "enter the code",
     "check your email",
+)
+
+# A CAPTCHA cannot, ever. Solving image challenges is not something this
+# project does — it is the line between automating your own login and
+# impersonating a human to a system that asked whether you were one.
+#
+# Keeping these separate matters practically too: routing a CAPTCHA into the
+# email path would click a "send code" button that is not there, then sit for
+# two minutes waiting on mail that was never sent.
+HUMAN_ONLY_MARKERS = (
     "puzzle",
     "captcha",
+    "solve this",
+    "select all images",
+    "are you a robot",
+    "verify you are human",
 )
+
+OTP_MARKERS = EMAIL_CODE_MARKERS + HUMAN_ONLY_MARKERS
 WRONG_CREDENTIAL_MARKERS = (
     "incorrect",
     "does not match",
@@ -101,6 +137,7 @@ WRONG_CREDENTIAL_MARKERS = (
 
 OK = "ok"
 OTP_REQUIRED = "otp_required"
+CAPTCHA = "captcha"
 BAD_CREDENTIALS = "bad_credentials"
 UNKNOWN = "unknown"
 
@@ -137,7 +174,24 @@ def _page_text(page: Any) -> str:
 
 
 def _needs_a_human(text: str) -> str | None:
+    """Any challenge at all, of either kind."""
     for marker in OTP_MARKERS:
+        if marker in text:
+            return marker
+    return None
+
+
+def _is_captcha(text: str) -> str | None:
+    """A challenge nothing here will answer.
+
+    Solving image puzzles is not something this project does: it is the line
+    between automating your own login and impersonating a human to a system
+    that just asked whether you were one. Keeping it separate matters
+    practically too — routing a CAPTCHA into the emailed-code path would click
+    a send button that is not there, then wait two minutes for mail nobody
+    sent, and burn the single attempt allowed per expiry.
+    """
+    for marker in HUMAN_ONLY_MARKERS:
         if marker in text:
             return marker
     return None
@@ -181,7 +235,8 @@ def _select_country(page: Any, country: str, *, timeout_ms: int = 20000) -> bool
         log.warning("could not select the country %r: %s", country, exc)
         return False
 
-def _enter_pin(page: Any, pin: str, *, timeout_ms: int = 20000) -> bool:
+def _enter_pin(page: Any, pin: str, *, timeout_ms: int = 20000,
+               selector: str | None = None) -> bool:
     """Type the PIN, whether it is one field or six little boxes.
 
     Split-digit inputs are common for PIN entry and a plain fill() on the
@@ -203,13 +258,64 @@ def _enter_pin(page: Any, pin: str, *, timeout_ms: int = 20000) -> bool:
             log.debug("split PIN entry failed: %s", exc)
 
     try:
-        field = page.locator(PIN_INPUT).first
+        field = page.locator(selector or PIN_INPUT).first
         field.wait_for(state="visible", timeout=timeout_ms)
         field.fill(pin)
         return True
     except Exception as exc:  # noqa: BLE001
         log.debug("single PIN field not found: %s", exc)
         return False
+
+def _solve_email_code(page: Any, *, timeout_ms: int = 20000) -> tuple[str, str] | None:
+    """Ask for the emailed code, read it out of the mailbox, and type it in.
+
+    Returns None when no mailbox is configured, leaving the caller to report
+    the challenge exactly as it did before. Never called for a CAPTCHA.
+    """
+    if otp_mail.configured() is None:
+        return None
+
+    requested_at = time.time()
+    try:
+        send = page.locator(SEND_CODE_BUTTON).first
+        if send.count():
+            send.click(timeout=timeout_ms)
+            page.wait_for_timeout(2000)
+            log.info("asked Amazon to email a verification code")
+    except Exception as exc:  # noqa: BLE001
+        return UNKNOWN, f"could not request the verification code: {str(exc)[:120]}"
+
+    # Only a code that arrives AFTER this moment counts — see otp_mail.
+    code = otp_mail.fetch_code(requested_at)
+    if not code:
+        return OTP_REQUIRED, (
+            "the code was requested but never arrived within the wait — check "
+            "OTP_IMAP_USER / OTP_IMAP_PASSWORD, or enter it yourself"
+        )
+
+    if not _enter_code(page, code, timeout_ms=timeout_ms):
+        return UNKNOWN, "the code arrived but no field appeared to type it into"
+
+    try:
+        page.locator(SUBMIT_BUTTON).first.click(timeout=timeout_ms)
+        page.wait_for_timeout(6000)
+    except Exception as exc:  # noqa: BLE001
+        return UNKNOWN, f"could not submit the verification code: {str(exc)[:120]}"
+
+    text = _page_text(page)
+    if _is_captcha(text):
+        return CAPTCHA, "a CAPTCHA appeared after the verification code"
+    if _needs_a_human(text):
+        return OTP_REQUIRED, "Amazon asked for another challenge after the code"
+    if any(marker in text for marker in WRONG_CREDENTIAL_MARKERS):
+        return BAD_CREDENTIALS, "the verification code was rejected"
+    return OK, "signed in after an emailed verification code"
+
+
+def _enter_code(page: Any, code: str, *, timeout_ms: int = 20000) -> bool:
+    """Same shapes as a PIN — one field, or one box per digit."""
+    return _enter_pin(page, code, timeout_ms=timeout_ms, selector=CODE_INPUT)
+
 
 def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, str]:
     """Try to sign in once. Returns (status, detail).
@@ -240,7 +346,11 @@ def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, 
         page.wait_for_timeout(4000)
 
         # Before typing anything: is this already a challenge?
-        blocker = _needs_a_human(_page_text(page))
+        text = _page_text(page)
+        stopper = _is_captcha(text)
+        if stopper:
+            return CAPTCHA, f"the login page is showing a {stopper!r} — only you can clear it"
+        blocker = _needs_a_human(text)
         if blocker:
             return OTP_REQUIRED, f"the login page is asking for {blocker!r}"
 
@@ -259,10 +369,14 @@ def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, 
         page.wait_for_timeout(5000)
 
         text = _page_text(page)
+        stopper = _is_captcha(text)
+        if stopper:
+            return CAPTCHA, f"a {stopper!r} appeared after the email — only you can clear it"
         blocker = _needs_a_human(text)
         if blocker:
-            # The common case on an untrusted device, and the reason this
-            # feature can never be relied on completely.
+            solved = _solve_email_code(page, timeout_ms=timeout_ms)
+            if solved is not None:
+                return solved
             return OTP_REQUIRED, f"Amazon asked for {blocker!r} — a human is needed"
 
         if not _enter_pin(page, pin, timeout_ms=timeout_ms):
@@ -274,9 +388,15 @@ def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, 
         page.wait_for_timeout(6000)
 
         text = _page_text(page)
+        stopper = _is_captcha(text)
+        if stopper:
+            return CAPTCHA, f"a {stopper!r} appeared after the PIN — only you can clear it"
         blocker = _needs_a_human(text)
         if blocker:
-            return OTP_REQUIRED, f"Amazon asked for {blocker!r} after the password"
+            solved = _solve_email_code(page, timeout_ms=timeout_ms)
+            if solved is not None:
+                return solved
+            return OTP_REQUIRED, f"Amazon asked for {blocker!r} after the PIN"
         if any(marker in text for marker in WRONG_CREDENTIAL_MARKERS):
             # Do not try again. Two wrong passwords in a row is how a lock
             # starts, and a locked account costs every future shift.

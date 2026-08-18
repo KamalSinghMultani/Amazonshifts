@@ -93,7 +93,18 @@ def check_portal_login(page: Any, base_url: str, settle_ms: int = 7000) -> Check
             fix="python save_session.py   (then open a job and press "
                 "'Select schedule' before pressing Enter)",
         )
-    return Check("hiring portal login", OK, "signed in")
+    # ⚠️ KNOWN LIMIT, measured 2026-08-18: this check can be optimistic.
+    # /application/ loaded fine while an actual apply attempt eight minutes
+    # later was bounced to the login page. The application shell is served on
+    # a weaker session than starting an application needs, so a pass here
+    # means "not obviously signed out" rather than "can hold a shift".
+    #
+    # The honest fix is a check that exercises real authentication, which no
+    # harmless request has been found for yet. Until then this says so.
+    return Check(
+        "hiring portal login", OK,
+        "signed in (shell loads — not proof a hold will be accepted)",
+    )
 
 
 def check_job_search(page: Any, job_search_url: str, settle_ms: int = 6000) -> Check:

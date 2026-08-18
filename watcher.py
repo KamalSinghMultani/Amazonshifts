@@ -33,6 +33,7 @@ from auth_token import TokenSource
 import doctor
 import drop_report
 import relogin
+import schedules as schedules_mod
 from config import (
     in_hot_window,
     load_config,
@@ -683,6 +684,21 @@ class Watcher:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         shot = SCREENSHOT_DIR / f"hold-{stamp}.png"
 
+        # The fast route: if we can learn the scheduleId, the application can
+        # be opened directly instead of clicked toward through five pages.
+        direct = self._application_url(shift)
+        if direct:
+            log.info("holding via the direct application URL")
+            result = site_selectors.hold_at_application(
+                page,
+                direct,
+                stop_before_submit=self.cfg["hold"]["stop_before_submit"],
+                timeout_ms=self.cfg["browser"]["action_timeout_ms"],
+                screenshot_path=str(shot),
+            )
+            self._report_hold(shift, result, shot, poll_started)
+            return
+
         result = site_selectors.hold_shift(
             page,
             shift,
@@ -691,6 +707,44 @@ class Watcher:
             screenshot_path=str(shot),
         )
 
+        self._report_hold(shift, result, shot, poll_started)
+
+    def _application_url(self, shift) -> str | None:
+        """The direct application URL for the best schedule on this job.
+
+        Returns None whenever anything is missing, so the click path stays as
+        the fallback rather than this becoming a new way to fail.
+        """
+        if not self.cfg["hold"].get("direct_apply", True):
+            return None
+        if self.api_client is None or not shift.id:
+            return None
+
+        try:
+            found = self.api_client.fetch_schedules(shift.id)
+        except Exception as exc:  # noqa: BLE001 - fall back to clicking
+            log.warning("could not fetch schedules for %s: %s", shift.id, exc)
+            return None
+
+        open_slots = schedules_mod.bookable(found)
+        if not open_slots:
+            log.info(
+                "%d schedule(s) for %s, none bookable — using the click path",
+                len(found), shift.id,
+            )
+            return None
+
+        # Most places left first: the likeliest to still be there in a race.
+        open_slots.sort(key=lambda s: -(s.available or 1))
+        best = open_slots[0]
+        log.info(
+            "%d bookable schedule(s); taking %s", len(open_slots), best.summary(),
+        )
+        return schedules_mod.application_url(
+            self.cfg["site"]["base_url"], best.job_id or shift.id, best.id,
+        )
+
+    def _report_hold(self, shift, result, shot, poll_started=None) -> None:
         if result.timings:
             log.info("hold timings: %s", result.timing_summary())
         if poll_started is not None:

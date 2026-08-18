@@ -658,6 +658,87 @@ class HoldResult:
         return "<HoldResult {}: {}>".format(self.status, self.message[:60])
 
 
+def hold_at_application(
+    page: Any,
+    application_url: str,
+    *,
+    stop_before_submit: bool = True,
+    timeout_ms: int = 20000,
+    screenshot_path: str | None = None,
+) -> HoldResult:
+    """Hold a slot by going straight to its application page.
+
+    The click path — card, detail page, schedule flyout, Apply, follow the new
+    tab — exists because that is how a human gets there. With a scheduleId in
+    hand none of it is necessary: Apply merely navigates to this URL, so we can
+    navigate to it ourselves.
+
+    Five page loads become one, and the two most fragile selectors in the
+    project (the flyout, and following the popup) stop being on the critical
+    path at all.
+    """
+    began = time.perf_counter()
+    timings: list[tuple[str, float]] = []
+
+    def mark(label: str) -> None:
+        timings.append((label, (time.perf_counter() - began) * 1000))
+
+    try:
+        page.goto(application_url, wait_until="domcontentloaded")
+        mark("application opened")
+    except Exception as exc:  # noqa: BLE001
+        return HoldResult(FAILED, f"could not open the application: {str(exc)[:150]}",
+                          url=application_url, timings=timings)
+
+    if is_login_page(page):
+        return HoldResult(
+            FAILED,
+            f"the application needs a login (opened {page.url[:70]}). "
+            "Detection works signed out, holding does not — "
+            "run `python save_session.py`.",
+            url=page.url, timings=timings,
+        )
+
+    settled = _settle_after_popup(page, timeout_ms=max(timeout_ms, 20000))
+
+    # Re-check AFTER settling. The redirect to login happens in JavaScript a
+    # moment after the navigation resolves, so the check before it can see the
+    # application URL and believe everything is fine. Without this the run
+    # ends with "could not find the Create Application button", which sends
+    # you hunting for a selector change when the truth is you are signed out.
+    if is_login_page(page):
+        return HoldResult(
+            FAILED,
+            f"the application redirected to the login page ({page.url[:70]}). "
+            "The session is not signed in — run `python save_session.py`.",
+            url=page.url, timings=timings,
+        )
+
+    if not settled:
+        # Not fatal on its own; the button wait below is the real test.
+        log.warning("the application page did not settle cleanly")
+    mark("application ready")
+
+    dismiss_overlays(page, timeout_ms=min(timeout_ms, 3000))
+
+    # The pre-consent page's only action. Harmless — it commits nothing.
+    try:
+        page.locator(PRE_CONSENT_NEXT).first.wait_for(state="visible", timeout=timeout_ms)
+        page.locator(PRE_CONSENT_NEXT).first.click(timeout=timeout_ms)
+        mark("consent screen opened")
+    except Exception as exc:  # noqa: BLE001 - some flows land past pre-consent
+        log.info("no pre-consent step to click (%s)", str(exc)[:80])
+
+    return _finish_application(
+        page,
+        stop_before_submit=stop_before_submit,
+        timeout_ms=timeout_ms,
+        screenshot_path=screenshot_path,
+        timings=timings,
+        mark=mark,
+    )
+
+
 def hold_shift(
     page: Any,
     shift: Shift,
@@ -777,6 +858,31 @@ def hold_shift(
     # tab opens blank and the app mounts a second or two later, so
     # screenshotting immediately produced a plain white image — a Telegram
     # alert carrying a blank photo reads as a failure even when the hold worked.
+    return _finish_application(
+        page,
+        stop_before_submit=stop_before_submit,
+        timeout_ms=timeout_ms,
+        screenshot_path=screenshot_path,
+        timings=timings,
+        mark=mark,
+    )
+
+
+def _finish_application(
+    page: Any,
+    *,
+    stop_before_submit: bool,
+    timeout_ms: int,
+    screenshot_path: str | None,
+    timings: list,
+    mark,
+) -> HoldResult:
+    """The last stretch, shared by both routes into the application.
+
+    Whether we clicked our way here or navigated straight to the URL, the
+    decisions from the consent screen onwards are identical — and so are the
+    ways it can go wrong.
+    """
     ready_error = None
     try:
         # Readiness, not a fixed sleep: this returns the instant the button
