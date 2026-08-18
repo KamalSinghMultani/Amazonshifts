@@ -32,6 +32,7 @@ from api_client import ApiClient
 from auth_token import TokenSource
 import doctor
 import drop_report
+import relogin
 from config import (
     in_hot_window,
     load_config,
@@ -96,6 +97,10 @@ class Watcher:
         self.alert_on_expiry = bool(session_cfg.get("alert_on_expiry", True))
         self.next_session_check = 0.0
         self.session_ok: bool | None = None
+        self.auto_relogin = bool(session_cfg.get("auto_relogin", False))
+        # One attempt per expiry. Repeated failed logins are how accounts get
+        # locked, and a locked account costs every shift, not one.
+        self.relogin_tried = False
 
         self.context = None
         self.page = None
@@ -328,6 +333,7 @@ class Watcher:
         self.session_ok = signed_in
 
         if signed_in:
+            self.relogin_tried = False  # armed again for the next expiry
             if was is False:
                 log.info("hiring portal session is back")
                 if self.alert_on_expiry:
@@ -346,6 +352,11 @@ class Watcher:
             "hiring portal session has EXPIRED after %s — detection works, "
             "holding will not", age,
         )
+        if self.auto_relogin and not self.relogin_tried:
+            self.relogin_tried = True
+            if self.try_relogin():
+                return True
+
         # Once per expiry, not once per check: an hourly nag you learn to
         # ignore is worse than no alert at all.
         if was is not False and self.alert_on_expiry:
@@ -358,6 +369,63 @@ class Watcher:
                 "<code>python save_session.py</code>",
             )
         return False
+
+    def try_relogin(self) -> bool:
+        """One automated sign-in attempt. Returns True only if verified.
+
+        Verified means checked afterwards, not inferred from the attempt
+        returning without error — the whole point of this project is not
+        believing a click worked because it did not throw.
+        """
+        if relogin.credentials() is None:
+            log.warning(
+                "session.auto_relogin is on but AMAZON_LOGIN_EMAIL / "
+                "AMAZON_LOGIN_PASSWORD are not in .env"
+            )
+            return False
+
+        log.info("attempting an automated re-login")
+        page = None
+        try:
+            page = self.context.new_page()
+            status, detail = relogin.attempt(page, self.cfg["site"]["base_url"])
+            log.info("re-login attempt: %s (%s)", status, detail)
+
+            if status != relogin.OK:
+                self.notify_async(
+                    self.notifier.notify_error,
+                    f"Automated re-login could not finish: {detail}\n"
+                    "Run <code>python save_session.py</code> when you can.",
+                )
+                return False
+
+            check = doctor.check_portal_login(page, self.cfg["site"]["base_url"])
+            if check.state != doctor.OK:
+                log.warning("re-login claimed success but the portal disagrees")
+                return False
+        except Exception as exc:  # noqa: BLE001 - never take the loop down
+            log.warning("re-login attempt raised: %s", exc)
+            return False
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # Persist it, so a restart does not have to do this all over again.
+        try:
+            self.context.storage_state(path=self.cfg["browser"]["storage_state"])
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not save the refreshed session: %s", exc)
+
+        self.session_ok = True
+        log.info("automated re-login succeeded — holding works again")
+        self.notify_async(
+            self.notifier.send_text,
+            "\U0001f501 <b>Session refreshed automatically</b> — holding works again.",
+        )
+        return True
 
     # ── hot mode ────────────────────────────────────────────────────────────
     def is_hot(self, now: datetime | None = None) -> bool:

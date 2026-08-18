@@ -21,6 +21,7 @@ import browser_launch
 import config as config_mod
 import doctor
 import drop_report
+import relogin
 import site_selectors
 from notifier import TelegramNotifier
 from shift_matcher import Shift, ShiftMatcher, ShiftRanker
@@ -2230,3 +2231,139 @@ def test_the_expiry_alert_says_how_long_it_lasted(tmp_path):
     w.check_session_if_due()
     w.drain_notifications(timeout=5)
     assert any("lasted" in t for t in w.notifier.texts), w.notifier.texts
+
+
+# ── automated re-login (opt-in) ─────────────────────────────────────────────
+def test_no_credentials_means_the_feature_is_inert(monkeypatch):
+    """Off by default and inert without credentials: the founding property of
+    this project is that no code path reads a password unless you opt in."""
+    monkeypatch.delenv("AMAZON_LOGIN_EMAIL", raising=False)
+    monkeypatch.delenv("AMAZON_LOGIN_PASSWORD", raising=False)
+    assert relogin.credentials() is None
+
+    status, detail = relogin.attempt(object(), "https://hiring.amazon.ca")
+    assert status == relogin.UNKNOWN
+    assert "no credentials" in detail
+
+
+def test_credentials_come_from_the_environment_not_config(monkeypatch):
+    """config.yaml is committed; .env is gitignored."""
+    monkeypatch.setenv("AMAZON_LOGIN_EMAIL", "someone@example.com")
+    monkeypatch.setenv("AMAZON_LOGIN_PASSWORD", "hunter2")
+    assert relogin.credentials() == ("someone@example.com", "hunter2")
+
+    shipped = (Path(__file__).resolve().parent.parent / "config.yaml").read_text("utf-8")
+    assert "AMAZON_LOGIN_PASSWORD" not in shipped or "password:" not in shipped.lower()
+
+
+def test_the_default_config_keeps_auto_relogin_off():
+    cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+    assert cfg["session"]["auto_relogin"] is False
+
+
+class LoginFake:
+    """A login page that can be told what to show at each step."""
+
+    def __init__(self, texts, has_password=True):
+        self.texts = list(texts)
+        self.has_password = has_password
+        self.typed = []
+        self.url = "https://auth.hiring.amazon.com/#/login"
+
+    def goto(self, url, **_kw):
+        self.url = url
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+    def inner_text(self, _sel):
+        return self.texts.pop(0) if self.texts else ""
+
+    def locator(self, selector):
+        page = self
+
+        class L:
+            def __init__(self, sel):
+                self.sel = sel
+
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                return 0 if ("password" in self.sel and not page.has_password) else 1
+
+            def is_visible(self):
+                return True
+
+            def wait_for(self, **_kw):
+                if "password" in self.sel and not page.has_password:
+                    raise RuntimeError("no password field")
+
+            def fill(self, value):
+                page.typed.append(value)
+
+            def click(self, **_kw):
+                pass
+
+        return L(selector)
+
+
+def test_an_otp_challenge_stops_instead_of_guessing(monkeypatch):
+    """It cannot answer an OTP, and pretending otherwise would burn login
+    attempts on an account that then gets locked."""
+    monkeypatch.setenv("AMAZON_LOGIN_EMAIL", "someone@example.com")
+    monkeypatch.setenv("AMAZON_LOGIN_PASSWORD", "hunter2")
+    page = LoginFake(["", "please enter the verification code we sent"])
+    status, detail = relogin.attempt(page, "https://hiring.amazon.ca")
+    assert status == relogin.OTP_REQUIRED
+    assert "verification code" in detail
+    assert "hunter2" not in page.typed, "the password must never be typed into a challenge"
+
+
+def test_rejected_credentials_are_reported_and_not_retried(monkeypatch):
+    monkeypatch.setenv("AMAZON_LOGIN_EMAIL", "someone@example.com")
+    monkeypatch.setenv("AMAZON_LOGIN_PASSWORD", "wrong")
+    page = LoginFake(["", "", "the password you entered is incorrect"])
+    status, detail = relogin.attempt(page, "https://hiring.amazon.ca")
+    assert status == relogin.BAD_CREDENTIALS
+    assert ".env" in detail
+
+
+def test_a_changed_login_flow_is_reported_rather_than_forced(monkeypatch):
+    monkeypatch.setenv("AMAZON_LOGIN_EMAIL", "someone@example.com")
+    monkeypatch.setenv("AMAZON_LOGIN_PASSWORD", "hunter2")
+    page = LoginFake(["", ""], has_password=False)
+    status, detail = relogin.attempt(page, "https://hiring.amazon.ca")
+    assert status == relogin.UNKNOWN
+    assert "password field" in detail
+
+
+def test_relogin_is_attempted_once_per_expiry_not_once_per_check(tmp_path):
+    """Repeated failed logins are how accounts get locked."""
+    w = _session_watcher(tmp_path, signed_in=False)
+    w.auto_relogin = True
+    attempts = []
+    w.try_relogin = lambda: attempts.append(1) or False
+
+    for _ in range(4):
+        w.next_session_check = 0.0
+        w.check_session_if_due()
+    assert len(attempts) == 1, "one attempt per expiry"
+
+
+def test_a_recovered_session_rearms_the_next_attempt(tmp_path):
+    w = _session_watcher(tmp_path, signed_in=True)
+    w.auto_relogin = True
+    w.relogin_tried = True
+    w.check_session_if_due()
+    assert w.relogin_tried is False
+
+
+def test_a_successful_relogin_suppresses_the_expiry_alert(tmp_path):
+    w = _session_watcher(tmp_path, signed_in=False)
+    w.auto_relogin = True
+    w.try_relogin = lambda: True
+    assert w.check_session_if_due() is True
+    w.drain_notifications(timeout=5)
+    assert not any("expired" in t.lower() for t in w.notifier.texts), w.notifier.texts

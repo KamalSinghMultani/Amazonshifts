@@ -96,6 +96,9 @@ DEFAULTS: dict[str, Any] = {
         "check_every_seconds": 600,
         "keepalive": True,
         "alert_on_expiry": True,
+        # Opt-in. Needs AMAZON_LOGIN_EMAIL / AMAZON_LOGIN_PASSWORD in .env.
+        # See relogin.py for why this is off by default.
+        "auto_relogin": False,
     },
     "state": {
         "path": "state/seen_shifts.json",
@@ -221,10 +224,15 @@ def validate_config(cfg: dict) -> None:
         raise ValueError(f"polling.mode must be 'dom' or 'api', got {mode!r}")
 
     polling = cfg["polling"]
-    if polling["interval_seconds"] < 5:
+    # Mode-aware, because a poll means two completely different things. In api
+    # mode it is one small JSON request — measured clean at 2s intervals. In
+    # dom mode it is a full page load with every asset, and 14s between those
+    # already earned a CloudFront 403.
+    floor = 2 if mode == "api" else 20
+    if polling["interval_seconds"] < floor:
         raise ValueError(
-            "polling.interval_seconds below 5 is abusive to the site and will "
-            "get you rate-limited or blocked"
+            f"polling.interval_seconds below {floor} in {mode} mode risks a "
+            "block, and a blocked watcher finds nothing at all"
         )
 
     if mode == "dom" and polling["interval_seconds"] < 30:
@@ -237,10 +245,13 @@ def validate_config(cfg: dict) -> None:
         )
 
     hot = polling["hot_interval_seconds"]
-    if hot < 3:
+    if hot < 2:
+        # 2s was measured clean against the live CA endpoint (20 consecutive
+        # polls, no 429, no 403). Below that is guesswork, and a block finds
+        # nothing at all.
         raise ValueError(
-            "polling.hot_interval_seconds below 3 will get you blocked long "
-            "before it wins you a shift"
+            "polling.hot_interval_seconds below 2 is past what has been "
+            "measured safe and risks a block, which finds nothing at all"
         )
     if hot > polling["interval_seconds"]:
         raise ValueError(
