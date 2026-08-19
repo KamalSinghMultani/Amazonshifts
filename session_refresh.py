@@ -28,6 +28,34 @@ def _write(path: Path, **payload) -> None:
     path.write_text(json.dumps(payload, indent=2), "utf-8")
 
 
+def _forced_login(page, base_url: str) -> tuple[str, str]:
+    """Run the auth state machine even if the existing page looks signed in.
+
+    login_flow.attempt() first asks whether the current page appears
+    authenticated. That is correct for expiry recovery, but a proactive
+    100-minute refresh must actually replace the session rather than declaring
+    the old one healthy and returning immediately.
+    """
+    if login_flow.credentials() is None:
+        return login_flow.UNKNOWN, "no credentials in .env"
+
+    manager = login_flow.create_auth_system(page, use_mock_solver=False)
+    try:
+        state = manager.auth_machine.run(base_url)
+    except Exception as exc:  # noqa: BLE001
+        return login_flow.UNKNOWN, f"forced login raised: {str(exc)[:200]}"
+
+    if state == login_flow.AuthState.AUTHENTICATED:
+        return login_flow.OK, "fresh session established"
+    if state == login_flow.AuthState.BAD_CREDENTIALS:
+        return login_flow.BAD_CREDENTIALS, "the email or PIN was rejected"
+    if state in (login_flow.AuthState.CAPTCHA_REQUIRED, login_flow.AuthState.CAPTCHA_FAILED):
+        return login_flow.CAPTCHA, "a CAPTCHA blocked the login"
+    if state == login_flow.AuthState.OTP_TIMEOUT:
+        return login_flow.OTP_REQUIRED, "the code was requested but never arrived"
+    return login_flow.UNKNOWN, f"authentication failed at state: {state.name}"
+
+
 def run(config_path: str, output_state: Path, result_path: Path, force_login: bool) -> int:
     load_dotenv()
     cfg = load_config(config_path)
@@ -50,19 +78,26 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
             context.set_default_navigation_timeout(browser_cfg["nav_timeout_ms"])
             page = context.pages[0] if context.pages else context.new_page()
 
-            # A cheap-ish check first. It is not perfect, so scheduled proactive
-            # refreshes can force a login even when the shell still loads.
-            check = doctor.check_portal_login(page, cfg["site"]["base_url"], settle_ms=1500)
-            healthy = check.state == doctor.OK
+            # A health-only pass avoids needless login attempts. Scheduled
+            # proactive refreshes intentionally bypass this shortcut.
+            if not force_login:
+                check = doctor.check_portal_login(
+                    page, cfg["site"]["base_url"], settle_ms=1500
+                )
+                if check.state == doctor.OK:
+                    output_state.parent.mkdir(parents=True, exist_ok=True)
+                    context.storage_state(path=str(output_state))
+                    _write(result_path, status="healthy", detail=check.detail)
+                    browser_launch.close_context(browser, context)
+                    return 0
 
-            if healthy and not force_login:
-                context.storage_state(path=str(output_state))
-                _write(result_path, status="healthy", detail=check.detail)
-                browser_launch.close_context(browser, context)
-                return 0
-
-            status, detail = login_flow.attempt(page, cfg["site"]["base_url"])
+            status, detail = (
+                _forced_login(page, cfg["site"]["base_url"])
+                if force_login
+                else login_flow.attempt(page, cfg["site"]["base_url"])
+            )
             if status == login_flow.OK:
+                output_state.parent.mkdir(parents=True, exist_ok=True)
                 context.storage_state(path=str(output_state))
                 _write(result_path, status="ok", detail=detail)
                 browser_launch.close_context(browser, context)
