@@ -511,3 +511,30 @@ def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, 
         return OK, "signed in"
     except Exception as exc:  # noqa: BLE001 - never take the watcher down
         return UNKNOWN, f"re-login attempt failed: {str(exc)[:200]}"
+
+def enter_code(page: Any, code: str, *, timeout_ms: int = 20000) -> bool:
+    """Type a 6-digit code into whatever shape the screen is using.
+
+    Public on purpose: any login implementation can call this instead of
+    re-deriving the selectors. Handles both layouts seen on this site — one
+    input inside [data-test-id='input-test-id-confirmOtp'], and six
+    single-character boxes — and falls back through inputmode/tel/maxlength
+    variants, because the field carries no test-id of its own.
+
+    Returns True if the code went in. Never raises.
+    """
+    return _enter_code(page, code, timeout_ms=timeout_ms)
+
+
+def submit_code(page: Any, *, timeout_ms: int = 20000) -> bool:
+    """Press Verify. CONFIRMED selector, with a submit-button fallback."""
+    try:
+        verify = page.locator(VERIFY_BUTTON).first
+        if not verify.count():
+            verify = page.locator(SUBMIT_BUTTON).first
+        verify.click(timeout=timeout_ms)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not press Verify: %s", exc)
+        return False
+

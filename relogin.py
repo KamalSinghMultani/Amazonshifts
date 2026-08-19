@@ -85,7 +85,11 @@ EMAIL_INPUT = "[data-test-id='input-test-id-login']"
 CONTINUE_BUTTON = "[data-test-id='button-continue']"
 CONSENT_BUTTON = "[data-test-id='consentBtn']"
 SEND_CODE_BUTTON = "[data-test-id='button-submit']"
-CODE_INPUT = "[data-test-id='input-test-id-confirmOtp']"
+# The test-id belongs to the WRAPPER; the field is a bare <input> inside it,
+# with maxlength=6 and no test-id of its own (confirmed on the live code
+# screen). Filling the wrapper raises "Element is not an <input>", which is
+# what stopped the login after the code had already been read from the inbox.
+CODE_INPUT = "[data-test-id='input-test-id-confirmOtp'] input"
 VERIFY_BUTTON = "[data-test-id='button-test-id-verifyAccount']"
 COUNTRY_TOGGLE = "#country-toggle-button"
 
@@ -595,17 +599,27 @@ class AuthenticationStateMachine:
         self._log_transition("OTP_RECEIVED")
         
         try:
-            # Enter code
-            code_input = self.page.locator(CODE_INPUT).first
-            if code_input.count() and code_input.is_visible():
-                code_input.fill(code)
-                
-                # Submit
-                verify_btn = self.page.locator(VERIFY_BUTTON).first
-                if verify_btn.count() and verify_btn.is_visible():
-                    verify_btn.click()
+            # Enter code. login_flow.enter_code knows both layouts this site
+            # uses — one input inside the wrapper, and six single-character
+            # boxes — and falls through maxlength/inputmode/tel variants. The
+            # field carries no test-id of its own, so a single hard-coded
+            # selector is the thing most likely to rot here.
+            import login_flow
+
+            entered = login_flow.enter_code(self.page, code)
+            if not entered:
+                code_input = self.page.locator(CODE_INPUT).first
+                if code_input.count() and code_input.is_visible():
+                    code_input.fill(code)
+                    entered = True
+
+            if entered:
+                if login_flow.submit_code(self.page):
                     self._log_transition("OTP_SUBMITTED")
                     return self._wait_for_state([AuthState.AUTHENTICATED])
+                log.error("code entered but Verify could not be pressed")
+            else:
+                log.error("code %s could not be typed into any field on screen", "*" * len(code))
         except Exception as exc:
             log.error(f"OTP submission failed: {exc}")
         
