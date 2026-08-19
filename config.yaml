@@ -51,10 +51,10 @@ polling:
   #
   # ⚠️ IF YOU SWITCH BACK TO dom MODE, raise this to 45 first — a dom poll is
   # a full page load, and 14s between those already earned a 403.
-  interval_seconds: 3
+  interval_seconds: 2
   # Random 0..jitter_seconds added to each interval so the traffic pattern
   # is not a metronome.
-  jitter_seconds: 2
+  jitter_seconds: 0
 
   # ── Hot mode ────────────────────────────────────────────────────────────
   # Amazon posts shifts in BATCHES: the moment one appears, the next is
@@ -367,6 +367,7 @@ notifications:
   max_alerts_per_poll: 8
 
 hold:
+  direct_apply: true
   # Click through to hold the slot once a match is found.
   # Ignored entirely when dry_run is true.
   enabled: true

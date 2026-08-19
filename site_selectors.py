@@ -710,6 +710,19 @@ def hold_at_application(
     project (the flyout, and following the popup) stop being on the critical
     path at all.
     """
+    # TEMP DIAGNOSTIC: log every POST request during this hold.
+    # Remove after capturing the Create Application mutation.
+    def _log_hold_request(request):
+        if request.method == "POST":
+            log.info(
+                "HOLD POST: url=%s\nheaders=%s\nbody=%s",
+                request.url,
+                dict(request.headers),
+                request.post_data,
+            )
+
+    page.on("request", _log_hold_request)
+
     began = time.perf_counter()
     timings: list[tuple[str, float]] = []
 
