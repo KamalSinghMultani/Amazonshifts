@@ -22,7 +22,7 @@ import config as config_mod
 import doctor
 import drop_report
 import otp_mail
-import relogin
+import login_flow as relogin
 import schedules as schedules_mod
 import site_selectors
 from notifier import TelegramNotifier
@@ -2628,12 +2628,17 @@ def test_a_captcha_disables_the_cycle_rather_than_retrying(tmp_path, monkeypatch
             return FakeCheckPage("https://auth.hiring.amazon.com/#/login")
 
     w.context = Ctx()
-    monkey = lambda page, base_url, **kw: (relogin.CAPTCHA, "a 'captcha' is on screen")
-    original, relogin.attempt = relogin.attempt, monkey
+    import watcher as watcher_mod
+
+    flow = watcher_mod.login_flow          # whichever module is wired in
+    monkey = lambda page, base_url, **kw: (flow.CAPTCHA, "a 'captcha' is on screen")
+    original_attempt, flow.attempt = flow.attempt, monkey
+    original_creds, flow.credentials = flow.credentials, lambda: ("a@b.com", "123456")
     try:
         assert w.try_relogin() is False
     finally:
-        relogin.attempt = original
+        flow.attempt = original_attempt
+        flow.credentials = original_creds
 
     assert w.relogin_blocked is True
     assert w.relogin_if_due() is None, "the cycle must stop after a CAPTCHA"
@@ -3117,3 +3122,32 @@ def test_every_configured_site_resolves_to_a_country():
         base = config_mod.load_config(root / name)["site"]["base_url"]
         assert any(host in base for host in relogin.COUNTRY_BY_HOST), base
         assert relogin.country_for(base) == expected, name
+
+
+def test_startup_does_not_count_as_an_overdue_relogin(tmp_path):
+    """Seen live: next_relogin started at 0.0, which reads as "due now", so a
+    scheduled login fired 17ms after an expiry-triggered one had just failed —
+    two attempts in the same second, two solver calls, two codes emailed."""
+    w = _batch_watcher(tmp_path, [], dry_run=False, session={
+        "auto_relogin": True, "relogin_every_seconds": 6000,
+    })
+    assert w.relogin_due() is False, "nothing is overdue at startup"
+
+
+def test_any_attempt_postpones_the_scheduled_one(tmp_path):
+    """The expiry path and the timer must not fire back to back."""
+    w = _batch_watcher(tmp_path, [], dry_run=False, session={
+        "auto_relogin": True, "relogin_every_seconds": 6000,
+    })
+    w.next_relogin = 0.0                      # pretend the timer is due
+    assert w.relogin_due() is True
+
+    import watcher as watcher_mod
+
+    flow = watcher_mod.login_flow
+    original, flow.credentials = flow.credentials, lambda: ("a@b.com", "123456")
+    try:
+        w.try_relogin()                       # triggered from anywhere
+    finally:
+        flow.credentials = original
+    assert w.relogin_due() is False, "an attempt must restart the clock"

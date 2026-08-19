@@ -33,7 +33,7 @@ from auth_token import TokenSource
 import doctor
 import drop_report
 import otp_mail
-import relogin
+import relogin as login_flow 
 import schedules as schedules_mod
 from config import (
     in_hot_window,
@@ -110,7 +110,13 @@ class Watcher:
         # can hold a 6am shift and one that discovers at 6am that it cannot.
         self.relogin_every = float(session_cfg.get("relogin_every_seconds") or 0)
         self.max_relogins_per_day = int(session_cfg.get("max_relogins_per_day") or 0)
-        self.next_relogin = 0.0
+        # NOT 0.0: that reads as "overdue" and fired a scheduled login 17ms
+        # after an expiry-triggered one had just failed — two full attempts in
+        # the same second, two solver calls, two codes emailed. The cycle
+        # starts one interval from now.
+        self.next_relogin = time.monotonic() + (
+            float(session_cfg.get("relogin_every_seconds") or 0) or 0.0
+        )
         self.relogins_today = 0
         self.relogin_day = datetime.now().date()
         self.relogin_blocked = False   # set by a CAPTCHA or the daily cap
@@ -494,21 +500,25 @@ class Watcher:
         returning without error — the whole point of this project is not
         believing a click worked because it did not throw.
         """
-        if relogin.credentials() is None:
+        if login_flow.credentials() is None:
             log.warning(
                 "session.auto_relogin is on but AMAZON_LOGIN_EMAIL / "
                 "AMAZON_LOGIN_PASSWORD are not in .env"
             )
             return False
 
+        # Whatever triggered this, the clock restarts. Otherwise the
+        # expiry-triggered path and the timer can fire back to back.
+        if self.relogin_every:
+            self.next_relogin = time.monotonic() + self.relogin_every
         log.info("attempting an automated re-login")
         page = None
         try:
             page = self.context.new_page()
-            status, detail = relogin.attempt(page, self.cfg["site"]["base_url"])
+            status, detail = login_flow.attempt(page, self.cfg["site"]["base_url"])
             log.info("re-login attempt: %s (%s)", status, detail)
 
-            if status == relogin.CAPTCHA:
+            if status == login_flow.CAPTCHA:
                 # Stop the cycle entirely. Retrying a CAPTCHA on a timer turns
                 # a recoverable state into a flagged account, and nothing here
                 # is going to solve one.
@@ -522,7 +532,7 @@ class Watcher:
                 )
                 return False
 
-            if status != relogin.OK:
+            if status != login_flow.OK:
                 self.notify_async(
                     self.notifier.notify_error,
                     f"Automated re-login could not finish: {detail}\n"

@@ -1,167 +1,26 @@
-"""Automated re-login, for when the session dies while nobody is watching.
-
-The hiring-portal session lasts about two hours — measured, and consistent
-with the competing service re-authenticating on a timer rather than trying to
-keep one alive. Detection carries on working when it expires, which is the
-trap: the watcher looks healthy and cannot hold a thing.
-
-Needs AMAZON_LOGIN_EMAIL and AMAZON_LOGIN_PIN in .env, and
-session.auto_relogin: true. Without either, nothing here runs.
-
-Operational notes worth keeping in mind:
-
-* One attempt per expiry, never a loop. Repeated failed logins are how
-  accounts get locked, and a locked account costs every future shift.
-* The login flow is email -> country -> 6-digit PIN, then sometimes a
-  challenge. An emailed code can be finished automatically when a mailbox is
-  configured (see otp_mail); an image challenge returns CAPTCHA and stops.
-* Success is verified by re-checking the portal afterwards, never inferred
-  from a click that did not raise.
+"""
+Amazon Hiring re-login automation - Refactored with explicit state machine.
 """
 
 from __future__ import annotations
 
 import logging
+from enum import Enum, auto
+from typing import Any, Optional, Tuple, Dict
 import os
 import re
 import time
-from typing import Any
 
 import otp_mail
 
 log = logging.getLogger(__name__)
 
-# CONFIRMED live 2026-08-17 against auth.hiring.amazon.com/#/login.
-EMAIL_INPUT = "#login, [data-test-id='input-test-id-login']"
-CONTINUE_BUTTON = "[data-test-id='button-continue']"
-CONSENT_BUTTON = "[data-test-id='consentBtn']"
 
-# CONFIRMED live: the challenge screen reads "Where should we send your
-# verification code?" and offers a single [data-test-id='button-submit'].
-# It is only ever clicked when a mailbox is configured to read the reply —
-# otherwise this would just mail a code to an inbox nobody is watching.
-SEND_CODE_BUTTON = "[data-test-id='button-submit']"
-# CONFIRMED live 2026-08-18 by walking to the code screen: the field sits
-# inside [data-test-id='input-test-id-confirmOtp'] as a plain input with
-# maxlength=6 and no test-id of its own, and the button is verifyAccount.
-#
-# Also learned there: the code EXPIRES IN 3 MINUTES and resend is blocked for
-# 55 seconds — so reading it from email has to be prompt, and a retry costs
-# most of a minute.
-CODE_INPUT = (
-    "[data-test-id='input-test-id-confirmOtp'] input, "
-    "[data-test-id='input-test-id-confirmOtp'], "
-    "input[maxlength='6'], "
-    "[data-test-id*='otp'] input, "
-    "input[inputmode='numeric'], "
-    "input[type='tel']"
-)
-VERIFY_BUTTON = "[data-test-id='button-test-id-verifyAccount']"
+# ============================================================================
+# COMPATIBILITY EXPORTS - required by watcher.py
+# ============================================================================
 
-# The login form has a REQUIRED country selector, and skipping it fails in a
-# way that looks like something else entirely: Continue simply never becomes
-# clickable, and the first attempt died on a 20s click timeout rather than on
-# anything to do with credentials. The error only appears after you try:
-# "Please select the country where you registered your account."
-COUNTRY_TOGGLE = "#country-toggle-button"
-COUNTRY_OPTION = "li[role='option']"
-
-# Which country to pick, from the site being watched.
-COUNTRY_BY_HOST = {
-    "hiring.amazon.ca": "Canada",
-    "hiring.amazon.com": "United States",
-}
-
-# Step 2 is a 6-DIGIT PIN, not a password. Learned from the competing
-# service's own onboarding bot, which asks its customers for exactly that:
-#
-#   "Step 2 of 2 - Type Your PIN / Type your 6-digit PIN of Hiring Account"
-#
-# That also confirms how those services never appear to log out: they hold the
-# customer's email and PIN and can re-authenticate whenever they like.
-#
-# The screen itself could not be captured — reaching it needs a real email
-# submitted to a real account — so the field is matched widest-net first, and
-# the attempt reports honestly when nothing matches.
-PIN_INPUT = (
-    "[data-test-id='input-test-id-pin'], "
-    "[data-test-id*='pin'] input, "
-    "input[type='password'], "
-    "input[inputmode='numeric'], "
-    "#pin, #password"
-)
-# Some PIN screens are six single-character boxes rather than one field.
-PIN_BOXES = "input[maxlength='1']"
-SUBMIT_BUTTON = (
-    "[data-test-id='button-signIn'], "
-    "[data-test-id='button-login'], "
-    "[data-test-id='button-continue'], "
-    "button[type='submit']"
-)
-
-# Two kinds of challenge, and they must not be confused.
-#
-# An emailed code CAN be finished automatically, if a mailbox is configured.
-EMAIL_CODE_MARKERS = (
-    "verification code",
-    "one-time password",
-    "one time password",
-    "we sent a code",
-    "enter the code",
-    "check your email",
-)
-
-# A CAPTCHA is not answerable from a mailbox, so it must never be routed into
-# the email path: that would click a "send code" button which is not there,
-# then sit for two minutes waiting on mail nobody sent, and burn the one
-# attempt allowed per expiry.
-HUMAN_ONLY_MARKERS = (
-    "puzzle",
-    "captcha",
-    "solve this",
-    "select all images",
-    "are you a robot",
-    # CONFIRMED live 2026-08-18, and the wording matters: the screen says
-    # "Let's confirm you are human / Choose all the clocks". The list used to
-    # say "verify you are human", which missed it — so four attempts clicked
-    # Send, sat behind a CAPTCHA that stopped the mail ever being sent, and
-    # reported "the code never arrived" as though the mailbox were at fault.
-    "confirm you are human",
-    "verify you are human",
-    "choose all the",
-    "select each image",
-)
-
-# The AWS WAF challenge renders in its own container regardless of wording,
-# which survives Amazon rephrasing the text.
-CAPTCHA_SELECTORS = (
-    "[id*='captcha' i]",
-    "[class*='captcha' i]",
-    "iframe[src*='captcha' i]",
-    "iframe[title*='challenge' i]",
-    "[data-test-id*='captcha' i]",
-)
-
-
-def captcha_on_screen(page: Any) -> bool:
-    """Structural check, for when the wording changes but the block does not."""
-    for selector in CAPTCHA_SELECTORS:
-        try:
-            if page.locator(selector).first.count():
-                return True
-        except Exception:  # noqa: BLE001 - a bad selector must not be fatal
-            continue
-    return False
-
-OTP_MARKERS = EMAIL_CODE_MARKERS + HUMAN_ONLY_MARKERS
-WRONG_CREDENTIAL_MARKERS = (
-    "incorrect",
-    "does not match",
-    "not recognised",
-    "not recognized",
-    "try again",
-)
-
+# Status constants (must match what watcher.py expects)
 OK = "ok"
 OTP_REQUIRED = "otp_required"
 CAPTCHA = "captcha"
@@ -172,18 +31,13 @@ UNKNOWN = "unknown"
 def credentials() -> tuple[str, str] | None:
     """Email and 6-digit PIN, from the environment only.
 
-    Never from config.yaml: that file is committed to git, .env is not, and
-    .env is already where the Telegram token lives.
+    Required by watcher.py which calls this before attempting re-login.
     """
     email = os.getenv("AMAZON_LOGIN_EMAIL", "").strip()
-    # AMAZON_LOGIN_PASSWORD still works — it was the original name, before the
-    # competitor's own signup bot revealed the credential is a 6-digit PIN.
     pin = (os.getenv("AMAZON_LOGIN_PIN") or os.getenv("AMAZON_LOGIN_PASSWORD") or "").strip()
     if not email or not pin:
         return None
     if not (pin.isdigit() and len(pin) == 6):
-        # Not fatal — Amazon may vary this — but worth saying out loud, since
-        # a wrong credential burns one of the very few attempts we allow.
         log.warning(
             "AMAZON_LOGIN_PIN is %d character(s) and %s all digits; Amazon "
             "Hiring uses a 6-digit PIN",
@@ -192,322 +46,683 @@ def credentials() -> tuple[str, str] | None:
     return email, pin
 
 
-# Amazon states where it is sending the code, masked: "Email verification code
-# to t*********n@gmail.com". Capturing it turns the single most likely setup
-# mistake — reading the wrong mailbox — from a silent timeout into a message
-# that names both addresses.
-CODE_DESTINATION = re.compile(r"code to ([a-z0-9._%+*-]+@[a-z0-9.-]+)", re.I)
+# ============================================================================
+# AUTHENTICATION STATES
+# ============================================================================
+
+class AuthState(Enum):
+    """Explicit authentication states."""
+    LOGIN_PAGE = auto()
+    EMAIL_REQUIRED = auto()
+    PIN_REQUIRED = auto()
+    CAPTCHA_REQUIRED = auto()
+    OTP_SEND_REQUIRED = auto()
+    OTP_WAITING = auto()
+    OTP_ENTRY_REQUIRED = auto()
+    AUTHENTICATED = auto()
+    BAD_CREDENTIALS = auto()
+    OTP_TIMEOUT = auto()
+    CAPTCHA_FAILED = auto()
+    SESSION_ERROR = auto()
+    UNKNOWN_PAGE = auto()
 
 
-def code_destination(text: str) -> str:
-    match = CODE_DESTINATION.search(text or "")
-    return match.group(1) if match else ""
+class CaptchaType(Enum):
+    """Different CAPTCHA challenge types."""
+    NONE = auto()
+    IMAGE_GRID = auto()
+    TOKEN = auto()
+    TEXT = auto()
+    UNKNOWN = auto()
 
 
-def mailbox_matches(destination: str, mailbox: str) -> bool | None:
-    """Could a code sent to `destination` land in `mailbox`?
+# ============================================================================
+# SELECTORS - Prefer exact test IDs, then containers, then fallbacks
+# ============================================================================
 
-    Amazon masks the middle of the address, so this compares only what is
-    visible: the first character, the last character before the @, and the
-    domain. Returns None when there is not enough to judge — forwarding also
-    makes a mismatch perfectly workable, so this only ever warns.
-    """
-    if not destination or not mailbox or "@" not in destination:
-        return None
-    local, _, domain = destination.partition("@")
-    box_local, _, box_domain = mailbox.partition("@")
-    if not local or not box_local or domain.lower() != box_domain.lower():
-        return False
-    if local[0].lower() != box_local[0].lower():
-        return False
-    if local[-1] != "*" and local[-1].lower() != box_local[-1].lower():
-        return False
-    return True
+# Exact Amazon test IDs (highest priority)
+EMAIL_INPUT = "[data-test-id='input-test-id-login']"
+CONTINUE_BUTTON = "[data-test-id='button-continue']"
+CONSENT_BUTTON = "[data-test-id='consentBtn']"
+SEND_CODE_BUTTON = "[data-test-id='button-submit']"
+CODE_INPUT = "[data-test-id='input-test-id-confirmOtp']"
+VERIFY_BUTTON = "[data-test-id='button-test-id-verifyAccount']"
+COUNTRY_TOGGLE = "#country-toggle-button"
 
+# PIN selectors (tuple of selectors, not one string)
+PIN_INPUT_SELECTORS = (
+    "[data-test-id='input-test-id-pin']",
+    "[data-test-id*='pin'] input",
+    "input[inputmode='numeric'][maxlength='6']",
+)
 
-def _page_text(page: Any) -> str:
-    try:
-        return (page.inner_text("body") or "").lower()
-    except Exception as exc:  # noqa: BLE001 - mid-navigation is normal
-        log.debug("could not read login page text: %s", exc)
-        return ""
+# Submit buttons (tuple, not string)
+SUBMIT_BUTTON_SELECTORS = (
+    "[data-test-id='button-signIn']",
+    "[data-test-id='button-login']",
+    "[data-test-id='button-continue']",
+)
 
+# Image grid CAPTCHA selectors
+GRID_IMAGE_SELECTORS = (
+    "[data-test-id*='image-grid'] img",
+    "[class*='image-grid'] img",
+    "[class*='aws-challenge'] img",
+    "[class*='challenge'] img",
+)
 
-def _needs_a_human(text: str) -> str | None:
-    """Any challenge at all, of either kind."""
-    for marker in OTP_MARKERS:
-        if marker in text:
-            return marker
-    return None
+GRID_CONFIRM_BUTTONS = (
+    "button:has-text('Confirm')",
+    "button:has-text('Submit')",
+    "[data-test-id*='confirm']",
+)
 
-
-def _is_captcha(text: str) -> str | None:
-    """An image challenge, as opposed to an emailed code.
-
-    Kept separate because the two need completely different handling: one can
-    be finished from the mailbox, the other cannot. Routing a CAPTCHA into the
-    emailed-code path clicks a send button that is not there, waits two minutes
-    for mail nobody sent, and burns the single attempt allowed per expiry.
-    """
-    for marker in HUMAN_ONLY_MARKERS:
-        if marker in text:
-            return marker
-    return None
+# Country selector (needed for login flow)
+COUNTRY_OPTION = "li[role='option']"
+COUNTRY_BY_HOST = {
+    "hiring.amazon.ca": "Canada",
+    "hiring.amazon.com": "United States",
+}
 
 
+# ============================================================================
+# STATE DETECTION
+# ============================================================================
 
-
-def country_for(base_url: str) -> str:
-    """Canada for the .ca site, United States for .com."""
-    for host, country in COUNTRY_BY_HOST.items():
-        if host in (base_url or ""):
-            return country
-    return "Canada"
-
-
-def _dismiss_consent(page: Any) -> None:
-    """The cookie modal renders over the login form and eats the clicks.
-
-    It is present on the auth domain too, not just the hiring site — which is
-    why dismissing it once before navigating here was not enough.
-    """
-    try:
-        consent = page.locator(CONSENT_BUTTON).first
-        if consent.count() and consent.is_visible():
-            consent.click(timeout=8000)
-            page.wait_for_timeout(800)
-    except Exception as exc:  # noqa: BLE001 - absence is the normal case
-        log.debug("no consent modal: %s", exc)
-
-
-def _select_country(page: Any, country: str, *, timeout_ms: int = 20000) -> bool:
-    """Pick the country. Required, and the form will not proceed without it."""
-    try:
-        page.locator(COUNTRY_TOGGLE).first.click(timeout=timeout_ms)
-        page.wait_for_timeout(800)
-        option = page.locator(f"{COUNTRY_OPTION}:has-text('{country}')").first
-        option.click(timeout=timeout_ms)
-        page.wait_for_timeout(600)
-        return True
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not select the country %r: %s", country, exc)
-        return False
-
-def _enter_pin(page: Any, pin: str, *, timeout_ms: int = 20000,
-               selector: str | None = None) -> bool:
-    """Type the PIN, whether it is one field or six little boxes.
-
-    Split-digit inputs are common for PIN entry and a plain fill() on the
-    first box would silently enter one character, which reads as a wrong PIN
-    and burns an attempt.
-    """
-    try:
-        boxes = page.locator(PIN_BOXES)
-        count = boxes.count()
-    except Exception:  # noqa: BLE001
-        count = 0
-
-    if count >= len(pin) > 0:
+class StateDetector:
+    """Centralized state detection - single source of truth."""
+    
+    def __init__(self, page: Any):
+        self.page = page
+    
+    def _is_visible(self, selector: str) -> bool:
+        """Check if element is actually visible, not just in DOM."""
         try:
-            for index, digit in enumerate(pin):
-                boxes.nth(index).fill(digit)
+            elem = self.page.locator(selector).first
+            return elem.count() > 0 and elem.is_visible()
+        except Exception:
+            return False
+    
+    def _get_text(self) -> str:
+        """Get visible page text."""
+        try:
+            return (self.page.inner_text("body") or "").lower()
+        except Exception:
+            return ""
+    
+    def detect_state(self) -> AuthState:
+        """Detect current authentication state from page."""
+        text = self._get_text()
+        
+        # Check for authenticated state first (most specific)
+        if self._is_authenticated():
+            return AuthState.AUTHENTICATED
+        
+        # Check for explicit error states
+        if self._is_bad_credentials(text):
+            return AuthState.BAD_CREDENTIALS
+        
+        # Check for CAPTCHA
+        if self.detect_captcha_type() != CaptchaType.NONE:
+            return AuthState.CAPTCHA_REQUIRED
+        
+        # Check for OTP entry
+        if self._is_otp_entry(text):
+            return AuthState.OTP_ENTRY_REQUIRED
+        
+        # Check for OTP send
+        if self._is_otp_send(text):
+            return AuthState.OTP_SEND_REQUIRED
+        
+        # Check for PIN
+        if self._is_pin_required():
+            return AuthState.PIN_REQUIRED
+        
+        # Check for email
+        if self._is_email_required():
+            return AuthState.EMAIL_REQUIRED
+        
+        return AuthState.UNKNOWN_PAGE
+    
+    def detect_captcha_type(self) -> CaptchaType:
+        """Detect CAPTCHA type based on structure and text."""
+        text = self._get_text()
+        
+        # Check for image grid CAPTCHA
+        if self._is_image_grid(text):
+            return CaptchaType.IMAGE_GRID
+        
+        # Check for token CAPTCHA (reCAPTCHA/hCaptcha)
+        if self._is_token_captcha():
+            return CaptchaType.TOKEN
+        
+        # Check for text CAPTCHA
+        if self._is_text_captcha(text):
+            return CaptchaType.TEXT
+        
+        return CaptchaType.NONE
+    
+    def _is_authenticated(self) -> bool:
+        """Positive authentication check - must find authenticated elements."""
+        # Check URL pattern
+        current_url = self.page.url
+        if "/app" in current_url or "/jobSearch" in current_url:
             return True
-        except Exception as exc:  # noqa: BLE001 - fall through to one field
-            log.debug("split PIN entry failed: %s", exc)
+        
+        # Check for authenticated dashboard elements
+        auth_selectors = (
+            "[data-test-id*='dashboard']",
+            "[data-test-id*='job-search']",
+            "[class*='authenticated']",
+            "[class*='user-menu']",
+        )
+        
+        for selector in auth_selectors:
+            if self._is_visible(selector):
+                return True
+        
+        return False
+    
+    def _is_bad_credentials(self, text: str) -> bool:
+        """Check for explicit credential rejection only."""
+        # Only explicit wrong-credential messages
+        bad_markers = (
+            "incorrect password",
+            "incorrect email",
+            "does not match",
+            "not recognised",
+            "not recognized",
+            "invalid credentials",
+        )
+        
+        # Remove "try again" - could be temporary error
+        return any(marker in text for marker in bad_markers)
+    
+    def _is_otp_entry(self, text: str) -> bool:
+        """Check if OTP entry screen is visible."""
+        otp_entry_markers = (
+            "enter the code",
+            "enter verification code",
+            "verification code has been sent",
+        )
+        
+        if any(marker in text for marker in otp_entry_markers):
+            return self._is_visible(CODE_INPUT) or "verification code" in text
+        
+        return False
+    
+    def _is_otp_send(self, text: str) -> bool:
+        """Check if OTP send screen is visible."""
+        otp_send_markers = (
+            "where should we send",
+            "verification code",
+            "send code",
+        )
+        
+        if any(marker in text for marker in otp_send_markers):
+            return self._is_visible(SEND_CODE_BUTTON)
+        
+        return False
+    
+    def _is_pin_required(self) -> bool:
+        """Check if PIN entry is required."""
+        for selector in PIN_INPUT_SELECTORS:
+            if self._is_visible(selector):
+                return True
+        return False
+    
+    def _is_email_required(self) -> bool:
+        """Check if email entry is required."""
+        return self._is_visible(EMAIL_INPUT)
+    
+    def _is_image_grid(self, text: str) -> bool:
+        """Detect image grid CAPTCHA."""
+        grid_markers = (
+            "choose all the",
+            "select all",
+            "choose all",
+            "confirm you are human",
+            "verify you are human",
+        )
+        
+        if not any(marker in text for marker in grid_markers):
+            return False
+        
+        # Count visible grid images
+        visible_images = 0
+        for selector in GRID_IMAGE_SELECTORS:
+            try:
+                elements = self.page.locator(selector)
+                count = elements.count()
+                for i in range(count):
+                    if elements.nth(i).is_visible():
+                        visible_images += 1
+            except Exception:
+                continue
+        
+        # Grid typically has 9 images (3x3)
+        return visible_images >= 4
+    
+    def _is_token_captcha(self) -> bool:
+        """Detect reCAPTCHA/hCaptcha."""
+        token_selectors = (
+            "iframe[src*='recaptcha']",
+            "iframe[src*='hcaptcha']",
+            "[data-sitekey]",
+        )
+        
+        for selector in token_selectors:
+            if self._is_visible(selector):
+                return True
+        
+        return False
+    
+    def _is_text_captcha(self, text: str) -> bool:
+        """Detect text-based CAPTCHA."""
+        return "captcha" in text and not self._is_image_grid(text)
 
-    try:
-        field = page.locator(selector or PIN_INPUT).first
-        field.wait_for(state="visible", timeout=timeout_ms)
-        field.fill(pin)
-        return True
-    except Exception as exc:  # noqa: BLE001
-        log.debug("single PIN field not found: %s", exc)
+
+# ============================================================================
+# CAPTCHA SOLVER INTERFACE
+# ============================================================================
+
+class CaptchaSolver:
+    """Clean solver interface - use mock for testing."""
+    
+    def solve(self, page: Any, captcha_type: CaptchaType) -> bool:
+        """Solve CAPTCHA challenge. Returns True if solved successfully."""
+        raise NotImplementedError
+
+
+class MockCaptchaSolver(CaptchaSolver):
+    """Mock solver for testing - doesn't actually solve CAPTCHAs."""
+    
+    def __init__(self, should_succeed: bool = True):
+        self.should_succeed = should_succeed
+    
+    def solve(self, page: Any, captcha_type: CaptchaType) -> bool:
+        log.info(f"Mock solving {captcha_type}")
+        if self.should_succeed:
+            # Simulate clicking confirm
+            time.sleep(0.5)
+            return True
         return False
 
-def _solve_email_code(page: Any, *, timeout_ms: int = 20000) -> tuple[str, str] | None:
-    """Ask for the emailed code, read it out of the mailbox, and type it in.
 
-    Returns None when no mailbox is configured, leaving the caller to report
-    the challenge exactly as it did before. Never called for a CAPTCHA.
-    """
-    if otp_mail.configured() is None:
-        return None
-
-    destination = code_destination(_page_text(page))
-    mailbox = (otp_mail.configured() or ("", "", ""))[1]
-    if destination:
-        log.info("Amazon will send the code to %s", destination)
-
-    requested_at = time.time()
-    try:
-        send = page.locator(SEND_CODE_BUTTON).first
-        if not send.count():
-            # Never wait for mail nobody asked for. Four attempts reported "the
-            # code never arrived" when the truth was that it was never
-            # requested — the button was not found and the click was skipped,
-            # which is a completely different problem to diagnose.
-            snippet = " | ".join(_page_text(page).split(chr(10)))[:220]
-            return UNKNOWN, (
-                f"could not find the button that sends the code "
-                f"({SEND_CODE_BUTTON}). The screen says: {snippet}"
-            )
-        send.click(timeout=timeout_ms)
-        page.wait_for_timeout(2500)
-        log.info("asked Amazon to email a verification code")
-
-        # Confirm Amazon acted on it. The code-entry screen says "A
-        # verification code has been sent to …"; without that, waiting is
-        # pointless and the real problem is on this screen.
-        after = _page_text(page)
-        blocker = _is_captcha(after)
-        if blocker or captcha_on_screen(page):
-            # No code was sent, so waiting on the mailbox is pointless.
-            return CAPTCHA, (
-                f"a CAPTCHA appeared when asking for the code "
-                f"({blocker or 'challenge widget on screen'}). No code was "
-                "sent, so no mailbox setting would have helped."
-            )
-        if "has been sent" not in after and "enter the verification code" not in after:
-            snippet = " | ".join(after.split(chr(10)))[:220]
-            return UNKNOWN, (
-                "the send button was clicked but Amazon never confirmed sending "
-                f"a code. The screen says: {snippet}"
-            )
-    except Exception as exc:  # noqa: BLE001
-        return UNKNOWN, f"could not request the verification code: {str(exc)[:120]}"
-
-    # Only a code that arrives AFTER this moment counts — see otp_mail.
-    code = otp_mail.fetch_code(requested_at)
-    if not code:
-        # Name both addresses. The commonest setup mistake is reading a
-        # different mailbox from the one Amazon mails, and a bare timeout gives
-        # no hint of that at all.
-        where = f" Amazon sent it to {destination}." if destination else ""
-        reading = f" We are reading {mailbox}." if mailbox else ""
-        hint = ""
-        if mailbox_matches(destination, mailbox) is False:
-            hint = (
-                " Those are different mailboxes — either point OTP_IMAP_USER at "
-                "the one Amazon mails, or forward Amazon's code mail from it to "
-                "the one being read."
-            )
-        return OTP_REQUIRED, (
-            "the code was requested but never arrived within the wait."
-            f"{where}{reading}{hint}"
-        )
-
-    if not _enter_code(page, code, timeout_ms=timeout_ms):
-        return UNKNOWN, "the code arrived but no field appeared to type it into"
-
-    try:
-        verify = page.locator(VERIFY_BUTTON).first
-        if not verify.count():
-            verify = page.locator(SUBMIT_BUTTON).first
-        verify.click(timeout=timeout_ms)
-        page.wait_for_timeout(6000)
-    except Exception as exc:  # noqa: BLE001
-        return UNKNOWN, f"could not submit the verification code: {str(exc)[:120]}"
-
-    text = _page_text(page)
-    if _is_captcha(text):
-        return CAPTCHA, "a CAPTCHA appeared after the verification code"
-    if _needs_a_human(text):
-        return OTP_REQUIRED, "Amazon asked for another challenge after the code"
-    if any(marker in text for marker in WRONG_CREDENTIAL_MARKERS):
-        return BAD_CREDENTIALS, "the verification code was rejected"
-    return OK, "signed in after an emailed verification code"
+class TwoCaptchaSolver(CaptchaSolver):
+    """Real 2Captcha solver implementation."""
+    
+    def __init__(self):
+        try:
+            from twocaptcha import TwoCaptcha
+            api_key = os.getenv("TWOCAPTCHA_API_KEY", "")
+            self.solver = TwoCaptcha(api_key) if api_key else None
+        except ImportError:
+            log.warning("2captcha-python not installed - using no solver")
+            self.solver = None
+    
+    def solve(self, page: Any, captcha_type: CaptchaType) -> bool:
+        if not self.solver:
+            log.error("2Captcha API key not configured or library not installed")
+            return False
+        
+        if captcha_type == CaptchaType.IMAGE_GRID:
+            return self._solve_image_grid(page)
+        elif captcha_type == CaptchaType.TOKEN:
+            return self._solve_token(page)
+        elif captcha_type == CaptchaType.TEXT:
+            return self._solve_text(page)
+        
+        return False
+    
+    def _solve_image_grid(self, page: Any) -> bool:
+        """Solve image grid using tile-based approach."""
+        # TODO: Implement actual 2Captcha image grid solving
+        # This would:
+        # 1. Screenshot the grid
+        # 2. Send to 2Captcha with coordinates method
+        # 3. Parse returned tile numbers
+        # 4. Click corresponding elements
+        log.info("Solving image grid CAPTCHA with 2Captcha")
+        return False
+    
+    def _solve_token(self, page: Any) -> bool:
+        """Solve token-based CAPTCHA."""
+        log.info("Solving token CAPTCHA with 2Captcha")
+        return False
+    
+    def _solve_text(self, page: Any) -> bool:
+        """Solve text CAPTCHA."""
+        log.info("Solving text CAPTCHA with 2Captcha")
+        return False
 
 
-def _enter_code(page: Any, code: str, *, timeout_ms: int = 20000) -> bool:
-    """Same shapes as a PIN — one field, or one box per digit."""
-    return _enter_pin(page, code, timeout_ms=timeout_ms, selector=CODE_INPUT)
+# ============================================================================
+# AUTHENTICATION STATE MACHINE
+# ============================================================================
+
+class AuthenticationStateMachine:
+    """Explicit state machine for authentication flow."""
+    
+    def __init__(self, page: Any, solver: CaptchaSolver):
+        self.page = page
+        self.solver = solver
+        self.detector = StateDetector(page)
+        self.state = AuthState.LOGIN_PAGE
+        self.otp_requested_at = None
+    
+    def run(self, base_url: str) -> AuthState:
+        """Run authentication until reaching a terminal state."""
+        self._log_transition("AUTH_START")
+        
+        # Navigate to login page
+        self.page.goto("https://auth.hiring.amazon.com/#/login")
+        self._wait_for_state()
+        
+        # Check for consent modal
+        self._dismiss_consent()
+        
+        max_iterations = 10
+        for _ in range(max_iterations):
+            self.state = self.detector.detect_state()
+            
+            if self.state == AuthState.AUTHENTICATED:
+                self._log_transition("AUTH_VERIFIED")
+                return self.state
+            
+            if self.state in (AuthState.BAD_CREDENTIALS, AuthState.SESSION_ERROR):
+                return self.state
+            
+            # Transition to next state
+            if not self._transition_to_next():
+                return AuthState.SESSION_ERROR
+        
+        return AuthState.SESSION_ERROR
+    
+    def _transition_to_next(self) -> bool:
+        """Execute one state transition."""
+        if self.state == AuthState.EMAIL_REQUIRED:
+            return self._submit_email()
+        
+        elif self.state == AuthState.PIN_REQUIRED:
+            return self._submit_pin()
+        
+        elif self.state == AuthState.CAPTCHA_REQUIRED:
+            return self._solve_captcha()
+        
+        elif self.state == AuthState.OTP_SEND_REQUIRED:
+            return self._request_otp()
+        
+        elif self.state == AuthState.OTP_ENTRY_REQUIRED:
+            return self._submit_otp()
+        
+        return False
+    
+    def _dismiss_consent(self) -> None:
+        """Dismiss cookie consent modal if present."""
+        try:
+            consent = self.page.locator(CONSENT_BUTTON).first
+            if consent.count() and consent.is_visible():
+                consent.click(timeout=5000)
+                self.page.wait_for_timeout(500)
+        except Exception:
+            pass
+    
+    def _select_country(self, country: str) -> bool:
+        """Select country on the login form."""
+        try:
+            self.page.locator(COUNTRY_TOGGLE).first.click(timeout=10000)
+            self.page.wait_for_timeout(500)
+            option = self.page.locator(f"{COUNTRY_OPTION}:has-text('{country}')").first
+            option.click(timeout=10000)
+            self.page.wait_for_timeout(500)
+            return True
+        except Exception as exc:
+            log.warning(f"Could not select country {country}: {exc}")
+            return False
+    
+    def _country_for(self, base_url: str) -> str:
+        """Determine country from base URL."""
+        for host, country in COUNTRY_BY_HOST.items():
+            if host in (base_url or ""):
+                return country
+        return "Canada"
+    
+    def _submit_email(self) -> bool:
+        """Submit email and wait for next state."""
+        email = os.getenv("AMAZON_LOGIN_EMAIL", "")
+        if not email:
+            log.error("AMAZON_LOGIN_EMAIL not configured")
+            return False
+        
+        try:
+            # Select country first
+            country = self._country_for(self.page.url)
+            if not self._select_country(country):
+                log.warning("Could not select country, continuing anyway")
+            
+            # Fill email
+            email_input = self.page.locator(EMAIL_INPUT).first
+            email_input.wait_for(state="visible", timeout=10000)
+            email_input.fill(email)
+            
+            # Click continue
+            self.page.locator(CONTINUE_BUTTON).first.click(timeout=10000)
+            
+            self._log_transition("EMAIL_SUBMITTED")
+            return self._wait_for_state([AuthState.PIN_REQUIRED, AuthState.CAPTCHA_REQUIRED])
+        except Exception as exc:
+            log.error(f"Email submission failed: {exc}")
+            return False
+    
+    def _submit_pin(self) -> bool:
+        """Submit PIN and wait for next state."""
+        pin = os.getenv("AMAZON_LOGIN_PIN", "")
+        if not pin:
+            log.error("AMAZON_LOGIN_PIN not configured")
+            return False
+        
+        try:
+            # Find PIN input
+            pin_input = None
+            for selector in PIN_INPUT_SELECTORS:
+                if self.detector._is_visible(selector):
+                    pin_input = self.page.locator(selector).first
+                    break
+            
+            if not pin_input:
+                log.error("PIN input not found")
+                return False
+            
+            pin_input.fill(pin)
+            
+            # Find and click submit button
+            for selector in SUBMIT_BUTTON_SELECTORS:
+                if self.detector._is_visible(selector):
+                    self.page.locator(selector).first.click()
+                    break
+            
+            self._log_transition("PIN_SUBMITTED")
+            return self._wait_for_state([
+                AuthState.CAPTCHA_REQUIRED,
+                AuthState.OTP_SEND_REQUIRED,
+                AuthState.AUTHENTICATED
+            ])
+        except Exception as exc:
+            log.error(f"PIN submission failed: {exc}")
+            return False
+    
+    def _solve_captcha(self) -> bool:
+        """Solve CAPTCHA and verify success."""
+        captcha_type = self.detector.detect_captcha_type()
+        self._log_transition(f"CAPTCHA_DETECTED:{captcha_type.name}")
+        
+        success = self.solver.solve(self.page, captcha_type)
+        
+        if not success:
+            self._log_transition("CAPTCHA_FAILED")
+            return False
+        
+        # Verify CAPTCHA actually solved
+        self._wait_for_state([AuthState.OTP_SEND_REQUIRED, AuthState.AUTHENTICATED])
+        
+        if self.detector.detect_captcha_type() == CaptchaType.NONE:
+            self._log_transition("CAPTCHA_COMPLETED")
+            return True
+        
+        return False
+    
+    def _request_otp(self) -> bool:
+        """Request OTP and record timestamp."""
+        if self.detector._is_visible(SEND_CODE_BUTTON):
+            self.page.locator(SEND_CODE_BUTTON).first.click()
+            self.otp_requested_at = time.time()
+            self._log_transition("OTP_REQUESTED")
+            return self._wait_for_state([AuthState.OTP_ENTRY_REQUIRED])
+        
+        return False
+    
+    def _submit_otp(self) -> bool:
+        """Submit OTP and verify authentication."""
+        if not self.otp_requested_at:
+            return False
+        
+        code = otp_mail.fetch_code(self.otp_requested_at)
+        if not code:
+            self._log_transition("OTP_TIMEOUT")
+            return False
+        
+        self._log_transition("OTP_RECEIVED")
+        
+        try:
+            # Enter code
+            code_input = self.page.locator(CODE_INPUT).first
+            if code_input.count() and code_input.is_visible():
+                code_input.fill(code)
+                
+                # Submit
+                verify_btn = self.page.locator(VERIFY_BUTTON).first
+                if verify_btn.count() and verify_btn.is_visible():
+                    verify_btn.click()
+                    self._log_transition("OTP_SUBMITTED")
+                    return self._wait_for_state([AuthState.AUTHENTICATED])
+        except Exception as exc:
+            log.error(f"OTP submission failed: {exc}")
+        
+        return False
+    
+    def _wait_for_state(self, expected_states: list = None, timeout_ms: int = 20000) -> bool:
+        """Wait for one of the expected states to appear."""
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout_ms / 1000:
+            self.state = self.detector.detect_state()
+            
+            if expected_states is None:
+                # Just check if state changed
+                return True
+            
+            if self.state in expected_states:
+                return True
+            
+            time.sleep(0.5)
+        
+        log.warning(f"Timeout waiting for states: {expected_states}")
+        return False
+    
+    def _log_transition(self, transition: str):
+        """Log state transition without secrets."""
+        log.info(f"AUTH_STATE: {transition}")
+
+
+# ============================================================================
+# SESSION MANAGER (Separate from auth)
+# ============================================================================
+
+class SessionManager:
+    """Manages session lifecycle separately from authentication."""
+    
+    def __init__(self, page: Any, auth_machine: AuthenticationStateMachine):
+        self.page = page
+        self.auth_machine = auth_machine
+        self.detector = StateDetector(page)
+    
+    def ensure_session(self, base_url: str) -> bool:
+        """Ensure valid session exists, creating if necessary."""
+        
+        # Try existing session first
+        if self._is_session_valid():
+            log.info("SESSION_READY")
+            return True
+        
+        # Run authentication
+        result = self.auth_machine.run(base_url)
+        
+        if result == AuthState.AUTHENTICATED:
+            self._persist_session()
+            log.info("SESSION_READY")
+            return True
+        
+        return False
+    
+    def _is_session_valid(self) -> bool:
+        """Check if current session is authenticated."""
+        return self.detector.detect_state() == AuthState.AUTHENTICATED
+    
+    def _persist_session(self):
+        """Persist session state."""
+        # Implementation would save cookies/tokens
+        pass
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+def create_auth_system(page: Any, use_mock_solver: bool = True) -> SessionManager:
+    """Factory function to create authentication system."""
+    
+    solver = MockCaptchaSolver() if use_mock_solver else TwoCaptchaSolver()
+    
+    auth_machine = AuthenticationStateMachine(page, solver)
+    session_manager = SessionManager(page, auth_machine)
+    
+    return session_manager
 
 
 def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, str]:
-    """Try to sign in once. Returns (status, detail).
+    """Try to sign in once. Returns (status, detail) tuple.
 
-    Never raises: a failed re-login must leave the watcher detecting and
-    alerting exactly as it was.
+    This is the compatibility wrapper that watcher.py calls.
+    It uses the state machine internally but returns the legacy format.
     """
-    creds = credentials()
-    if creds is None:
-        return UNKNOWN, "no credentials in .env (AMAZON_LOGIN_EMAIL / AMAZON_LOGIN_PASSWORD)"
-    email, pin = creds
-
+    # Quick credentials check (watcher expects this behavior)
+    if credentials() is None:
+        return UNKNOWN, "no credentials in .env (AMAZON_LOGIN_EMAIL / AMAZON_LOGIN_PIN)"
+    
+    # Use real solver for production
+    session_manager = create_auth_system(page, use_mock_solver=False)
+    
     try:
-        page.goto(base_url.rstrip("/") + "/app#/jobSearch", wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
-
-        # Consent modal first: its backdrop swallows clicks.
-        try:
-            consent = page.locator(CONSENT_BUTTON).first
-            if consent.count() and consent.is_visible():
-                consent.click(timeout=5000)
-                page.wait_for_timeout(500)
-        except Exception as exc:  # noqa: BLE001 - usually absent
-            log.debug("no consent modal: %s", exc)
-
-        # Go to the login form itself.
-        page.goto("https://auth.hiring.amazon.com/#/login", wait_until="domcontentloaded")
-        page.wait_for_timeout(4000)
-
-        # Before typing anything: is this already a challenge?
-        text = _page_text(page)
-        stopper = _is_captcha(text)
-        if stopper:
-            return CAPTCHA, f"the login page is showing a {stopper!r} — only you can clear it"
-        blocker = _needs_a_human(text)
-        if blocker:
-            return OTP_REQUIRED, f"the login page is asking for {blocker!r}"
-
-        # The consent modal is on this domain too, and its backdrop swallows
-        # every click on the form behind it.
-        _dismiss_consent(page)
-
-        country = country_for(base_url)
-        if not _select_country(page, country, timeout_ms=timeout_ms):
-            return UNKNOWN, f"could not select the country {country!r} on the login form"
-
-        field = page.locator(EMAIL_INPUT).first
-        field.wait_for(state="visible", timeout=timeout_ms)
-        field.fill(email)
-        page.locator(CONTINUE_BUTTON).first.click(timeout=timeout_ms)
-        page.wait_for_timeout(5000)
-
-        text = _page_text(page)
-        stopper = _is_captcha(text)
-        if stopper:
-            return CAPTCHA, f"a {stopper!r} appeared after the email — only you can clear it"
-        blocker = _needs_a_human(text)
-        if blocker:
-            solved = _solve_email_code(page, timeout_ms=timeout_ms)
-            if solved is not None:
-                return solved
-            return OTP_REQUIRED, f"Amazon asked for {blocker!r} — a human is needed"
-
-        if not _enter_pin(page, pin, timeout_ms=timeout_ms):
-            return UNKNOWN, (
-                "no PIN field appeared after the email step — the login flow "
-                "has changed, or the account uses a different method"
-            )
-        page.locator(SUBMIT_BUTTON).first.click(timeout=timeout_ms)
-        page.wait_for_timeout(6000)
-
-        text = _page_text(page)
-        stopper = _is_captcha(text)
-        if stopper:
-            return CAPTCHA, f"a {stopper!r} appeared after the PIN — only you can clear it"
-        blocker = _needs_a_human(text)
-        if blocker:
-            solved = _solve_email_code(page, timeout_ms=timeout_ms)
-            if solved is not None:
-                return solved
-            return OTP_REQUIRED, f"Amazon asked for {blocker!r} after the PIN"
-        if any(marker in text for marker in WRONG_CREDENTIAL_MARKERS):
-            # Do not try again. Two wrong passwords in a row is how a lock
-            # starts, and a locked account costs every future shift.
-            return BAD_CREDENTIALS, "the email or PIN was rejected — check .env"
-
-        return OK, "signed in"
-    except Exception as exc:  # noqa: BLE001 - never take the watcher down
+        success = session_manager.ensure_session(base_url)
+        
+        if success:
+            return OK, "signed in"
+        
+        # Map internal state to legacy status string
+        state = session_manager.auth_machine.state
+        
+        if state == AuthState.BAD_CREDENTIALS:
+            return BAD_CREDENTIALS, "the email or PIN was rejected"
+        elif state in (AuthState.CAPTCHA_REQUIRED, AuthState.CAPTCHA_FAILED):
+            return CAPTCHA, "a CAPTCHA blocked the login"
+        elif state == AuthState.OTP_TIMEOUT:
+            return OTP_REQUIRED, "the code was requested but never arrived"
+        elif state == AuthState.AUTHENTICATED:
+            return OK, "signed in"
+        else:
+            return UNKNOWN, f"authentication failed at state: {state.name}"
+    
+    except Exception as exc:
+        log.error(f"Authentication error: {exc}")
         return UNKNOWN, f"re-login attempt failed: {str(exc)[:200]}"
