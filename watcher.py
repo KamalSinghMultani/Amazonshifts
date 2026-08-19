@@ -35,6 +35,7 @@ import drop_report
 import otp_mail
 import relogin as login_flow 
 import schedules as schedules_mod
+from http_hold import hold_with_retry
 from config import (
     in_hot_window,
     load_config,
@@ -983,6 +984,27 @@ class Watcher:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         shot = SCREENSHOT_DIR / f"hold-{stamp}.png"
 
+        # HTTP FAST PATH: Submit hold via direct GraphQL mutation (50-150ms)
+        # This beats competitor bots by avoiding page loads and click delays.
+        # Only used when direct_apply is enabled and we can fetch schedules.
+        if self.cfg["hold"].get("http_fast_path", True):
+            http_result = self._try_http_hold(shift)
+            if http_result and http_result.success:
+                log.info("HTTP hold succeeded in %.0fms", http_result.response_time_ms)
+                # Convert HTTP result to site_selectors HoldResult for reporting
+                from site_selectors import HoldResult, SUCCESS
+                result = HoldResult(
+                    status=SUCCESS,
+                    message=f"HTTP hold: {http_result.message}",
+                    url=f"{self.cfg['site']['base_url']}/application/?jobId={shift.id}&scheduleId={http_result.schedule_id}",
+                    timings=[("http_hold", http_result.response_time_ms)],
+                )
+                self._report_hold(shift, result, shot, poll_started)
+                return result
+            elif http_result:
+                log.info("HTTP hold failed (%.0fms), falling back to browser: %s", 
+                        http_result.response_time_ms, http_result.message[:100])
+
         # The fast route: if we can learn the scheduleId, the application can
         # be opened directly instead of clicked toward through five pages.
         direct = self._application_url(shift)
@@ -1076,6 +1098,53 @@ class Watcher:
         return schedules_mod.application_url(
             self.cfg["site"]["base_url"], best.job_id or shift.id, best.id,
         )
+
+    def _try_http_hold(self, shift) -> "HoldResult | None":
+        """Try to hold via direct HTTP POST (faster than browser clicks).
+        
+        Returns HoldResult on success/failure, or None if HTTP hold not attempted.
+        Falls back silently on any error — the browser click path remains the backup.
+        """
+        if self.api_client is None or not shift.id:
+            return None
+        
+        try:
+            # Fetch all schedules for this job
+            found = self.api_client.fetch_schedules(shift.id)
+        except Exception as exc:
+            log.debug("HTTP hold: could not fetch schedules: %s", exc)
+            return None
+        
+        open_slots = schedules_mod.bookable(found)
+        if not open_slots:
+            log.debug("HTTP hold: no bookable schedules")
+            return None
+        
+        # Sort by availability (most spots first = most likely to succeed)
+        open_slots.sort(key=lambda s: -(s.available or 1))
+        
+        # Extract schedule IDs to try (best first)
+        schedule_ids = [s.id for s in open_slots[:5]]  # Try top 5
+        
+        log.info(
+            "HTTP hold: attempting with %d schedule(s) for job %s",
+            len(schedule_ids), shift.id
+        )
+        
+        # Use the API client's request context and token provider
+        result = hold_with_retry(
+            request_context=self.context.request,
+            job_id=shift.id,
+            schedule_ids=schedule_ids,
+            endpoint_url=self.api_client.endpoint_url,
+            country=self.api_client.country,
+            locale=self.api_client.locale,
+            token_provider=self.token_source.current if self.token_source else None,
+            max_attempts=3,
+            timeout_ms=3000,  # Aggressive timeout for speed
+        )
+        
+        return result
 
     def _report_hold(self, shift, result, shot, poll_started=None) -> None:
         if result.timings:

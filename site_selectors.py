@@ -1052,24 +1052,48 @@ def _finish_application(
             url=url, timings=timings,
         )
 
-    # The Create Application button is disabled until the consent checkbox
-    # is checked. Check it first, then click.
+    # OPTIMIZED FOR SPEED: Aggressive clicking with force=True and minimal waits.
+    # This two-phase approach minimizes delay when checkbox isn't needed.
+    
+    clicked = False
+    
+    # PHASE 1: Try immediate aggressive click if button is enabled (fastest path ~200ms)
     try:
-        checkbox = page.locator(CONSENT_CHECKBOX).first
-        if checkbox.is_visible(timeout=timeout_ms):
-            if not checkbox.is_checked():
-                checkbox.check(timeout=timeout_ms)
-                mark("consent checkbox checked")
-    except Exception as exc:  # noqa: BLE001 - checkbox may not exist on all flows
-        log.info("no consent checkbox found or already checked (%s)", str(exc)[:80])
-
-    try:
-        page.locator(CREATE_APPLICATION).first.click(timeout=timeout_ms)
-        mark("create application clicked")
-    except Exception as exc:  # noqa: BLE001
+        btn = page.locator(CREATE_APPLICATION).first
+        if btn.is_enabled(timeout=200):
+            btn.click(timeout=2000, force=True, wait_after=0)
+            mark("create application clicked (fast path)")
+            clicked = True
+    except Exception:
+        pass  # Button disabled or other issue, proceed to phase 2
+    
+    # PHASE 2: Handle consent checkbox if click didn't work - check immediately then click
+    if not clicked:
+        try:
+            checkbox = page.locator(CONSENT_CHECKBOX).first
+            if checkbox.is_visible(timeout=300):
+                if not checkbox.is_checked():
+                    checkbox.check(timeout=300, force=True)
+                    mark("consent checkbox checked")
+                    # Minimal wait for button to enable after checking
+                    page.wait_for_timeout(50)
+        except Exception as exc:
+            log.info("no consent checkbox found or already checked (%s)", str(exc)[:80])
+        
+        try:
+            page.locator(CREATE_APPLICATION).first.click(timeout=2000, force=True, wait_after=0)
+            mark("create application clicked")
+            clicked = True
+        except Exception as exc:
+            _screenshot(page, screenshot_path)
+            return HoldResult(
+                FAILED, f"Create Application click failed: {exc}", url=url, timings=timings,
+            )
+    
+    if not clicked:
         _screenshot(page, screenshot_path)
         return HoldResult(
-            FAILED, f"Create Application click failed: {exc}", url=url, timings=timings,
+            FAILED, "Could not click Create Application button", url=url, timings=timings,
         )
 
     # Never assume the click worked. The site states the hold itself, with a
