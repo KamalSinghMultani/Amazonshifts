@@ -1,21 +1,4 @@
-# Secrets / session — NEVER commit these
-.env
-auth_state.json
-auth_state.*.json
-*.storage.json
-browser_profile/
-browser_profile_*/
-
-# Runtime output
-logs/
-state/
-screenshots/
-api_captures/
-
-# Python
-.venv/
-venv/
+```
 __pycache__/
-*.py[cod]
-.pytest_cache/
-*.egg-info/
+*.pyc
+```

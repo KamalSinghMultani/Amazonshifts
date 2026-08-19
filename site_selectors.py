@@ -149,6 +149,20 @@ DETAIL_PAGE_MARKER = "[data-test-id='jobDetailSelectScheduleButton']"
 #   https://hiring.amazon.ca/app#/jobDetail?jobId={id}
 # and the watcher can jump straight to the job instead of hunting for a card.
 
+# The pre-consent page's only action button. Harmless — it commits nothing,
+# just advances to the consent screen where the real decision lives.
+PRE_CONSENT_NEXT: str = "[data-test-id='layout'] button:has-text('Next')"
+
+# The consent screen requires checking a checkbox before Create Application
+# becomes enabled. This checkbox acknowledges that you are 18+, willing to take
+# a drug test, and agree to the data policy.
+CONSENT_CHECKBOX: str = (
+    "[data-test-id='layout'] input[type='checkbox'], "
+    "[data-test-id='layout'] [role='checkbox'], "
+    "label:has-text('I acknowledge') input[type='checkbox'], "
+    "label:has-text('I agree') input[type='checkbox']"
+)
+
 # THE one click that commits you, and the one that actually holds the shift.
 #
 # The consent screen states you are 18+, willing to take a drug test, and
@@ -1037,6 +1051,17 @@ def _finish_application(
             f"could not find the Create Application button: {ready_error}",
             url=url, timings=timings,
         )
+
+    # The Create Application button is disabled until the consent checkbox
+    # is checked. Check it first, then click.
+    try:
+        checkbox = page.locator(CONSENT_CHECKBOX).first
+        if checkbox.is_visible(timeout=timeout_ms):
+            if not checkbox.is_checked():
+                checkbox.check(timeout=timeout_ms)
+                mark("consent checkbox checked")
+    except Exception as exc:  # noqa: BLE001 - checkbox may not exist on all flows
+        log.info("no consent checkbox found or already checked (%s)", str(exc)[:80])
 
     try:
         page.locator(CREATE_APPLICATION).first.click(timeout=timeout_ms)
