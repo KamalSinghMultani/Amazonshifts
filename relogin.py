@@ -212,24 +212,45 @@ class StateDetector:
         return CaptchaType.NONE
     
     def _is_authenticated(self) -> bool:
-        """Positive authentication check - must find authenticated elements."""
-        # Check URL pattern
-        current_url = self.page.url
-        if "/app" in current_url or "/jobSearch" in current_url:
-            return True
-        
-        # Check for authenticated dashboard elements
-        auth_selectors = (
+        """Is this session REALLY signed in?
+
+        The old version returned True whenever the URL contained "/app" — which
+        it already does throughout the login flow, before anything is
+        submitted. Four consecutive re-logins therefore reported success 22 to
+        162 milliseconds after pressing Continue, faster than any page can
+        load, and the watcher's own verification disagreed with every one of
+        them. The session stayed dead for 25 hours while the log said "ok".
+
+        A URL is not evidence. Being off the auth domain is necessary but not
+        sufficient — signed-out users are redirected to the public site too —
+        so this asks the application whether it will serve an application page,
+        which is the same thing a hold needs.
+        """
+        current_url = self.page.url or ""
+
+        # Still on the login domain? Then no, whatever else is true.
+        if "auth.hiring.amazon" in current_url:
+            return False
+
+        # Ask the part of the site that actually requires a session. This is
+        # the same check watcher.py verifies with afterwards, so the state
+        # machine and its caller can no longer disagree.
+        try:
+            import doctor
+
+            base = "https://hiring.amazon.ca" if ".ca" in current_url else "https://hiring.amazon.com"
+            check = doctor.check_portal_login(self.page, base, settle_ms=4000)
+            return check.state == doctor.OK
+        except Exception as exc:  # noqa: BLE001 - fall back to the weak signal
+            log.debug("portal check failed, falling back to markup: %s", exc)
+
+        for selector in (
             "[data-test-id*='dashboard']",
-            "[data-test-id*='job-search']",
-            "[class*='authenticated']",
+            "[data-test-id*='user-menu']",
             "[class*='user-menu']",
-        )
-        
-        for selector in auth_selectors:
+        ):
             if self._is_visible(selector):
                 return True
-        
         return False
     
     def _is_bad_credentials(self, text: str) -> bool:

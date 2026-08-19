@@ -315,6 +315,13 @@ filters:
   # ever risk silently dropping a shift you wanted.
   min_pay_rate: null
 
+  # ⚠️ TEST WINDOW — every posting in Canada matches while this is in the
+  # future, Ottawa and Nisku and Dartmouth included. It exists to prove the
+  # hold path on a real posting, and it EXPIRES BY ITSELF at the time below.
+  # Nothing to remember to switch off; delete the line or set it to null to
+  # end it sooner. Anything held during it is a real application to withdraw.
+  accept_everything_until: "2026-08-19T02:07"
+
 # ── Which one do you want MOST? ─────────────────────────────────────────────
 # Filters decide what is acceptable. This decides the order, which matters
 # because a whole batch can land in one poll and only the front of the list is

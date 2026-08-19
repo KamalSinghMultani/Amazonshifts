@@ -109,9 +109,20 @@ def test_the_code_selector_targets_an_input_not_its_wrapper():
 
 
 # ── state detection ─────────────────────────────────────────────────────────
-def test_the_job_search_url_counts_as_authenticated():
+def test_a_url_alone_no_longer_counts_as_authenticated():
+    """The old check returned True for any URL containing "/app" — which it
+    does throughout the login flow, before anything is submitted. Four
+    consecutive re-logins reported success 22-162ms after pressing Continue,
+    faster than a page can load, while the session stayed dead for 25 hours.
+    A URL is not evidence."""
     page = FakePage(url="https://hiring.amazon.ca/app#/jobSearch")
-    assert StateDetector(page).detect_state() is AuthState.AUTHENTICATED
+    # With nothing on the page to prove a session, this must not claim one.
+    assert StateDetector(page).detect_state() is not AuthState.AUTHENTICATED
+
+
+def test_still_on_the_auth_domain_is_never_authenticated():
+    page = FakePage(url="https://auth.hiring.amazon.com/#/login")
+    assert StateDetector(page)._is_authenticated() is False
 
 
 def test_rejected_credentials_are_detected():

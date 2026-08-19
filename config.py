@@ -72,7 +72,14 @@ DEFAULTS: dict[str, Any] = {
     },
     # warehouse_types / shift_types mirror Amazon's own onboarding choices.
     # Empty means every type, which is where its wizard starts too.
-    "filters": {"warehouse_types": [], "shift_types": []},
+    "filters": {
+        "warehouse_types": [],
+        "shift_types": [],
+        # An ISO timestamp. While it is in the future, every posting matches —
+        # for proving the hold path when nothing commutable is up. It expires
+        # on its own; see ShiftMatcher.
+        "accept_everything_until": None,
+    },
     # Which acceptable shift you want most. See ShiftRanker.
     "priority": {
         "order": ["location", "title", "pay"],

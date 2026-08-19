@@ -1317,6 +1317,18 @@ def _shipped():
     return config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
 
 
+def _shipped_filters():
+    """The shipped filters, with any live test window neutralised.
+
+    config.yaml may legitimately carry an accept_everything_until while the
+    hold path is being proved. These tests are about what the filters MEAN,
+    not about whether an override is currently open.
+    """
+    filters = dict(_shipped()["filters"])
+    filters["accept_everything_until"] = None
+    return filters
+
+
 def _gta(title, city, pay=23.0):
     return Shift(id=f"{title}|{city}", title=title, location=f"{city}, ON", pay_rate=pay)
 
@@ -1387,14 +1399,14 @@ def test_pay_only_breaks_a_tie_nothing_more():
 
 
 def test_the_shipped_filters_accept_what_they_should():
-    matcher = ShiftMatcher(_shipped()["filters"])
+    matcher = ShiftMatcher(_shipped_filters())
     for title in (FULFILLMENT, DELIVERY, SORT):
         for city in ("Brampton", "Mississauga", "Toronto", "Oakville", "Milton", "Etobicoke"):
             assert matcher.matches(_gta(title, city))[0], (title, city)
 
 
 def test_the_shipped_filters_reject_what_they_should():
-    matcher = ShiftMatcher(_shipped()["filters"])
+    matcher = ShiftMatcher(_shipped_filters())
     assert not matcher.matches(_gta(FULFILLMENT, "Ottawa"))[0]
     assert not matcher.matches(_gta(FULFILLMENT, "Vancouver"))[0]
     assert not matcher.matches(Shift(title="Delivery Driver", location="Brampton, ON"))[0]
@@ -1403,7 +1415,7 @@ def test_the_shipped_filters_reject_what_they_should():
 def test_substring_matching_cannot_send_you_across_the_country():
     """'maple' is in the include list for Maple, ON — and would also match
     Maple Ridge, BC without the province excludes."""
-    matcher = ShiftMatcher(_shipped()["filters"])
+    matcher = ShiftMatcher(_shipped_filters())
     assert matcher.matches(_gta(FULFILLMENT, "Maple"))[0]
     assert not matcher.matches(Shift(title=FULFILLMENT, location="Maple Ridge, BC"))[0]
 
@@ -1412,7 +1424,7 @@ def test_no_pay_filter_is_configured():
     """These all pay about the same, so a threshold could only ever drop a
     shift that was wanted."""
     assert _shipped()["filters"]["min_pay_rate"] is None
-    matcher = ShiftMatcher(_shipped()["filters"])
+    matcher = ShiftMatcher(_shipped_filters())
     assert matcher.matches(Shift(title=FULFILLMENT, location="Brampton, ON"))[0]
 
 
@@ -1429,7 +1441,7 @@ def test_the_watcher_holds_the_top_ranked_shift_of_a_batch(tmp_path):
             _gta(FULFILLMENT, "Mississauga"),
         ],
         dry_run=False,
-        filters=shipped["filters"],
+        filters=_shipped_filters(),
         priority=shipped["priority"],
     )
     w._hold = lambda shift, **kw: held.append(shift)
@@ -1894,7 +1906,7 @@ def test_a_filtered_out_posting_still_leaves_a_trace(tmp_path, caplog):
                   location="Tsawwassen, BC", pay_rate=23.0),
             Shift(id="2", title="Delivery Driver", location="Brampton, ON", pay_rate=23.0),
         ],
-        filters=shipped["filters"],
+        filters=_shipped_filters(),
         priority=shipped["priority"],
     )
     with caplog.at_level("INFO"):
@@ -2792,7 +2804,7 @@ def test_a_dead_session_alerts_instead_of_attempting_a_doomed_hold(tmp_path):
                location="Etobicoke, ON", pay_rate=23.10,
                url="https://hiring.amazon.ca/app#/jobDetail?jobId=JOB-CA-1")],
         dry_run=False,
-        filters=shipped["filters"],
+        filters=_shipped_filters(),
         priority=shipped["priority"],
     )
     w.session_ok = False
@@ -2993,7 +3005,7 @@ def test_shift_types_filter_on_what_the_api_actually_returns():
 def test_milton_does_not_match_hamilton():
     """Found the moment the GTA list was widened: "milton" is inside
     "Hamilton", so a substring match accepted a posting 70km away."""
-    matcher = ShiftMatcher(_shipped()["filters"])
+    matcher = ShiftMatcher(_shipped_filters())
     assert matcher.matches(_gta(FULFILLMENT, "Milton"))[0]
     assert not matcher.matches(_gta(FULFILLMENT, "Hamilton"))[0]
 
@@ -3002,7 +3014,7 @@ def test_the_province_excludes_still_work_after_the_word_boundaries():
     """A leading word-boundary guard on ", bc" would demand a non-letter before
     the comma — never true — and would silently disable every province
     exclude. That regression lasted one test run."""
-    matcher = ShiftMatcher(_shipped()["filters"])
+    matcher = ShiftMatcher(_shipped_filters())
     assert matcher.matches(_gta(FULFILLMENT, "Maple"))[0]
     assert not matcher.matches(Shift(title=FULFILLMENT, location="Maple Ridge, BC"))[0]
     assert not matcher.matches(Shift(title=FULFILLMENT, location="Nisku, AB"))[0]
@@ -3021,13 +3033,13 @@ def test_titles_still_match_on_substrings():
 def test_the_gta_list_covers_torontos_districts():
     """Amazon labels sites by district as often as by city, so matching
     "toronto" alone would miss Etobicoke, Scarborough and North York."""
-    matcher = ShiftMatcher(_shipped()["filters"])
+    matcher = ShiftMatcher(_shipped_filters())
     for district in ("Etobicoke", "Scarborough", "North York", "East York"):
         assert matcher.matches(_gta(FULFILLMENT, district))[0], district
 
 
 def test_the_gta_list_stops_at_the_radius():
-    matcher = ShiftMatcher(_shipped()["filters"])
+    matcher = ShiftMatcher(_shipped_filters())
     for far in ("Ottawa", "Barrie", "London", "Kingston", "Windsor"):
         assert not matcher.matches(_gta(FULFILLMENT, far))[0], far
 
@@ -3276,3 +3288,44 @@ def test_overlay_dismissal_still_closes_a_real_modal():
     dismissed = site_selectors.dismiss_overlays(ModalPage())
     assert dismissed, "a visible modal must still be closed"
     assert closed
+
+
+# ── the self-expiring test window ───────────────────────────────────────────
+def test_the_test_window_accepts_everything_while_open():
+    from datetime import datetime, timedelta
+
+    later = (datetime.now() + timedelta(hours=1)).isoformat(timespec="minutes")
+    matcher = ShiftMatcher({
+        "include_locations": ["brampton"], "accept_everything_until": later,
+    })
+    ok, why = matcher.matches(Shift(title="Delivery Station Warehouse Associate",
+                                    location="Dartmouth, NS"))
+    assert ok and "TEST WINDOW" in why
+
+
+def test_the_test_window_closes_by_itself():
+    """A test mode you have to remember to switch off is one that ends up
+    holding a shift in Nova Scotia three weeks later."""
+    from datetime import datetime, timedelta
+
+    past = (datetime.now() - timedelta(minutes=1)).isoformat(timespec="minutes")
+    matcher = ShiftMatcher({
+        "include_locations": ["brampton"], "accept_everything_until": past,
+    })
+    ok, why = matcher.matches(Shift(title="Delivery Station Warehouse Associate",
+                                    location="Dartmouth, NS"))
+    assert not ok
+    assert "matched no include filter" in why
+
+
+def test_no_window_configured_changes_nothing():
+    matcher = ShiftMatcher({"include_locations": ["brampton"]})
+    assert matcher.test_window_open() is False
+    assert not matcher.matches(Shift(title="Warehouse", location="Ottawa, ON"))[0]
+
+
+def test_a_malformed_window_fails_at_startup():
+    """Silently never opening looks like a quiet night; silently never closing
+    holds shifts you cannot work."""
+    with pytest.raises(ValueError, match="accept_everything_until"):
+        ShiftMatcher({"accept_everything_until": "in three hours"})

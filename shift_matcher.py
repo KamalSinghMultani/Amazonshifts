@@ -156,6 +156,28 @@ def _contains_any_word(haystack: str, needles: Iterable[str]) -> str | None:
     return None
 
 
+
+def _parse_when(value: Any):
+    """An ISO timestamp, or None. Anything unparseable is fatal at startup.
+
+    A test window that silently never opens looks exactly like a quiet night,
+    and one that silently never CLOSES holds shifts you cannot work.
+    """
+    if not value:
+        return None
+    from datetime import datetime
+
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        raise ValueError(
+            f"filters.accept_everything_until must be an ISO timestamp like "
+            f"2026-08-19T02:00, got {value!r}"
+        ) from None
+
+
 class ShiftMatcher:
     """Decides whether a Shift is one the user actually wants."""
 
@@ -171,6 +193,11 @@ class ShiftMatcher:
         # Both empty means "any" — the same convention as the include_ lists,
         # and the same default Amazon's own onboarding starts from with every
         # box ticked.
+        # A time-boxed "take anything" window, for proving the hold path when
+        # nothing commutable is posted. It expires by ITSELF: a test mode you
+        # have to remember to switch off is one that ends up holding a shift in
+        # Nova Scotia three weeks later.
+        self.accept_everything_until = _parse_when(filters.get("accept_everything_until"))
         self.warehouse_types = [
             str(t).strip().lower() for t in (filters.get("warehouse_types") or [])
         ]
@@ -178,9 +205,22 @@ class ShiftMatcher:
             str(t).strip().lower() for t in (filters.get("shift_types") or [])
         ]
 
+    def test_window_open(self, now: Any = None) -> bool:
+        if self.accept_everything_until is None:
+            return False
+        from datetime import datetime as _dt
+
+        return (now or _dt.now()) < self.accept_everything_until
+
     def matches(self, shift: Shift) -> tuple[bool, str]:
         """Return (matched, reason). The reason is logged, which makes the
         dry-run period actually diagnosable."""
+        if self.test_window_open():
+            return True, (
+                "TEST WINDOW — filters bypassed until "
+                f"{self.accept_everything_until:%H:%M}"
+            )
+
         checks = (
             ("title", shift.title, self.include_titles, self.exclude_titles),
             ("location", shift.location, self.include_locations, self.exclude_locations),
