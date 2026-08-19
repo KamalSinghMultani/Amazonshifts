@@ -212,47 +212,59 @@ class StateDetector:
         return CaptchaType.NONE
     
     def _is_authenticated(self) -> bool:
-        """Is this session REALLY signed in?
+        """Is this session signed in? Observed, never navigated.
 
-        The old version returned True whenever the URL contained "/app" — which
-        it already does throughout the login flow, before anything is
-        submitted. Four consecutive re-logins therefore reported success 22 to
-        162 milliseconds after pressing Continue, faster than any page can
-        load, and the watcher's own verification disagreed with every one of
-        them. The session stayed dead for 25 hours while the log said "ok".
+        Two failures shaped this, in opposite directions.
 
-        A URL is not evidence. Being off the auth domain is necessary but not
-        sufficient — signed-out users are redirected to the public site too —
-        so this asks the application whether it will serve an application page,
-        which is the same thing a hold needs.
+        It used to return True for any URL containing "/app" — which it does
+        throughout the login flow — so four re-logins declared success 22 to
+        162ms after pressing Continue, before any page could load.
+
+        The fix for that was worse: asking the portal meant NAVIGATING, and
+        detect_state() calls this constantly. It sailed away from the login
+        form mid-flow and reported SESSION_READY in 4.6 seconds without ever
+        submitting an email. A state detector must not move the page it is
+        detecting.
+
+        So this only reads what is in front of it. The authoritative check
+        stays where it belongs: the caller verifies afterwards, once, when
+        navigating is safe.
         """
         current_url = self.page.url or ""
 
-        # Still on the login domain? Then no, whatever else is true.
+        # On the login domain, nothing else matters.
         if "auth.hiring.amazon" in current_url:
             return False
 
-        # Ask the part of the site that actually requires a session. This is
-        # the same check watcher.py verifies with afterwards, so the state
-        # machine and its caller can no longer disagree.
-        try:
-            import doctor
+        # A login form on screen means the flow is still in progress.
+        for selector in (EMAIL_INPUT, CODE_INPUT, COUNTRY_TOGGLE, *PIN_INPUT_SELECTORS):
+            if self._is_visible(selector):
+                return False
 
-            base = "https://hiring.amazon.ca" if ".ca" in current_url else "https://hiring.amazon.com"
-            check = doctor.check_portal_login(self.page, base, settle_ms=4000)
-            return check.state == doctor.OK
-        except Exception as exc:  # noqa: BLE001 - fall back to the weak signal
-            log.debug("portal check failed, falling back to markup: %s", exc)
+        text = self._get_text()
+        if any(phrase in text for phrase in (
+            "enter your personal pin",
+            "verification code",
+            "email or mobile number",
+            "select your country",
+        )):
+            return False
 
-        for selector in (
-            "[data-test-id*='dashboard']",
-            "[data-test-id*='user-menu']",
-            "[class*='user-menu']",
-        ):
+        # Positive evidence, when the viewport is wide enough to render it.
+        # Headless collapses the nav behind a hamburger, so absence proves
+        # nothing — which is exactly why the caller verifies separately.
+        if any(marker in text for marker in ("my account", "sign out", "welcome back")):
+            return True
+
+        for selector in ("[data-test-id*='dashboard']", "[data-test-id*='user-menu']",
+                         "[class*='user-menu']"):
             if self._is_visible(selector):
                 return True
+
+        # Off the auth domain, no login form, no proof either way. Say no: a
+        # false yes stops the login flow dead, a false no merely repeats it.
         return False
-    
+
     def _is_bad_credentials(self, text: str) -> bool:
         """Check for explicit credential rejection only."""
         # Only explicit wrong-credential messages

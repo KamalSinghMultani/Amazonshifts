@@ -324,3 +324,40 @@ def test_submit_stops_once_the_auth_domain_is_behind_us():
     page.url = "https://hiring.amazon.ca/app#/jobSearch"
     assert login_flow.submit_code(page, presses=3) is False
     assert page.clicked == []
+
+
+def test_state_detection_never_navigates():
+    """A state detector must not move the page it is detecting. Asking the
+    portal meant navigating, detect_state() calls this constantly, and it
+    sailed away from the login form mid-flow — reporting SESSION_READY in 4.6
+    seconds without ever submitting an email."""
+    navigations = []
+
+    class TrackingPage(FakePage):
+        def goto(self, url, **_kw):
+            navigations.append(url)
+
+    page = TrackingPage(text="welcome back kamaldeep", url="https://hiring.amazon.ca/app")
+    StateDetector(page).detect_state()
+    assert navigations == [], f"detect_state navigated to {navigations}"
+
+
+def test_a_visible_login_form_means_not_authenticated():
+    """Off the auth domain with a PIN box on screen is mid-login, not done."""
+    page = FakePage(
+        text="enter your personal pin",
+        url="https://hiring.amazon.ca/app#/jobSearch",
+    )
+    assert StateDetector(page)._is_authenticated() is False
+
+
+def test_the_account_menu_counts_as_signed_in():
+    page = FakePage(text="my account sign out", url="https://hiring.amazon.ca/")
+    assert StateDetector(page)._is_authenticated() is True
+
+
+def test_no_evidence_either_way_reports_not_authenticated():
+    """A false yes stops the login flow dead; a false no merely repeats it."""
+    page = FakePage(text="fraud warning: amazon never requests payment",
+                    url="https://hiring.amazon.ca/")
+    assert StateDetector(page)._is_authenticated() is False
