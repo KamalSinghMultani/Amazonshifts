@@ -1,4 +1,8 @@
 ```
-__pycache__/
+# Compiled Python files
 *.pyc
+__pycache__/
+
+# Logs
+*.log
 ```

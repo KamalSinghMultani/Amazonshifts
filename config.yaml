@@ -51,7 +51,7 @@ polling:
   #
   # ⚠️ IF YOU SWITCH BACK TO dom MODE, raise this to 45 first — a dom poll is
   # a full page load, and 14s between those already earned a 403.
-  interval_seconds: 2
+  interval_seconds: 0.5
   # Random 0..jitter_seconds added to each interval so the traffic pattern
   # is not a metronome.
   jitter_seconds: 0
@@ -66,7 +66,7 @@ polling:
   # Two triggers, either is enough:
   #   * a match just happened     -> hot for hot_duration_seconds
   #   * the clock is in a window  -> hot for as long as the window lasts
-  hot_interval_seconds: 2
+  hot_interval_seconds: 0.3
   hot_duration_seconds: 120
 
   # Times of day that are ALWAYS hot, in your local time. May wrap midnight
