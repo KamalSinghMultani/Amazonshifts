@@ -186,6 +186,10 @@ class CodeFieldPage:
         self.value = ""
         self.typed = ""
         self.clicked: list[str] = []
+        self.url = "https://auth.hiring.amazon.com/#/login"
+
+    def wait_for_timeout(self, _ms):
+        pass
 
     def locator(self, selector):
         page = self
@@ -239,9 +243,11 @@ def test_the_code_is_typed_so_the_component_registers_it():
     assert page.value == "832013", "and must read back what it typed"
 
 
-def test_a_field_that_never_accepts_the_code_is_reported_as_failure():
-    """Better to say "no field took it" than to press submit on an empty form
-    and read Amazon's rejection as a bad code."""
+def test_a_masked_field_is_not_treated_as_a_failure():
+    """Corrected by the account holder: this component renders the code greyed
+    with a circle-slash icon on EVERY account — normal styling, not an invalid
+    state — and may not report its value back. Refusing to submit on that
+    basis would fail a login that was about to succeed."""
     import login_flow
 
     class SilentField:
@@ -274,7 +280,7 @@ def test_a_field_that_never_accepts_the_code_is_reported_as_failure():
 
             return L()
 
-    assert login_flow.enter_code(SilentField(), "832013") is False
+    assert login_flow.enter_code(SilentField(), "832013") is True
 
 
 def test_submit_finds_the_button_whichever_word_it_uses():
@@ -284,5 +290,26 @@ def test_submit_finds_the_button_whichever_word_it_uses():
 
     for word in ("Verify", "Continue"):
         page = CodeFieldPage(button_text=word)
-        assert login_flow.submit_code(page) is True, word
+        assert login_flow.submit_code(page, presses=1) is True, word
         assert any(word.lower() in c.lower() for c in page.clicked), word
+
+
+def test_submit_presses_more_than_once_because_the_form_needs_it():
+    """Confirmed by the account holder: enter the code, press Verify, then
+    press Continue as well. One press leaves you on the same screen looking
+    exactly like a rejected code."""
+    import login_flow
+
+    page = CodeFieldPage(button_text="Continue")
+    login_flow.submit_code(page, presses=3)
+    assert len(page.clicked) >= 2, page.clicked
+
+
+def test_submit_stops_once_the_auth_domain_is_behind_us():
+    """It must not keep clicking at a page that has already signed in."""
+    import login_flow
+
+    page = CodeFieldPage(button_text="Continue")
+    page.url = "https://hiring.amazon.ca/app#/jobSearch"
+    assert login_flow.submit_code(page, presses=3) is False
+    assert page.clicked == []

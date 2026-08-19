@@ -554,7 +554,16 @@ def enter_code(page: Any, code: str, *, timeout_ms: int = 20000) -> bool:
             got = ""
         if got == code:
             return True
-        log.warning("typed the code but the field reads %r", got)
+        # A mismatch is NOT proof of failure. This component renders the code
+        # greyed with a circle-slash icon on every account — that is its normal
+        # styling, not an invalid state — and it may not expose the value back
+        # through input_value() at all. Say so and carry on; the submit step
+        # and the session check are the honest verdict.
+        log.info(
+            "field reads %r after typing (the component masks its value — "
+            "this is normal here)", got,
+        )
+        return True
     except Exception as exc:  # noqa: BLE001
         log.debug("typing the code failed: %s", exc)
 
@@ -583,18 +592,45 @@ CODE_SUBMIT_CANDIDATES = (
 )
 
 
-def submit_code(page: Any, *, timeout_ms: int = 20000) -> bool:
-    """Submit the code, whatever this variant calls the button."""
-    for selector in CODE_SUBMIT_CANDIDATES:
+def submit_code(page: Any, *, timeout_ms: int = 20000, presses: int = 3) -> bool:
+    """Submit the code and keep going until the login form lets go.
+
+    It takes MORE THAN ONE press. Confirmed by the account holder: you enter
+    the code, press Verify, and then have to press Continue as well before
+    Amazon signs you in. A single click leaves you on the same screen with the
+    code apparently entered and nothing happening — which reads exactly like a
+    rejected code and is not one.
+
+    Stops as soon as the auth domain is behind us, so it cannot keep clicking
+    at a page that has already moved on.
+    """
+    pressed = 0
+    for _ in range(max(1, presses)):
+        if "auth.hiring.amazon" not in (getattr(page, "url", "") or ""):
+            break                       # already through
+
+        clicked = False
+        for selector in CODE_SUBMIT_CANDIDATES:
+            try:
+                button = page.locator(selector).first
+                if not button.count() or not button.is_visible():
+                    continue
+                button.click(timeout=timeout_ms)
+                pressed += 1
+                clicked = True
+                log.info("pressed %s (%d)", selector, pressed)
+                break
+            except Exception as exc:  # noqa: BLE001 - try the next candidate
+                log.debug("%s did not work: %s", selector, exc)
+
+        if not clicked:
+            break
         try:
-            button = page.locator(selector).first
-            if not button.count() or not button.is_visible():
-                continue
-            button.click(timeout=timeout_ms)
-            log.info("submitted the code via %s", selector)
-            return True
-        except Exception as exc:  # noqa: BLE001 - try the next candidate
-            log.debug("%s did not work: %s", selector, exc)
-    log.warning("no button on screen would submit the code")
-    return False
+            page.wait_for_timeout(3000)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not pressed:
+        log.warning("no button on screen would submit the code")
+    return pressed > 0
 
