@@ -3189,3 +3189,26 @@ def test_failure_capture_never_breaks_the_watcher(tmp_path):
             raise RuntimeError("no body")
 
     w._capture_relogin_failure(Hostile(), "unknown")   # must not raise
+
+
+def test_the_authorize_probe_is_not_used_for_any_decision():
+    """SETTLED live: it returned 401 on a session that had just been
+    re-established and was genuinely usable. Acting on it would fire a
+    re-login against a healthy session, spending a CAPTCHA solve and an
+    emailed code to fix nothing."""
+    import inspect
+
+    import watcher as watcher_mod
+
+    decision = inspect.getsource(watcher_mod.Watcher.check_session_if_due)
+
+    # signed_in must come from the page check alone.
+    assignment = [ln for ln in decision.splitlines() if "signed_in =" in ln]
+    assert assignment, "could not find where the session verdict is decided"
+    assert all("authorize" not in ln and "probe" not in ln for ln in assignment), assignment
+
+    # And the probe result must never be branched on.
+    for line in decision.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("if ", "elif ", "while ")) and "status" in stripped:
+            assert "probe" not in stripped, stripped

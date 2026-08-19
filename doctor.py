@@ -120,11 +120,14 @@ def probe_authorize(request_context: Any, base_url: str) -> tuple[int | None, st
     browser that has never signed in. This one returned a clean 401 when
     signed out, which makes it a candidate for a check that does not lie.
 
-    It is NOT trusted yet — the signed-in side has never been observed, and a
-    false "signed out" would fire an automated re-login against a healthy
-    session and burn attempts on OTP for nothing. So for now it is recorded,
-    not acted on. Every session check logs it, and the first run against a
-    live session settles it.
+    SETTLED 2026-08-18, and the answer is no. On a session that had just been
+    re-established and was genuinely usable, this returned 401 while the page
+    check correctly read "signed in". So it cannot distinguish a dead session
+    from a live one, and acting on it would fire a re-login against a healthy
+    session — burning a CAPTCHA solve and an emailed code for nothing.
+
+    Kept only as a log line, because knowing it is unreliable is worth more
+    than removing the evidence. Do not wire it into any decision.
     """
     base = base_url.rstrip("/")
     code = country_code(base_url)
