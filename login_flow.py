@@ -515,26 +515,86 @@ def attempt(page: Any, base_url: str, *, timeout_ms: int = 20000) -> tuple[str, 
 def enter_code(page: Any, code: str, *, timeout_ms: int = 20000) -> bool:
     """Type a 6-digit code into whatever shape the screen is using.
 
-    Public on purpose: any login implementation can call this instead of
-    re-deriving the selectors. Handles both layouts seen on this site — one
-    input inside [data-test-id='input-test-id-confirmOtp'], and six
-    single-character boxes — and falls back through inputmode/tel/maxlength
-    variants, because the field carries no test-id of its own.
+    TYPED, not filled. Confirmed from a failure screenshot: fill() put "832013"
+    into the box, the component still rendered it greyed with an invalid-input
+    icon, and Continue did nothing. This is a Stencil component — fill() sets
+    the DOM value without the keystrokes its internal state listens for, so the
+    form stays empty as far as the app is concerned.
 
-    Returns True if the code went in. Never raises.
+    Returns True only if the field reads back the code afterwards. Never raises.
     """
-    return _enter_code(page, code, timeout_ms=timeout_ms)
+    field = None
+    for selector in [s.strip() for s in CODE_INPUT.split(",")]:
+        try:
+            candidate = page.locator(selector).first
+            if candidate.count() and candidate.is_visible():
+                field = candidate
+                break
+        except Exception:  # noqa: BLE001 - try the next shape
+            continue
+
+    if field is None:
+        # Six single-character boxes, the other layout this site uses.
+        return _enter_code(page, code, timeout_ms=timeout_ms)
+
+    try:
+        field.click(timeout=timeout_ms)
+        field.fill("")
+        # press_sequentially fires real key events; fill() does not.
+        try:
+            field.press_sequentially(code, delay=60)
+        except AttributeError:      # older Playwright
+            field.type(code, delay=60)
+
+        # Read it back. "I typed it" and "the field has it" are different
+        # claims, and only the second one submits.
+        try:
+            got = (field.input_value() or "").strip()
+        except Exception:  # noqa: BLE001 - not an <input>, fall through
+            got = ""
+        if got == code:
+            return True
+        log.warning("typed the code but the field reads %r", got)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("typing the code failed: %s", exc)
+
+    # Only fall back when the OTHER layout is actually present. Otherwise this
+    # would fill the same unresponsive field again and report success — which
+    # is how a login ends up pressing submit on an empty form and blaming
+    # Amazon for rejecting the code.
+    try:
+        if page.locator(PIN_BOXES).count() >= len(code):
+            return _enter_code(page, code, timeout_ms=timeout_ms)
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+# The button is not always called the same thing. Confirmed twice on the same
+# screen days apart: "Verify" with data-test-id button-test-id-verifyAccount,
+# and "Continue" with no such id. Try the id, then either word.
+CODE_SUBMIT_CANDIDATES = (
+    VERIFY_BUTTON,
+    "[data-test-id='layout'] button:has-text('Verify')",
+    "[data-test-id='layout'] button:has-text('Continue')",
+    "button:has-text('Verify')",
+    "button:has-text('Continue')",
+    SUBMIT_BUTTON,
+)
 
 
 def submit_code(page: Any, *, timeout_ms: int = 20000) -> bool:
-    """Press Verify. CONFIRMED selector, with a submit-button fallback."""
-    try:
-        verify = page.locator(VERIFY_BUTTON).first
-        if not verify.count():
-            verify = page.locator(SUBMIT_BUTTON).first
-        verify.click(timeout=timeout_ms)
-        return True
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not press Verify: %s", exc)
-        return False
+    """Submit the code, whatever this variant calls the button."""
+    for selector in CODE_SUBMIT_CANDIDATES:
+        try:
+            button = page.locator(selector).first
+            if not button.count() or not button.is_visible():
+                continue
+            button.click(timeout=timeout_ms)
+            log.info("submitted the code via %s", selector)
+            return True
+        except Exception as exc:  # noqa: BLE001 - try the next candidate
+            log.debug("%s did not work: %s", selector, exc)
+    log.warning("no button on screen would submit the code")
+    return False
 

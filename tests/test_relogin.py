@@ -174,3 +174,115 @@ def test_attempt_never_raises_on_a_broken_page(monkeypatch):
     status, detail = relogin.attempt(Exploding(), "https://hiring.amazon.ca")
     assert status in (relogin.UNKNOWN, relogin.OTP_REQUIRED, relogin.CAPTCHA)
     assert isinstance(detail, str)
+
+
+# ── entering the code: typed, not filled ────────────────────────────────────
+class CodeFieldPage:
+    """A Stencil-style field: fill() sets nothing the component believes."""
+
+    def __init__(self, honours_fill: bool = False, button_text: str = "Continue"):
+        self.honours_fill = honours_fill
+        self.button_text = button_text
+        self.value = ""
+        self.typed = ""
+        self.clicked: list[str] = []
+
+    def locator(self, selector):
+        page = self
+
+        class L:
+            def __init__(self, sel):
+                self.sel = sel
+
+            @property
+            def first(self):
+                return self
+
+            def count(self):
+                if "maxlength='1'" in self.sel:
+                    return 0                      # not the six-box layout
+                if "input" in self.sel or "confirmOtp" in self.sel:
+                    return 1
+                return 1 if page.button_text.lower() in self.sel.lower() else 0
+
+            def is_visible(self):
+                return self.count() > 0
+
+            def click(self, **_kw):
+                page.clicked.append(self.sel)
+
+            def fill(self, value):
+                if page.honours_fill or value == "":
+                    page.value = value
+
+            def press_sequentially(self, text, **_kw):
+                page.typed += text
+                page.value = page.typed          # keystrokes the component sees
+
+            def input_value(self):
+                return page.value
+
+            def wait_for(self, **_kw):
+                pass
+
+        return L(selector)
+
+
+def test_the_code_is_typed_so_the_component_registers_it():
+    """From a failure screenshot: fill() put 832013 in the box, the component
+    still showed it greyed with an invalid icon, and Continue did nothing."""
+    import login_flow
+
+    page = CodeFieldPage(honours_fill=False)
+    assert login_flow.enter_code(page, "832013") is True
+    assert page.typed == "832013", "must use key events, not fill()"
+    assert page.value == "832013", "and must read back what it typed"
+
+
+def test_a_field_that_never_accepts_the_code_is_reported_as_failure():
+    """Better to say "no field took it" than to press submit on an empty form
+    and read Amazon's rejection as a bad code."""
+    import login_flow
+
+    class SilentField:
+        def locator(self, selector):
+            class L:
+                @property
+                def first(self_inner):
+                    return self_inner
+
+                def count(self_inner):
+                    return 0 if "maxlength='1'" in selector else 1
+
+                def is_visible(self_inner):
+                    return True
+
+                def click(self_inner, **_kw):
+                    pass
+
+                def fill(self_inner, _value):
+                    pass
+
+                def press_sequentially(self_inner, _text, **_kw):
+                    pass
+
+                def input_value(self_inner):
+                    return ""          # nothing ever lands
+
+                def wait_for(self_inner, **_kw):
+                    pass
+
+            return L()
+
+    assert login_flow.enter_code(SilentField(), "832013") is False
+
+
+def test_submit_finds_the_button_whichever_word_it_uses():
+    """Confirmed twice, days apart: the same screen offered "Verify" with a
+    test-id, then "Continue" with none."""
+    import login_flow
+
+    for word in ("Verify", "Continue"):
+        page = CodeFieldPage(button_text=word)
+        assert login_flow.submit_code(page) is True, word
+        assert any(word.lower() in c.lower() for c in page.clicked), word
