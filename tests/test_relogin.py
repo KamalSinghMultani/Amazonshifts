@@ -361,3 +361,57 @@ def test_no_evidence_either_way_reports_not_authenticated():
     page = FakePage(text="fraud warning: amazon never requests payment",
                     url="https://hiring.amazon.ca/")
     assert StateDetector(page)._is_authenticated() is False
+
+
+def test_the_login_sets_the_country_context_first():
+    """auth.hiring.amazon.com serves both countries. Arrived at cold it returns
+    you to the US site — the post-login page carried Amazon's own banner:
+    "Seems like you're visiting the US website from Canada." A session
+    established there is no use to a watcher polling hiring.amazon.ca."""
+    import relogin as module
+
+    visited = []
+
+    class Recording:
+        url = "https://hiring.amazon.ca/app#/jobSearch"
+
+        def goto(self, url, **_kw):
+            visited.append(url)
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+        def inner_text(self, _sel):
+            return ""
+
+        def locator(self, _sel):
+            class L:
+                @property
+                def first(self_inner):
+                    return self_inner
+
+                def count(self_inner):
+                    return 0
+
+                def is_visible(self_inner):
+                    return False
+
+                def click(self_inner, **_kw):
+                    pass
+
+            return L()
+
+        def keyboard_press(self, _k):
+            pass
+
+    machine = module.AuthenticationStateMachine(Recording(), module.MockCaptchaSolver())
+    try:
+        machine.run("https://hiring.amazon.ca")
+    except Exception:
+        pass  # the flow will not complete against a stub; only the order matters
+
+    assert visited, "the login navigated nowhere"
+    assert "hiring.amazon.ca" in visited[0], (
+        f"the country site must be loaded before the auth domain, got {visited[0]}"
+    )
+    assert any("auth.hiring.amazon" in url for url in visited)

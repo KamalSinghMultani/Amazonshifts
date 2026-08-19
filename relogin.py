@@ -457,8 +457,19 @@ class AuthenticationStateMachine:
     def run(self, base_url: str) -> AuthState:
         """Run authentication until reaching a terminal state."""
         self._log_transition("AUTH_START")
-        
-        # Navigate to login page
+
+        # Load the COUNTRY site first. auth.hiring.amazon.com serves both
+        # countries and, arrived at cold, returns you to the US site — the
+        # post-login page carried Amazon's own banner saying so: "Seems like
+        # you're visiting the US website from Canada." A session established
+        # over there is no use to a watcher polling hiring.amazon.ca.
+        try:
+            self.page.goto(base_url.rstrip("/") + "/app#/jobSearch",
+                           wait_until="domcontentloaded")
+            self.page.wait_for_timeout(2000)
+        except Exception as exc:  # noqa: BLE001 - the login can still proceed
+            log.debug("could not set the country context: %s", exc)
+
         self.page.goto("https://auth.hiring.amazon.com/#/login")
         self._wait_for_state()
         
