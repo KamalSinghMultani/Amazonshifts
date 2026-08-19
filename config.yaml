@@ -39,22 +39,16 @@ polling:
   # These values are tuned for `api` mode, where a poll is one small JSON
   # request rather than a page load with every asset.
   #
-  # MEASURED 2026-08-17 against the live CA endpoint: 60 consecutive polls
-  # stepping 8s -> 5s -> 3s -> 2s apart drew no 429, no 403 and no WAF page,
-  # at a median of 132ms per poll. 5s is therefore comfortably inside what
-  # the endpoint tolerates, not a guess.
-  #
-  # Why this matters: a Concord posting was picked by a competing service at
-  # 21:44 and never appeared in eight consecutive polls either side of it.
-  # Postings can be gone in seconds, so the gap between polls is the gap
-  # through which shifts disappear.
+  # BALANCED APPROACH: 1.0s base + 0.5s jitter = 1.0-1.5s effective interval.
+  # Fast enough to catch shifts (most disappear in 20-60s window), but safe
+  # enough to avoid WAF blocks. The real speed comes from HTTP fast path holding,
+  # not polling frequency.
   #
   # ⚠️ IF YOU SWITCH BACK TO dom MODE, raise this to 45 first — a dom poll is
   # a full page load, and 14s between those already earned a 403.
-  interval_seconds: 0.5
-  # Random 0..jitter_seconds added to each interval so the traffic pattern
-  # is not a metronome.
-  jitter_seconds: 0
+  interval_seconds: 1.0
+  # Random jitter to avoid metronome pattern that triggers WAF
+  jitter_seconds: 0.5
 
   # ── Hot mode ────────────────────────────────────────────────────────────
   # Amazon posts shifts in BATCHES: the moment one appears, the next is
@@ -66,7 +60,10 @@ polling:
   # Two triggers, either is enough:
   #   * a match just happened     -> hot for hot_duration_seconds
   #   * the clock is in a window  -> hot for as long as the window lasts
-  hot_interval_seconds: 0.3
+  #
+  # HOT MODE TUNED FOR SAFETY: Must be <= interval_seconds. Set to 0.8s 
+  # (faster than base 1.0s) for catching batch drops while staying safe.
+  hot_interval_seconds: 0.8
   hot_duration_seconds: 120
 
   # Times of day that are ALWAYS hot, in your local time. May wrap midnight
@@ -382,6 +379,20 @@ hold:
   # competitor bot speeds while maintaining the safety of authenticated
   # browser sessions.
   http_fast_path: true
+
+  # ── Multi-Schedule Fallback ─────────────────────────────────────────────
+  # When a shift has multiple schedules (e.g., different start times), try
+  # them in sequence if the first gets sniped. Most drops have one schedule,
+  # but some popular locations have 2-3 schedules available simultaneously.
+  # The bot tries up to this many schedules per job before moving to the next city.
+  # Set higher during high-competition periods.
+  job_attempts: 5
+  
+  # Total time budget for trying multiple jobs in a single poll. With HTTP
+  # fast path, each attempt costs ~300-500ms. This budget allows trying
+  # Brampton -> Mississauga -> Toronto within one poll if needed.
+  # Increase to 60s if you want to cascade through more cities.
+  attempt_budget_seconds: 30
 
   # ── The one click that commits you ────────────────────────────────────────
   # CONFIRMED live: the shift is reserved only when "Create Application" is

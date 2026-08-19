@@ -285,7 +285,7 @@ def validate_config(cfg: dict) -> None:
     # If http_fast_path is enabled, we can safely poll faster since we're 
     # using authenticated browser sessions for GraphQL calls.
     if http_fast_path:
-        floor = 0.5  # Safe for HTTP fast path with browser cookies
+        floor = 0.8  # Safe minimum for HTTP fast path with browser cookies
     else:
         floor = 2 if mode == "api" else 20
         
