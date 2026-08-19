@@ -522,6 +522,47 @@ class Watcher:
         except Exception as exc:  # noqa: BLE001
             log.debug("could not screenshot the failure: %s", exc)
 
+        # Where does the challenge actually live? A screenshot showed "Choose
+        # all the bags" while page text had none of it AND no awswaf frame was
+        # found — so it is neither the main document nor a recognisable iframe.
+        # Shadow DOM is the remaining candidate, and guessing has cost hours.
+        try:
+            frames = [(f.url or "(blank)")[:90] for f in page.frames]
+            log.error("frames on the failed page (%d): %s", len(frames), " | ".join(frames))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not enumerate frames: %s", exc)
+
+        try:
+            census = page.evaluate(
+                r"""() => {
+                    const out = {iframes: [], shadowHosts: []};
+                    for (const f of document.querySelectorAll('iframe')) {
+                        out.iframes.push({src: (f.getAttribute('src')||'')
+                            .slice(0,90), title: f.getAttribute('title')||''});
+                    }
+                    const walk = (root, depth) => {
+                        for (const el of root.querySelectorAll('*')) {
+                            if (el.shadowRoot) {
+                                out.shadowHosts.push({
+                                    tag: el.tagName.toLowerCase(),
+                                    id: el.id || null,
+                                    cls: (el.className || '').toString().slice(0, 40),
+                                    text: (el.shadowRoot.textContent || '')
+                                        .replace(/\s+/g, ' ').trim().slice(0, 90),
+                                });
+                                if (depth < 3) walk(el.shadowRoot, depth + 1);
+                            }
+                        }
+                    };
+                    walk(document, 0);
+                    return out;
+                }"""
+            )
+            log.error("iframes: %s", census.get("iframes"))
+            log.error("shadow hosts: %s", census.get("shadowHosts"))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("DOM census failed: %s", exc)
+
         try:
             log.error("re-login failed on: %s", (page.url or "")[:140])
             text = (page.inner_text("body") or "").strip()

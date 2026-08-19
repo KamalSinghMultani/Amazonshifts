@@ -115,6 +115,14 @@ GRID_IMAGE_SELECTORS = (
     "[class*='challenge'] img",
 )
 
+# Amazon's human-verification challenge is rendered in a cross-origin AWS WAF
+# iframe. Main-page body text/locators cannot see its contents.
+AWS_WAF_FRAME_URL_MARKERS = (
+    "edge.sdk.awswaf.com",
+    "awswaf.com",
+)
+
+
 GRID_CONFIRM_BUTTONS = (
     "button:has-text('Confirm')",
     "button:has-text('Submit')",
@@ -147,12 +155,49 @@ class StateDetector:
         except Exception:
             return False
     
-    def _get_text(self) -> str:
-        """Get visible page text."""
+    def captcha_frame(self):
+        """Return the live AWS WAF challenge frame when present, otherwise None.
+
+        This is detection/diagnostic plumbing only. It does not solve the
+        challenge.
+        """
         try:
-            return (self.page.inner_text("body") or "").lower()
+            for frame in self.page.frames:
+                url = (frame.url or "").lower()
+                if any(marker in url for marker in AWS_WAF_FRAME_URL_MARKERS):
+                    return frame
+        except Exception as exc:
+            log.debug("could not enumerate frames: %s", exc)
+        return None
+
+    def _frame_text(self, frame: Any) -> str:
+        """Best-effort visible text from a frame."""
+        try:
+            return (frame.locator("body").inner_text() or "").lower()
         except Exception:
             return ""
+
+    def _get_text(self) -> str:
+        """Get visible text from the main document plus the AWS WAF challenge.
+
+        The CAPTCHA wording lives in a separate iframe, so main-document
+        inner_text alone can never see phrases such as "Choose all the ...".
+        """
+        parts = []
+        try:
+            main_text = (self.page.inner_text("body") or "").lower()
+            if main_text:
+                parts.append(main_text)
+        except Exception:
+            pass
+
+        frame = self.captcha_frame()
+        if frame is not None:
+            frame_text = self._frame_text(frame)
+            if frame_text:
+                parts.append(frame_text)
+
+        return "\n".join(parts)
     
     def detect_state(self) -> AuthState:
         """Detect current authentication state from page."""
@@ -189,26 +234,64 @@ class StateDetector:
         return AuthState.UNKNOWN_PAGE
     
     def detect_captcha_type(self) -> CaptchaType:
-        """Detect CAPTCHA type based on structure and text."""
+        """Detect CAPTCHA type based on frame presence, structure and text."""
         text = self._get_text()
-        
-        # Check for image grid CAPTCHA
+        frame = self.captcha_frame()
+
+        # Amazon's human-verification challenge is hosted in an AWS WAF frame.
+        # Classify the observed "choose/select all ..." wording from that frame
+        # directly, rather than looking for tiles on the main document.
+        if frame is not None:
+            frame_text = self._frame_text(frame)
+            challenge_text = frame_text or text
+
+            grid_markers = (
+                "choose all the",
+                "select all",
+                "choose all",
+                "confirm you are human",
+                "verify you are human",
+            )
+
+            if any(marker in challenge_text for marker in grid_markers):
+                # If images are visible, this is positively an image-grid.
+                # Even when the tile markup changes, the known AWS WAF frame
+                # plus the observed grid wording is sufficient to route it as
+                # IMAGE_GRID instead of UNKNOWN.
+                if self._is_image_grid(challenge_text, frame=frame):
+                    return CaptchaType.IMAGE_GRID
+
+                log.info(
+                    "AWS WAF challenge uses image-grid wording but tile markup "
+                    "did not match known selectors; routing as IMAGE_GRID"
+                )
+                return CaptchaType.IMAGE_GRID
+
+            # Known challenge frame, but its exact challenge type is unclear.
+            log.info("AWS WAF challenge frame detected but type is unknown: %s", frame.url)
+            return CaptchaType.UNKNOWN
+
+        # Main-document fallbacks for other challenge implementations.
         if self._is_image_grid(text):
             return CaptchaType.IMAGE_GRID
-        
-        # Check for token CAPTCHA (reCAPTCHA/hCaptcha)
+
         if self._is_token_captcha():
             return CaptchaType.TOKEN
-        
-        # Check for text CAPTCHA
+
         if self._is_text_captcha(text):
             return CaptchaType.TEXT
 
-        if any(m in text for m in ("confirm you are human", "verify you are human",
-                           "choose all the", "select all images", "captcha", "puzzle")):
-            log.warning("challenge wording but no image grid matched — treating as UNKNOWN")
+        if any(m in text for m in (
+            "confirm you are human",
+            "verify you are human",
+            "choose all the",
+            "select all images",
+            "captcha",
+            "puzzle",
+        )):
+            log.warning("challenge wording detected but type could not be classified")
             return CaptchaType.UNKNOWN
-        
+
         return CaptchaType.NONE
     
     def _is_authenticated(self) -> bool:
@@ -318,8 +401,8 @@ class StateDetector:
         """Check if email entry is required."""
         return self._is_visible(EMAIL_INPUT)
     
-    def _is_image_grid(self, text: str) -> bool:
-        """Detect image grid CAPTCHA."""
+    def _is_image_grid(self, text: str, frame: Any = None) -> bool:
+        """Detect an image-grid CAPTCHA in the supplied document/frame."""
         grid_markers = (
             "choose all the",
             "select all",
@@ -327,24 +410,41 @@ class StateDetector:
             "confirm you are human",
             "verify you are human",
         )
-        
+
+        if frame is not None:
+            frame_text = self._frame_text(frame)
+            if frame_text:
+                text = frame_text
+
         if not any(marker in text for marker in grid_markers):
             return False
-        
-        # Count visible grid images
-        visible_images = 0
-        for selector in GRID_IMAGE_SELECTORS:
+
+        root = frame if frame is not None else self.page
+
+        # Use the largest visible count from any selector instead of adding
+        # overlapping selector matches. This avoids counting one tile several
+        # times when it matches multiple CSS selectors.
+        selectors = list(GRID_IMAGE_SELECTORS)
+        if frame is not None:
+            # Once already scoped to the known AWS WAF challenge document,
+            # plain images are a useful fallback if Amazon changes class names.
+            selectors.append("img")
+
+        max_visible = 0
+        for selector in selectors:
             try:
-                elements = self.page.locator(selector)
-                count = elements.count()
-                for i in range(count):
+                elements = root.locator(selector)
+                visible = 0
+                for i in range(elements.count()):
                     if elements.nth(i).is_visible():
-                        visible_images += 1
+                        visible += 1
+                max_visible = max(max_visible, visible)
             except Exception:
                 continue
-        
-        # Grid typically has 9 images (3x3)
-        return visible_images >= 4
+
+        # The observed challenge is a multi-tile grid. Requiring several
+        # images avoids mistaking a logo or decorative image for the grid.
+        return max_visible >= 4
     
     def _is_token_captcha(self) -> bool:
         """Detect reCAPTCHA/hCaptcha."""
@@ -372,8 +472,8 @@ class StateDetector:
 class CaptchaSolver:
     """Clean solver interface - use mock for testing."""
     
-    def solve(self, page: Any, captcha_type: CaptchaType) -> bool:
-        """Solve CAPTCHA challenge. Returns True if solved successfully."""
+    def solve(self, page: Any, captcha_type: CaptchaType, frame: Any = None) -> bool:
+        """Handle CAPTCHA challenge. The frame is supplied when one was detected."""
         raise NotImplementedError
 
 
@@ -383,8 +483,8 @@ class MockCaptchaSolver(CaptchaSolver):
     def __init__(self, should_succeed: bool = True):
         self.should_succeed = should_succeed
     
-    def solve(self, page: Any, captcha_type: CaptchaType) -> bool:
-        log.info(f"Mock solving {captcha_type}")
+    def solve(self, page: Any, captcha_type: CaptchaType, frame: Any = None) -> bool:
+        log.info("Mock solving %s (challenge_frame=%s)", captcha_type, frame is not None)
         if self.should_succeed:
             # Simulate clicking confirm
             time.sleep(0.5)
@@ -404,22 +504,22 @@ class TwoCaptchaSolver(CaptchaSolver):
             log.warning("2captcha-python not installed - using no solver")
             self.solver = None
     
-    def solve(self, page: Any, captcha_type: CaptchaType) -> bool:
+    def solve(self, page: Any, captcha_type: CaptchaType, frame: Any = None) -> bool:
         if not self.solver:
             log.error("2Captcha API key not configured or library not installed")
             return False
         
         if captcha_type == CaptchaType.IMAGE_GRID:
-            return self._solve_image_grid(page)
+            return self._solve_image_grid(page, frame)
         elif captcha_type == CaptchaType.TOKEN:
-            return self._solve_token(page)
+            return self._solve_token(page, frame)
         elif captcha_type == CaptchaType.TEXT:
-            return self._solve_text(page)
+            return self._solve_text(page, frame)
         
         return False
     
-    def _solve_image_grid(self, page: Any) -> bool:
-        """Solve image grid using tile-based approach."""
+    def _solve_image_grid(self, page: Any, frame: Any = None) -> bool:
+        """Image-grid handler placeholder."""
         # TODO: Implement actual 2Captcha image grid solving
         # This would:
         # 1. Screenshot the grid
@@ -429,13 +529,13 @@ class TwoCaptchaSolver(CaptchaSolver):
         log.info("Solving image grid CAPTCHA with 2Captcha")
         return False
     
-    def _solve_token(self, page: Any) -> bool:
-        """Solve token-based CAPTCHA."""
+    def _solve_token(self, page: Any, frame: Any = None) -> bool:
+        """Token-challenge handler placeholder."""
         log.info("Solving token CAPTCHA with 2Captcha")
         return False
     
-    def _solve_text(self, page: Any) -> bool:
-        """Solve text CAPTCHA."""
+    def _solve_text(self, page: Any, frame: Any = None) -> bool:
+        """Text-challenge handler placeholder."""
         log.info("Solving text CAPTCHA with 2Captcha")
         return False
 
@@ -618,25 +718,43 @@ class AuthenticationStateMachine:
             return False
     
     def _solve_captcha(self) -> bool:
-        """Solve CAPTCHA and verify success."""
+        """Route CAPTCHA handling and verify the page actually leaves the challenge."""
         captcha_type = self.detector.detect_captcha_type()
         self._log_transition(f"CAPTCHA_DETECTED:{captcha_type.name}")
-        
-        success = self.solver.solve(self.page, captcha_type)
-        
+
+        challenge_frame = self.detector.captcha_frame()
+        if challenge_frame is not None:
+            log.info("CAPTCHA challenge frame: %s", challenge_frame.url)
+
+        success = self.solver.solve(
+            self.page,
+            captcha_type,
+            frame=challenge_frame,
+        )
+
         if not success:
             self._log_transition("CAPTCHA_FAILED")
             return False
-        
-        # Verify CAPTCHA actually solved
-        self._wait_for_state([AuthState.OTP_SEND_REQUIRED, AuthState.AUTHENTICATED])
-        
-        if self.detector.detect_captcha_type() == CaptchaType.NONE:
-            self._log_transition("CAPTCHA_COMPLETED")
-            return True
-        
-        return False
-    
+
+        # A handler reporting success is not sufficient. Require a real next
+        # authentication state and verify that the challenge is no longer seen.
+        moved_forward = self._wait_for_state([
+            AuthState.OTP_SEND_REQUIRED,
+            AuthState.OTP_ENTRY_REQUIRED,
+            AuthState.AUTHENTICATED,
+        ])
+
+        if not moved_forward:
+            self._log_transition("CAPTCHA_FAILED:NO_STATE_TRANSITION")
+            return False
+
+        if self.detector.detect_captcha_type() != CaptchaType.NONE:
+            self._log_transition("CAPTCHA_FAILED:STILL_PRESENT")
+            return False
+
+        self._log_transition("CAPTCHA_COMPLETED")
+        return True
+
     def _request_otp(self) -> bool:
         """Request OTP and record timestamp."""
         if self.detector._is_visible(SEND_CODE_BUTTON):
@@ -701,22 +819,21 @@ class AuthenticationStateMachine:
         return False
     
     def _wait_for_state(self, expected_states: list = None, timeout_ms: int = 20000) -> bool:
-        """Wait for one of the expected states to appear."""
+        """Wait until the page reaches a recognizable or explicitly expected state."""
         start_time = time.time()
-        
+
         while time.time() - start_time < timeout_ms / 1000:
             self.state = self.detector.detect_state()
-            
+
             if expected_states is None:
-                # Just check if state changed
+                if self.state != AuthState.UNKNOWN_PAGE:
+                    return True
+            elif self.state in expected_states:
                 return True
-            
-            if self.state in expected_states:
-                return True
-            
+
             time.sleep(0.5)
-        
-        log.warning(f"Timeout waiting for states: {expected_states}")
+
+        log.warning("Timeout waiting for states: %s", expected_states)
         return False
     
     def _log_transition(self, transition: str):
