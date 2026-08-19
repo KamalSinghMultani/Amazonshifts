@@ -3351,3 +3351,40 @@ def test_the_expiry_path_respects_the_daily_cap(tmp_path):
             w.relogins_today += 1
             w.try_relogin()
     assert len(attempts) == 2, f"the cap must stop it, got {len(attempts)}"
+
+
+def test_a_challenge_in_an_iframe_is_detected():
+    """The AWS WAF challenge renders in a separate document served from
+    *.edge.sdk.awswaf.com. page.inner_text("body") cannot see a word of it —
+    a screenshot showed "Choose all the hats" while the page text read "Where
+    should we send your verification code?"."""
+    import login_flow
+
+    class Frame:
+        def __init__(self, url):
+            self.url = url
+
+    class PageWithFrames:
+        def __init__(self, urls):
+            self.frames = [Frame(u) for u in urls]
+
+        def locator(self, _sel):
+            class L:
+                @property
+                def first(self_inner):
+                    return self_inner
+
+                def count(self_inner):
+                    return 0
+            return L()
+
+    challenged = PageWithFrames([
+        "https://auth.hiring.amazon.com/#/login",
+        "https://ebcec29959ba.edge.sdk.awswaf.com/ebcec29959ba/challenge",
+    ])
+    assert login_flow.captcha_frame(challenged) is not None
+    assert login_flow.captcha_on_screen(challenged) is True
+
+    clean = PageWithFrames(["https://auth.hiring.amazon.com/#/login"])
+    assert login_flow.captcha_frame(clean) is None
+    assert login_flow.captcha_on_screen(clean) is False

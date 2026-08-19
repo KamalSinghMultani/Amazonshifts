@@ -132,19 +132,51 @@ HUMAN_ONLY_MARKERS = (
     "select each image",
 )
 
-# The AWS WAF challenge renders in its own container regardless of wording,
-# which survives Amazon rephrasing the text.
+# The challenge is AWS WAF's, confirmed from our own request capture:
+#   https://ebcec29959ba.edge.sdk.awswaf.com/<id>/inputs?client=browser
+#   https://ebcec29959ba.edge.sdk.awswaf.com/<id>/mp_verify
+#
+# It renders in a SEPARATE DOCUMENT — an iframe served from that host — which
+# is why page.inner_text("body") cannot see a word of it. A screenshot showed
+# "Let's confirm you are human / Choose all the hats" while the page text
+# read "Where should we send your verification code?". Two documents, one
+# picture.
 CAPTCHA_SELECTORS = (
     "[id*='captcha' i]",
     "[class*='captcha' i]",
     "iframe[src*='captcha' i]",
+    "iframe[src*='awswaf' i]",
     "iframe[title*='challenge' i]",
     "[data-test-id*='captcha' i]",
 )
 
+# Hosts that serve a challenge. Matched against every FRAME's url, not the
+# page's, because the frame is the only place the challenge exists.
+CAPTCHA_FRAME_HOSTS = ("awswaf", "captcha", "recaptcha", "hcaptcha")
+
+
+def captcha_frame(page: Any):
+    """The frame carrying a challenge, or None.
+
+    page.frames includes the main frame and every iframe. A challenge lives in
+    one of the others, so anything reading only the main document is blind to
+    it — which is exactly how a CAPTCHA sat on screen for twenty seconds while
+    the detector reported no CAPTCHA at all.
+    """
+    try:
+        for frame in page.frames:
+            url = (getattr(frame, "url", "") or "").lower()
+            if any(host in url for host in CAPTCHA_FRAME_HOSTS):
+                return frame
+    except Exception as exc:  # noqa: BLE001 - never fatal
+        log.debug("could not enumerate frames: %s", exc)
+    return None
+
 
 def captcha_on_screen(page: Any) -> bool:
     """Structural check, for when the wording changes but the block does not."""
+    if captcha_frame(page) is not None:
+        return True
     for selector in CAPTCHA_SELECTORS:
         try:
             if page.locator(selector).first.count():
