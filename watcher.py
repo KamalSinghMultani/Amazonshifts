@@ -476,7 +476,21 @@ class Watcher:
             "holding will not", age,
         )
         if self.auto_relogin and not self.relogin_tried:
+            # The daily cap applies HERE too. It used to count only scheduled
+            # re-logins, so the expiry-triggered path ran unchecked — twelve
+            # attempts in ninety minutes tonight, after which Amazon began
+            # showing a CAPTCHA on every single one. Repeated logins are how
+            # you teach it to challenge you, and a challenged account holds no
+            # shifts at all.
+            if not self._relogin_budget_left():
+                log.warning(
+                    "not re-logging in: %d attempts already today (cap %d). "
+                    "Log in by hand, or restart to reset the count.",
+                    self.relogins_today, self.max_relogins_per_day,
+                )
+                return False
             self.relogin_tried = True
+            self.relogins_today += 1
             if self.try_relogin():
                 return True
 

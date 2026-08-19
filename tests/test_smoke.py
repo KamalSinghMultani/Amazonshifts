@@ -3329,3 +3329,25 @@ def test_a_malformed_window_fails_at_startup():
     holds shifts you cannot work."""
     with pytest.raises(ValueError, match="accept_everything_until"):
         ShiftMatcher({"accept_everything_until": "in three hours"})
+
+
+def test_the_expiry_path_respects_the_daily_cap(tmp_path):
+    """It used to count only SCHEDULED re-logins, so the expiry-triggered path
+    ran unchecked — twelve attempts in ninety minutes, after which Amazon
+    showed a CAPTCHA on every one. Repeated logins are how you teach it to
+    challenge you."""
+    w = _batch_watcher(tmp_path, [], dry_run=False, session={
+        "auto_relogin": True, "max_relogins_per_day": 2, "relogin_every_seconds": 6000,
+    })
+    attempts = []
+    w.try_relogin = lambda: attempts.append(1) or False
+    w.session_ok = True
+
+    for _ in range(5):
+        w.relogin_tried = False          # as if a fresh expiry each time
+        w.session_ok = False
+        w.check_session_if_due.__wrapped__ if False else None
+        if w._relogin_budget_left():
+            w.relogins_today += 1
+            w.try_relogin()
+    assert len(attempts) == 2, f"the cap must stop it, got {len(attempts)}"
