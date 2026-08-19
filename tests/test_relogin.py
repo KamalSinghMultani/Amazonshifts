@@ -415,3 +415,34 @@ def test_the_login_sets_the_country_context_first():
         f"the country site must be loaded before the auth domain, got {visited[0]}"
     )
     assert any("auth.hiring.amazon" in url for url in visited)
+
+
+def test_the_country_comes_from_the_site_being_watched():
+    """THE bug that kept the Canadian session dead for 26 hours. The country
+    was read from self.page.url at the moment the form was filled — and by
+    then the page is always auth.hiring.amazon.COM, so the lookup returned
+    "United States" every time. Every re-login signed in to the American site
+    while the watcher polled the Canadian one."""
+    import relogin as module
+
+    machine = module.AuthenticationStateMachine.__new__(module.AuthenticationStateMachine)
+    assert machine._country_for("https://hiring.amazon.ca") == "Canada"
+    assert machine._country_for("https://hiring.amazon.com") == "United States"
+
+    # The trap: the auth domain is .com whichever country you are logging in to
+    assert machine._country_for("https://auth.hiring.amazon.com/#/login") == "United States"
+
+
+def test_the_run_fixes_the_country_before_touching_the_login_page():
+    import inspect
+
+    import relogin as module
+
+    source = inspect.getsource(module.AuthenticationStateMachine.run)
+    assert "self.country = self._country_for(base_url)" in source, (
+        "the country must be decided from base_url at the start of the run"
+    )
+    submit = inspect.getsource(module.AuthenticationStateMachine._submit_email)
+    assert "self._country_for(self.page.url)" not in submit.split("getattr")[0], (
+        "the country must not be re-derived from the current page"
+    )

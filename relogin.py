@@ -453,10 +453,20 @@ class AuthenticationStateMachine:
         self.detector = StateDetector(page)
         self.state = AuthState.LOGIN_PAGE
         self.otp_requested_at = None
+        self.country = "Canada"
     
     def run(self, base_url: str) -> AuthState:
         """Run authentication until reaching a terminal state."""
         self._log_transition("AUTH_START")
+
+        # Decide the country ONCE, from the site we are watching. It used to be
+        # read off self.page.url at the moment the form was filled — by which
+        # point the page is always auth.hiring.amazon.COM, so the lookup
+        # returned "United States" every single time and every re-login signed
+        # in to the American site. The Canadian session stayed dead for 26
+        # hours while the login itself looked perfectly healthy.
+        self.country = self._country_for(base_url)
+        log.info("logging in as %s (from %s)", self.country, base_url)
 
         # Load the COUNTRY site first. auth.hiring.amazon.com serves both
         # countries and, arrived at cold, returns you to the US site — the
@@ -550,8 +560,9 @@ class AuthenticationStateMachine:
             return False
         
         try:
-            # Select country first
-            country = self._country_for(self.page.url)
+            # The country decided at the start of the run, NOT the URL of the
+            # page we happen to be on — that is always the .com auth domain.
+            country = getattr(self, "country", None) or self._country_for(self.page.url)
             if not self._select_country(country):
                 log.warning("Could not select country, continuing anyway")
             
