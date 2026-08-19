@@ -1,0 +1,200 @@
+"""Browser launching, shared by save_session.py, api_sniffer.py and watcher.py.
+
+Why this module exists: Amazon's login flow detects automated browsers. The
+usual symptom is that everything works until the OTP step, and then the
+"send verification code" step silently refuses — no error, it just never
+completes. Playwright's bundled Chromium is trivially detectable:
+
+  * it sets `navigator.webdriver = true`
+  * it launches with `--enable-automation`, which also shows the
+    "Chrome is being controlled by automated test software" banner
+  * a fresh context has no history, no profile, and no device trust, so every
+    login looks like a brand new device worth challenging
+
+Three settings in config.yaml address that, in rough order of effectiveness:
+
+  browser.channel        drive your REAL installed Chrome instead of the
+                         bundled Chromium
+  browser.user_data_dir  keep a persistent profile, so Amazon remembers the
+                         device and stops re-challenging on every login
+  browser.stealth        drop the automation flags and the webdriver property
+
+None of this defeats a CAPTCHA or logs in for you — you still type your own
+password and OTP by hand. It stops a legitimate manual login from being
+misread as a bot.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# Removing this arg also removes the "controlled by automated test software"
+# infobar, which is itself a detection signal.
+STEALTH_ARGS = ["--disable-blink-features=AutomationControlled"]
+STEALTH_IGNORE_ARGS = ["--enable-automation"]
+
+# navigator.webdriver is the single most-checked automation tell.
+STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+"""
+
+
+def resolve_user_agent(playwright, browser_cfg: dict, headless: bool) -> str | None:
+    """Return a user agent that does not advertise headless Chrome.
+
+    Headless Chrome puts "HeadlessChrome" in both `navigator.userAgent` AND the
+    User-Agent request header. Amazon's CloudFront WAF blocks on it — you get a
+    "403 ERROR / Request blocked" page instead of the site. Overriding
+    navigator.userAgent from JS is not enough, because the header is what the
+    CDN actually inspects, so the UA has to be set on the context itself.
+
+    We probe the real browser for its UA rather than hardcoding a version, so
+    this keeps working as Chrome updates. Returns None when no override is
+    needed (headed mode already reports a normal UA).
+    """
+    explicit = browser_cfg.get("user_agent")
+    if explicit:
+        return explicit
+    if not headless:
+        return None
+
+    probe_kwargs: dict = {"headless": True}
+    if browser_cfg.get("channel"):
+        probe_kwargs["channel"] = browser_cfg["channel"]
+    if browser_cfg.get("executable_path"):
+        probe_kwargs["executable_path"] = browser_cfg["executable_path"]
+
+    browser = None
+    try:
+        browser = playwright.chromium.launch(**probe_kwargs)
+        user_agent = browser.new_page().evaluate("() => navigator.userAgent")
+    except Exception as exc:  # noqa: BLE001 - probing is best effort
+        log.warning("could not probe the browser user agent: %s", exc)
+        return None
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if "Headless" not in user_agent:
+        return None
+    fixed = user_agent.replace("HeadlessChrome", "Chrome")
+    log.info("overriding headless user agent so CloudFront does not block us")
+    return fixed
+
+
+def launch_context(
+    playwright,
+    browser_cfg: dict,
+    *,
+    headless: bool | None = None,
+    storage_state: str | None = None,
+):
+    """Launch a browser and return (browser, context).
+
+    `browser` is None when a persistent profile is used — in that case the
+    context owns the browser process. Always close with `close_context()`
+    rather than assuming one or the other.
+    """
+    if headless is None:
+        headless = bool(browser_cfg.get("headless", True))
+
+    stealth = bool(browser_cfg.get("stealth", True))
+    channel = browser_cfg.get("channel") or None
+    executable_path = browser_cfg.get("executable_path") or None
+    user_data_dir = browser_cfg.get("user_data_dir") or None
+
+    launch_kwargs: dict = {"headless": headless}
+    if channel:
+        launch_kwargs["channel"] = channel
+    if executable_path:
+        launch_kwargs["executable_path"] = executable_path
+    if stealth:
+        launch_kwargs["args"] = list(STEALTH_ARGS)
+        launch_kwargs["ignore_default_args"] = list(STEALTH_IGNORE_ARGS)
+
+    context_kwargs = {
+        "user_agent": resolve_user_agent(playwright, browser_cfg, headless),
+        "locale": browser_cfg.get("locale") or None,
+        "timezone_id": browser_cfg.get("timezone") or None,
+    }
+
+    if user_data_dir:
+        # A persistent profile keeps cookies, localStorage and Amazon's device
+        # trust between runs. storage_state is meaningless here — the profile
+        # on disk IS the state.
+        profile = Path(user_data_dir)
+        profile.mkdir(parents=True, exist_ok=True)
+        log.info("using persistent browser profile at %s", profile)
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                str(profile), **launch_kwargs, **context_kwargs
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised, just intelligibly
+            if looks_like_profile_in_use(str(exc)):
+                raise ProfileInUse(
+                    f"the browser profile {profile} is already open in another "
+                    "process — almost always the watcher itself.\n"
+                    "Stop it first, then run this again:\n"
+                    "    Stop-ScheduledTask -TaskName AmazonShiftWatcher\n"
+                    "    (or press Ctrl-C in the run_watcher.bat window)\n"
+                    "Only one process at a time can use a Chrome profile."
+                ) from exc
+            raise
+        browser = None
+    else:
+        browser = playwright.chromium.launch(**launch_kwargs)
+        context = browser.new_context(storage_state=storage_state, **context_kwargs)
+
+    if stealth:
+        context.add_init_script(STEALTH_SCRIPT)
+
+    return browser, context
+
+
+
+class ProfileInUse(RuntimeError):
+    """Another process already has this browser profile open.
+
+    Chrome allows exactly one process per profile directory and exits with
+    code 21 when a second tries. Playwright surfaces that as a TargetClosedError
+    with sixty lines of launch flags, which reads like a Playwright bug and
+    sends you debugging the wrong thing. It is almost always just the watcher
+    already running.
+    """
+
+
+# Signatures of "profile is locked" inside Playwright's launch error text.
+PROFILE_IN_USE_MARKERS = ("exitcode=21", "process singleton", "profile appears to be in use")
+
+
+def looks_like_profile_in_use(error_text: str) -> bool:
+    low = (error_text or "").lower()
+    if any(marker in low for marker in PROFILE_IN_USE_MARKERS):
+        return True
+    # The generic close error only means this when a persistent profile was
+    # involved, which the caller establishes before asking.
+    return "target page, context or browser has been closed" in low
+
+def close_context(browser, context) -> None:
+    """Close whichever of the two actually owns the browser process."""
+    try:
+        if browser is not None:
+            browser.close()
+        else:
+            context.close()
+    except Exception as exc:  # noqa: BLE001 - shutdown must not raise
+        log.debug("error while closing browser: %s", exc)
+
+
+def describe(browser_cfg: dict) -> str:
+    """One-line summary of how the browser will be launched, for logging."""
+    channel = browser_cfg.get("channel") or "bundled chromium"
+    profile = browser_cfg.get("user_data_dir") or "fresh context"
+    stealth = "stealth on" if browser_cfg.get("stealth", True) else "stealth off"
+    return f"{channel}, {profile}, {stealth}"

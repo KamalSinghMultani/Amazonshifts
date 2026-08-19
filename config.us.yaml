@@ -1,0 +1,132 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# US config — for testing the code and the workflow, NOT for getting shifts.
+#
+#     python save_session.py --config config.us.yaml   # log in once
+#     python watcher.py --config config.us.yaml --once
+#
+# Why this exists: hiring.amazon.ca is empty most of the time, so there is
+# often nothing in Canada to test against. hiring.amazon.com runs the same
+# frontend and the same auth service and always has jobs, which makes it the
+# only place the whole path — detect, rank, alert, hold — can actually be
+# exercised on demand.
+#
+# `extends` pulls in everything from config.yaml, so only the differences live
+# here and the two cannot drift apart.
+extends: "config.yaml"
+
+# ⚠️ EVERYTHING BELOW IS DELIBERATELY SEPARATE FROM THE CANADIAN SETUP.
+# Session, dedup state, detection log and logs all use their own paths, so a
+# test run can never mark a Canadian shift as already-seen, overwrite the
+# Canadian login, or pollute the drop-time data that --drop-report reads.
+
+site:
+  base_url: "https://hiring.amazon.com"
+  job_search_url: "https://hiring.amazon.com/app#/jobSearch"
+
+browser:
+  # Its own login and its own profile. The US portal is a separate hiring
+  # account from the Canadian one, and mixing them in one profile is how you
+  # end up debugging the wrong session at 6am.
+  storage_state: "auth_state.us.json"
+  user_data_dir: "browser_profile_us"
+
+api:
+  endpoint_url: "https://hiring.amazon.com/graphql"
+  url_template: "https://hiring.amazon.com/app#/jobDetail?jobId={id}"
+  extra_headers:
+    country: "United States"
+    iscanary: "false"
+    origin: "https://hiring.amazon.com"
+    referer: "https://hiring.amazon.com/app"
+  payload:
+    operationName: "searchJobCardsByLocation"
+    variables:
+      searchJobRequest:
+        locale: "en-US"
+        country: "United States"
+        keyWords: ""
+        equalFilters: []
+        containFilters:
+          - key: "isPrivateSchedule"
+            val: ["false"]
+        rangeFilters: []
+        orFilters: []
+        dateFilters: []
+        sorters: []
+        pageSize: 100
+        consolidateSchedule: true
+    query: |
+      query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+        searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+          nextToken
+          jobCards {
+            jobId
+            jobTitle
+            locationName
+            city
+            state
+            jobType
+            employmentType
+            totalPayRateMin
+            totalPayRateMax
+            scheduleCount
+            __typename
+          }
+          __typename
+        }
+      }
+
+# Wide open on purpose: the point is to exercise the code, not to find a
+# commutable shift. The GTA filters in config.yaml would match nothing here.
+filters:
+  include_titles:
+    - "warehouse"
+    - "fulfillment"
+  exclude_titles: []
+  include_locations: []
+  exclude_locations: []
+  include_schedules: []
+  exclude_schedules: []
+  min_pay_rate: null
+
+priority:
+  order: ["title", "location", "pay"]
+  titles:
+    - "fulfillment center warehouse associate"
+  locations: []
+  demote_titles:
+    - "delivery"
+
+# Its own dedup set and detection log. Sharing them with Canada would make
+# --drop-report describe US posting times, which is worse than useless — it
+# would set your hot_windows to the wrong hours.
+state:
+  path: "state/seen_shifts.us.json"
+  detections_path: "state/detections.us.jsonl"
+  ttl_hours: 6
+
+logging:
+  path: "logs/watcher.us.log"
+
+# The US site always has ~100 matching jobs, so an unfiltered test run would
+# fire a hundred alerts. One is enough to prove the path works.
+notifications:
+  max_alerts_per_poll: 1
+  notify_on_start: false
+
+# SAFE BY DEFAULT, same as Canada: a test run detects and alerts, and clicks
+# nothing. Set dry_run: false (and stop_before_submit: false to press Create
+# Application) only for a deliberate end-to-end test — and remember it starts
+# a REAL application on your account that you then have to withdraw.
+dry_run: true
+hold:
+  enabled: true
+  stop_before_submit: true
+  max_per_poll: 1
+
+# Never, in the testing environment. `extends` would otherwise inherit this
+# from config.yaml, and a test run signing itself into the shared Amazon
+# account is exactly the interference the two-environment split exists to
+# prevent. Real re-logins belong to the Canadian watcher alone.
+session:
+  auto_relogin: false

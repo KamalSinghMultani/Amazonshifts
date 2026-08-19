@@ -1,0 +1,465 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Amazon Shift Auto-Applier — configuration
+#
+# Safe by default. Leave dry_run: true until you have watched it run for a
+# while and trust what it is doing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# When true: detect + alert + log only. No clicking, ever.
+# When false: it clicks through and — with hold.stop_before_submit: false —
+# presses Create Application, which reserves the shift for ~3 hours.
+#
+# LIVE as of 2026-08-17: signed in and holding enabled. Set back to true for
+# alert-only.
+dry_run: false
+
+site:
+  base_url: "https://hiring.amazon.ca"
+  # The page the watcher reloads in `dom` mode, and opens in `api` mode only
+  # once a match is found.
+  job_search_url: "https://hiring.amazon.ca/app#/jobSearch"
+
+polling:
+  # api = hit the site's own JSON endpoint directly  <- default, and much faster
+  # dom = reload the page and scrape rendered HTML   <- fallback if the API moves
+  #
+  # Measured side by side on the live site, 2026-08-17:
+  #     dom  5,697–6,127 ms/poll, 25 jobs
+  #     api    234–769 ms/poll,   99 jobs
+  # dom's 25 is one rendered page of results, not the whole listing — so dom
+  # was never seeing three quarters of the jobs. api also returns Amazon's real
+  # jobId, which makes dedup exact.
+  mode: api
+
+  # ⚠️ Amazon fronts this site with a CloudFront WAF that WILL block you.
+  # Measured: three full page loads about 14s apart returned "403 ERROR /
+  # Request blocked" on the third. A blocked watcher finds nothing at all, so
+  # a block costs far more than a slow poll ever does.
+  #
+  # These values are tuned for `api` mode, where a poll is one small JSON
+  # request rather than a page load with every asset.
+  #
+  # MEASURED 2026-08-17 against the live CA endpoint: 60 consecutive polls
+  # stepping 8s -> 5s -> 3s -> 2s apart drew no 429, no 403 and no WAF page,
+  # at a median of 132ms per poll. 5s is therefore comfortably inside what
+  # the endpoint tolerates, not a guess.
+  #
+  # Why this matters: a Concord posting was picked by a competing service at
+  # 21:44 and never appeared in eight consecutive polls either side of it.
+  # Postings can be gone in seconds, so the gap between polls is the gap
+  # through which shifts disappear.
+  #
+  # ⚠️ IF YOU SWITCH BACK TO dom MODE, raise this to 45 first — a dom poll is
+  # a full page load, and 14s between those already earned a 403.
+  interval_seconds: 2
+  # Random 0..jitter_seconds added to each interval so the traffic pattern
+  # is not a metronome.
+  jitter_seconds: 0
+
+  # ── Hot mode ────────────────────────────────────────────────────────────
+  # Amazon posts shifts in BATCHES: the moment one appears, the next is
+  # usually seconds away rather than minutes. A flat interval sleeps through
+  # exactly the window that matters. Hot mode polls fast during it and
+  # relaxes afterwards, so you get low latency without hammering the site
+  # all day.
+  #
+  # Two triggers, either is enough:
+  #   * a match just happened     -> hot for hot_duration_seconds
+  #   * the clock is in a window  -> hot for as long as the window lasts
+  hot_interval_seconds: 2
+  hot_duration_seconds: 120
+
+  # Times of day that are ALWAYS hot, in your local time. May wrap midnight
+  # ("22:00-02:00"). A malformed entry fails at startup rather than silently
+  # never opening.
+  #
+  # Don't guess these — measure them. Run in dry run for a few days, then:
+  #     python watcher.py --drop-report
+  # and paste what it suggests.
+  hot_windows: []
+  # hot_windows: ["06:00-08:00", "09:00-10:00"]
+
+  # ⚠️ In dom mode a poll is a full page load, and 14s between page loads has
+  # already earned a CloudFront 403 here — so hot_interval_seconds below 20
+  # warns at startup. Configure `api` mode before polling faster than that:
+  # one JSON request is far lighter than a page load, and it is the only
+  # honest way to get down to single-digit seconds.
+
+  # The site is a React SPA — scraping immediately after domcontentloaded
+  # finds an empty shell. This is how long to wait for it to render.
+  render_wait_ms: 5000
+
+  # Circuit breaker: after this many consecutive failures, sleep for
+  # cooldown_seconds before trying again. A WAF block counts as a failure,
+  # so repeated blocks make the watcher back off rather than dig in.
+  max_consecutive_errors: 5
+  cooldown_seconds: 300
+
+browser:
+  headless: true
+  # Written by save_session.py. Contains your logged-in cookies — gitignored.
+  storage_state: "auth_state.json"
+  nav_timeout_ms: 30000
+  action_timeout_ms: 10000
+  # null = use Playwright's default. Set a string to override.
+  user_agent: null
+  locale: "en-CA"
+  timezone: "America/Toronto"
+  # null = use the Chromium that `playwright install` downloaded. Set a path
+  # only if you need a specific browser binary.
+  executable_path: null
+
+  # ── Getting past Amazon's bot detection at login ──────────────────────────
+  # If login stalls at the "send verification code" step, these are the fix.
+  # See browser_launch.py for why.
+
+  # "chrome" or "msedge" drives your REAL installed browser instead of the
+  # Chromium Playwright downloads. This is the single most effective setting —
+  # try it first if login is being refused.
+  channel: "chrome"
+
+  # Persistent profile directory. Amazon remembers the device between runs, so
+  # it stops re-challenging you on every login, and the session lasts longer.
+  # Set to null to use a fresh throwaway context each time.
+  # NOTE: this directory holds your logged-in session — it is gitignored, and
+  # should be treated as sensitive as auth_state.json.
+  user_data_dir: "browser_profile"
+
+  # Drop the automation flags and hide navigator.webdriver.
+  stealth: true
+
+# ── api mode ────────────────────────────────────────────────────────────────
+# CONFIRMED live 2026-08-17 against the same frontend. Measured side by side:
+#
+#     dom:  5,697–6,127 ms per poll,  25 jobs
+#     api:    501–769 ms per poll,    99 jobs   <- 10x faster, 4x the coverage
+#
+# The 25 was never the truth: it is one rendered page of results. The API also
+# returns Amazon's real jobId, which makes dedup exact instead of a hash of
+# title+location that collides between two openings at the same warehouse.
+#
+# Re-discover any of this with: python api_sniffer.py --seconds 20 --headless
+api:
+  endpoint_url: "https://hiring.amazon.ca/graphql"
+  method: "POST"
+
+  # The site's own query, trimmed to the fields we use — a smaller response is
+  # a faster one. pageSize 100 is what the site itself asks for.
+  payload:
+    operationName: "searchJobCardsByLocation"
+    variables:
+      searchJobRequest:
+        locale: "en-CA"
+        country: "Canada"
+        keyWords: ""
+        equalFilters: []
+        containFilters:
+          - key: "isPrivateSchedule"
+            val: ["false"]
+        rangeFilters: []
+        orFilters: []
+        # No dateFilters on purpose: the site pins today's date here, which
+        # would silently rot in a config file at the next midnight.
+        dateFilters: []
+        sorters: []
+        pageSize: 100
+        consolidateSchedule: true
+    query: |
+      query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+        searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+          nextToken
+          jobCards {
+            jobId
+            jobTitle
+            locationName
+            city
+            state
+            jobType
+            employmentType
+            totalPayRateMin
+            totalPayRateMax
+            scheduleCount
+            __typename
+          }
+          __typename
+        }
+      }
+
+  # Dotted path into the JSON response where the list of shifts lives.
+  # Supports list indexes: "data.results.0.jobCards"
+  shifts_path: "data.searchJobCardsByLocation.jobCards"
+
+  # Maps our Shift fields <- keys in each item of that list.
+  # `schedule` is jobType (PART_TIME / FULL_TIME); employmentType carries
+  # Regular vs Seasonal and is still in Shift.raw if you want to filter on it.
+  field_map:
+    id: "jobId"
+    title: "jobTitle"
+    location: "locationName"
+    schedule: "jobType"
+    pay_rate: "totalPayRateMin"
+    url: null
+
+  # If the API only gives an id, build the URL from it. {id} is substituted.
+  url_template: "https://hiring.amazon.ca/app#/jobDetail?jobId={id}"
+
+  extra_headers:
+    country: "Canada"
+    iscanary: "false"
+    origin: "https://hiring.amazon.ca"
+    referer: "https://hiring.amazon.ca/app"
+
+  # ── the authorization token ───────────────────────────────────────────────
+  # Measured: this endpoint returns 401 with cookies alone. The token is minted
+  # by the page's JavaScript and rotates, so a value pasted here would work for
+  # a while and then silently start 401ing — which looks exactly like "no
+  # shifts today".
+  #
+  # So we never store one. With auth_from_page the watcher keeps a page open,
+  # reads the token the page itself is using, and on a 401 reloads once to mint
+  # a fresh one and retries the poll. Nothing to paste, nothing to expire.
+  auth_from_page: true
+  auth_header: "authorization"
+  auth_storage_key: "sessionToken"
+
+# ── What counts as a shift you want ─────────────────────────────────────────
+# All string matching is case-insensitive substring matching.
+# Empty include_* list = "anything passes".
+filters:
+  # Anything warehouse. "Delivery Station Warehouse Associate" contains
+  # "warehouse", so delivery roles DO pass the filter — they are wanted, just
+  # wanted least. That is handled by priority below, not by excluding them.
+  include_titles:
+    - "warehouse"
+    - "fulfillment"
+    - "sortation"
+    - "sort center"
+  exclude_titles: []
+
+  # Brampton, Mississauga, Toronto, Oakville, and the sites within ~30km of
+  # Brampton. Matching is substring, so "toronto" also catches "Toronto, ON".
+  # The GTA — roughly a 30km radius from Toronto. Amazon labels sites by
+  # district as often as by city ("Etobicoke, ON", "North York, ON"), so the
+  # districts are listed individually; matching "toronto" alone would miss
+  # them.
+  include_locations:
+    # Toronto and its districts
+    - "toronto"
+    - "etobicoke"
+    - "scarborough"
+    - "north york"
+    - "east york"
+    - "rexdale"
+    - "downsview"
+    # Peel
+    - "brampton"
+    - "mississauga"
+    - "malton"
+    - "bolton"
+    - "caledon"
+    # York
+    - "vaughan"
+    - "woodbridge"
+    - "concord"
+    - "maple"
+    - "thornhill"
+    - "markham"
+    - "richmond hill"
+    - "kleinburg"
+    # Halton
+    - "oakville"
+    - "milton"
+    - "georgetown"
+    - "halton hills"
+    - "norval"
+    # Durham — the eastern edge of the radius
+    - "pickering"
+    - "ajax"
+
+  # Substring matching is blunt: "maple" would also match "Maple Ridge, BC".
+  # Excluding the other provinces costs nothing and stops a 3,000km commute
+  # from ever reaching your phone. Harmless if the site omits the province.
+  exclude_locations:
+    - ", bc"
+    - ", ab"
+    - ", qc"
+    - ", mb"
+    - ", sk"
+    - ", ns"
+    - ", nb"
+    - ", nl"
+    - ", pe"
+    - ", yt"
+    - ", nt"
+    - ", nu"
+
+  # The API only exposes PART_TIME / FULL_TIME / FLEX_TIME here. Actual shift
+  # times live on the job detail page, so they cannot be filtered before the
+  # alert goes out.
+  include_schedules: []
+  exclude_schedules: []
+
+  # ── Amazon's own preference model ─────────────────────────────────────────
+  # Its onboarding asks for warehouse type and shift type separately, and both
+  # start with every box ticked. Empty here means the same: take anything.
+  #
+  # warehouse_types: delivery station, fulfillment centre, sortation centre,
+  #                  xl warehouse
+  # All four are the same associate job in different buildings — Delivery
+  # Station needs no licence, it is only a different place to commute to.
+  warehouse_types: []
+  # shift_types: full time, part time, flex time, reduced time
+  shift_types: []
+
+  # No pay filter: these all pay about the same, so a threshold would only
+  # ever risk silently dropping a shift you wanted.
+  min_pay_rate: null
+
+  # ⚠️ TEST WINDOW — every posting in Canada matches while this is in the
+  # future, Ottawa and Nisku and Dartmouth included. It exists to prove the
+  # hold path on a real posting, and it EXPIRES BY ITSELF at the time below.
+  # Nothing to remember to switch off; delete the line or set it to null to
+  # end it sooner. Anything held during it is a real application to withdraw.
+  accept_everything_until: "2026-08-19T02:07"
+
+# ── Which one do you want MOST? ─────────────────────────────────────────────
+# Filters decide what is acceptable. This decides the order, which matters
+# because a whole batch can land in one poll and only the front of the list is
+# alerted individually and held (see notifications.max_alerts_per_poll and
+# hold.max_per_poll).
+#
+# `order` is the tie-break sequence. With location first, the shortest commute
+# wins and the role only breaks ties within a city — so a Delivery job in
+# Brampton outranks a Fulfillment job in Toronto.
+priority:
+  order: ["location", "title", "pay"]
+
+  # Earlier = more wanted. Anything unlisted ranks after everything listed.
+  locations:
+    - "brampton"
+    - "mississauga"
+    - "toronto"
+
+  titles:
+    - "fulfillment center warehouse associate"
+    - "fulfillment"
+
+  # Nothing is demoted. "Delivery Station Warehouse Associate" was down here
+  # on the assumption it involved driving; it does not — it is the same
+  # associate job in a different building type, and no licence is required.
+  # Amazon's own onboarding treats Delivery Station as one warehouse type
+  # among four, not as a lesser role.
+  demote_titles: []
+
+notifications:
+  telegram:
+    enabled: true
+    # Attach a screenshot of the held shift (dom mode / after hold only).
+    screenshot: true
+  notify_on_start: true
+  notify_on_error: true
+
+  # An unfiltered poll can match a hundred jobs at once. Telegram rate-limits
+  # a single chat, so a hundred pings would arrive slowly, out of order, and
+  # bury the one that mattered. Past this many, the rest become one summary
+  # line. Matches are sorted by pay, so the ones you hear about are the best
+  # paying ones. Set to null to send every match.
+  max_alerts_per_poll: 8
+
+hold:
+  direct_apply: true
+  # Click through to hold the slot once a match is found.
+  # Ignored entirely when dry_run is true.
+  enabled: true
+  # You only need to win ONE shift. If a batch lands in a single poll, hold
+  # this many (the best paying first) and merely alert on the rest — holding
+  # a whole batch would race itself and multiply the clicks.
+  max_per_poll: 1
+
+  # ── The one click that commits you ────────────────────────────────────────
+  # CONFIRMED live: the shift is reserved only when "Create Application" is
+  # pressed on the consent screen. That screen declares you are 18+, willing
+  # to take a drug test, and agree to the data policy. Pressing it produces:
+  #
+  #   "We are holding a spot for you for the next 2 hours and 59 minutes to
+  #    complete the remaining steps."        (then Step 1 of 7)
+  #
+  # true  = walk up to that screen, screenshot it, alert you, press NOTHING.
+  #         Safe, commits you to nothing — but THE SPOT IS NOT HELD, and
+  #         somebody else can still take it while you get to your phone.
+  #
+  # false = also press Create Application, so the spot is genuinely held for
+  #         ~3 hours and you finish the 7 remaining steps whenever you can.
+  #         This is what you want if the point is to win the shift.
+  #
+  # Either way the watcher never fills in the application itself: the
+  # remaining steps involve your personal details and consents, and it stops
+  # as soon as the spot is secured.
+  stop_before_submit: false
+
+# ── Session watch ───────────────────────────────────────────────────────────
+# MEASURED 2026-08-17: the hiring-portal session signed itself out after about
+# two hours, while job search kept working perfectly. That is the dangerous
+# failure — the watcher looks healthy, detects shifts, alerts you, and cannot
+# hold a single one.
+#
+# So it checks periodically and tells you. Loading /application/ doubles as a
+# keepalive, since it is an idle session that expires, and it is the same page
+# the hold flow needs anyway.
+session:
+  # 5 minutes. This is the closest thing we have to the "stay logged in"
+  # trick: a session that is used does not go idle, and idle is what expires.
+  # Each pass loads /application/ (proving the session) and reloads the job
+  # page (renewing the SPA's access token, which otherwise sits untouched for
+  # hours while api mode polls around it).
+  check_every_seconds: 300
+  keepalive: true
+  # One alert per expiry, not one per check — an hourly nag is one you learn
+  # to ignore. You also get a message when the session comes back.
+  alert_on_expiry: true
+
+  # OPT-IN: try to sign back in automatically when the session dies.
+  #
+  # Off by default on purpose. Everything else here is built so that no code
+  # path ever reads your password; turning this on trades that for surviving a
+  # 3am expiry unattended, which is the one thing the paid services have that
+  # this does not (they hold their customers' credentials outright).
+  #
+  # Needs AMAZON_LOGIN_EMAIL and AMAZON_LOGIN_PIN in .env (the hiring
+  # portal uses a 6-digit PIN, not a password).
+  # Attempts ONCE per expiry, and stops if Amazon asks for a verification
+  # code — repeated failed logins are how accounts get locked. A persistent
+  # profile usually avoids the challenge, since the machine is already trusted.
+  # ON as of 2026-08-17. Inert until AMAZON_LOGIN_EMAIL and
+  # AMAZON_LOGIN_PIN are set in .env — it warns rather than pretending.
+  auto_relogin: true
+
+  # ── Sign in BEFORE the session dies ─────────────────────────────────────
+  # The competing service's own FAQ: "To stay active, the bot auto-logs in
+  # every 2 hours." They do not keep sessions alive — they replace them. Our
+  # own measurements agree ~2h is the ceiling, so 100 minutes lands inside it
+  # with room for a slow attempt.
+  #
+  # Set to 0 to go back to re-logging in only once an expiry has been noticed,
+  # which leaves every shift dropping in the gap unholdable.
+  relogin_every_seconds: 6000
+  # A 100-minute cycle needs ~15 sign-ins a day. This cap is for the case where
+  # they are all FAILING: something is rejecting them, and hammering the
+  # account is how a recoverable problem becomes a flagged one.
+  max_relogins_per_day: 12
+
+state:
+  path: "state/seen_shifts.json"
+  # Forget a shift id after this long, so a genuinely re-posted shift
+  # can alert again.
+  ttl_hours: 72
+  # Append-only log of every detection. This is what --drop-report reads to
+  # tell you when shifts actually drop. Writing it is best-effort: analytics
+  # can never break detection.
+  detections_path: "state/detections.jsonl"
+
+logging:
+  level: "INFO"
+  path: "logs/watcher.log"
+  max_bytes: 2000000
+  backup_count: 3
