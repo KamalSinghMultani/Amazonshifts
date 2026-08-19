@@ -549,6 +549,20 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
     """
     dismissed: list[str] = []
 
+    # Fast path. In the common case nothing is covering the page — the consent
+    # was accepted once in save_session.py and persists in the profile — and
+    # the hold is the one place where a wasted half-second is a lost shift.
+    try:
+        if not _backdrop_visible(page):
+            if not any(
+                page.locator(selector).first.count()
+                and page.locator(selector).first.is_visible()
+                for _label, selector in OVERLAY_DISMISSERS
+            ):
+                return dismissed
+    except Exception as exc:  # noqa: BLE001 - fall through to the full sweep
+        log.debug("overlay fast path failed: %s", exc)
+
     for _ in range(rounds):
         acted = False
         for label, selector in OVERLAY_DISMISSERS:
@@ -559,7 +573,7 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
                 item.click(timeout=timeout_ms)
                 dismissed.append(label)
                 acted = True
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(250)
             except Exception as exc:  # noqa: BLE001 - absence is the normal case
                 log.debug("could not dismiss %s: %s", label, exc)
 
@@ -571,7 +585,7 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
             try:
                 page.keyboard.press("Escape")
                 dismissed.append("escape")
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(250)
             except Exception as exc:  # noqa: BLE001
                 log.debug("escape failed: %s", exc)
             if _backdrop_visible(page):
@@ -614,8 +628,8 @@ def _hold_confirmation(page: Any, timeout_ms: int = 10000) -> str:
                 return found
         except Exception as exc:  # noqa: BLE001 - page may still be navigating
             log.debug("could not read the holding banner: %s", exc)
-        page.wait_for_timeout(1000)
-        waited += 1000
+        page.wait_for_timeout(250)
+        waited += 250
     return ""
 
 

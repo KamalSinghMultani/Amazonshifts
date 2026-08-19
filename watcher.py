@@ -977,7 +977,9 @@ class Watcher:
             try:
                 page.goto(shift.url or self.cfg["site"]["job_search_url"],
                           wait_until="domcontentloaded")
-                page.wait_for_timeout(1500)
+                # Back at the flyout for the next schedule. 800ms is enough
+                # for it to re-render; the posting may not survive 1500.
+                page.wait_for_timeout(800)
             except PlaywrightError as exc:
                 log.warning("could not return to the listing: %s", exc)
                 break

@@ -3212,3 +3212,67 @@ def test_the_authorize_probe_is_not_used_for_any_decision():
         stripped = line.strip()
         if stripped.startswith(("if ", "elif ", "while ")) and "status" in stripped:
             assert "probe" not in stripped, stripped
+
+
+def test_overlay_dismissal_leaves_immediately_when_nothing_covers_the_page():
+    """The hold is the one place a wasted half-second is a lost shift, and the
+    common case is no modal at all — consent was accepted once in
+    save_session.py and persists in the profile."""
+    checked = []
+
+    class CleanPage:
+        def locator(self, selector):
+            checked.append(selector)
+
+            class L:
+                @property
+                def first(self_inner):
+                    return self_inner
+
+                def count(self_inner):
+                    return 0
+
+                def is_visible(self_inner):
+                    return False
+
+            return L()
+
+        def wait_for_timeout(self, ms):
+            raise AssertionError(f"should not have waited {ms}ms with no overlay")
+
+    assert site_selectors.dismiss_overlays(CleanPage()) == []
+
+
+def test_overlay_dismissal_still_closes_a_real_modal():
+    closed = []
+
+    class ModalPage:
+        def __init__(self):
+            self.open = True
+
+        def locator(self, selector):
+            page = self
+
+            class L:
+                @property
+                def first(self_inner):
+                    return self_inner
+
+                def count(self_inner):
+                    return 1 if page.open else 0
+
+                def is_visible(self_inner):
+                    return page.open
+
+                def click(self_inner, **_kw):
+                    closed.append(selector)
+                    page.open = False
+
+            return L()
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    dismissed = site_selectors.dismiss_overlays(ModalPage())
+    assert dismissed, "a visible modal must still be closed"
+    assert closed
