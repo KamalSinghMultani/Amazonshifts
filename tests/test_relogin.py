@@ -446,3 +446,30 @@ def test_the_run_fixes_the_country_before_touching_the_login_page():
     assert "self._country_for(self.page.url)" not in submit.split("getattr")[0], (
         "the country must not be re-derived from the current page"
     )
+
+
+def test_pressing_send_accepts_a_challenge_as_an_outcome():
+    """Amazon frequently answers "Send verification code" with a challenge
+    rather than the code screen. Waiting only for OTP_ENTRY_REQUIRED spent
+    twenty seconds watching for a screen that cannot appear until the
+    challenge is cleared, then timed out — without ever asking detect_state(),
+    so the solver was never invoked."""
+    import inspect
+
+    import relogin as module
+
+    source = inspect.getsource(module.AuthenticationStateMachine._request_otp)
+    assert "AuthState.CAPTCHA_REQUIRED" in source, (
+        "a challenge after Send must end the wait, not time it out"
+    )
+    assert "AuthState.OTP_ENTRY_REQUIRED" in source
+
+
+def test_a_captcha_state_routes_to_the_solver():
+    """The routing existed all along; nothing ever reached it."""
+    import inspect
+
+    import relogin as module
+
+    source = inspect.getsource(module.AuthenticationStateMachine._transition_to_next)
+    assert "CAPTCHA_REQUIRED" in source and "_solve_captcha" in source

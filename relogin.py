@@ -643,7 +643,21 @@ class AuthenticationStateMachine:
             self.page.locator(SEND_CODE_BUTTON).first.click()
             self.otp_requested_at = time.time()
             self._log_transition("OTP_REQUESTED")
-            return self._wait_for_state([AuthState.OTP_ENTRY_REQUIRED])
+            # Wait for EITHER outcome. Pressing Send does not always produce
+            # the code screen: Amazon frequently answers with a challenge
+            # instead ("Let's confirm you are human / Choose all the hats").
+            # Waiting only for OTP_ENTRY_REQUIRED meant twenty seconds spent
+            # watching for a screen that cannot appear until the challenge is
+            # cleared, then a timeout — while detect_state() was never asked,
+            # so the solver was never invoked and the run died at
+            # OTP_SEND_REQUIRED with the CAPTCHA still on screen.
+            #
+            # Returning on CAPTCHA_REQUIRED hands control back to the run loop,
+            # which routes it to _solve_captcha and comes back here afterwards.
+            return self._wait_for_state([
+                AuthState.OTP_ENTRY_REQUIRED,
+                AuthState.CAPTCHA_REQUIRED,
+            ])
         
         return False
     
