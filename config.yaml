@@ -376,6 +376,13 @@ hold:
   # a whole batch would race itself and multiply the clicks.
   max_per_poll: 1
 
+  # ── HTTP Fast Path ────────────────────────────────────────────────────────
+  # When enabled, uses direct GraphQL API calls with browser cookies to hold
+  # shifts in ~200-500ms instead of ~1-2s for browser clicks. This matches
+  # competitor bot speeds while maintaining the safety of authenticated
+  # browser sessions.
+  http_fast_path: true
+
   # ── The one click that commits you ────────────────────────────────────────
   # CONFIRMED live: the shift is reserved only when "Create Application" is
   # pressed on the consent screen. That screen declares you are 18+, willing

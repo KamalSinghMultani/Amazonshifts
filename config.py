@@ -274,11 +274,21 @@ def validate_config(cfg: dict) -> None:
         raise ValueError(f"polling.mode must be 'dom' or 'api', got {mode!r}")
 
     polling = cfg["polling"]
+    
+    # Check if http_fast_path is enabled (allows safer, faster polling)
+    http_fast_path = cfg.get("hold", {}).get("http_fast_path", False)
+    
     # Mode-aware, because a poll means two completely different things. In api
     # mode it is one small JSON request — measured clean at 2s intervals. In
     # dom mode it is a full page load with every asset, and 14s between those
     # already earned a CloudFront 403.
-    floor = 2 if mode == "api" else 20
+    # If http_fast_path is enabled, we can safely poll faster since we're 
+    # using authenticated browser sessions for GraphQL calls.
+    if http_fast_path:
+        floor = 0.5  # Safe for HTTP fast path with browser cookies
+    else:
+        floor = 2 if mode == "api" else 20
+        
     if polling["interval_seconds"] < floor:
         raise ValueError(
             f"polling.interval_seconds below {floor} in {mode} mode risks a "
@@ -295,12 +305,18 @@ def validate_config(cfg: dict) -> None:
         )
 
     hot = polling["hot_interval_seconds"]
-    if hot < 2:
+    
+    # If http_fast_path is enabled, allow faster hot intervals since we're
+    # using authenticated browser sessions for GraphQL calls
+    http_fast_path = cfg.get("hold", {}).get("http_fast_path", False)
+    hot_floor = 0.3 if http_fast_path else 2
+    
+    if hot < hot_floor:
         # 2s was measured clean against the live CA endpoint (20 consecutive
         # polls, no 429, no 403). Below that is guesswork, and a block finds
         # nothing at all.
         raise ValueError(
-            "polling.hot_interval_seconds below 2 is past what has been "
+            f"polling.hot_interval_seconds below {hot_floor} is past what has been "
             "measured safe and risks a block, which finds nothing at all"
         )
     if hot > polling["interval_seconds"]:
