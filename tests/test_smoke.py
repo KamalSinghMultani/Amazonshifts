@@ -3151,3 +3151,41 @@ def test_any_attempt_postpones_the_scheduled_one(tmp_path):
     finally:
         flow.credentials = original
     assert w.relogin_due() is False, "an attempt must restart the clock"
+
+
+def test_a_failed_relogin_captures_what_was_on_screen(tmp_path, caplog):
+    """A status word is not a diagnosis. "failed at OTP_ENTRY_REQUIRED" says
+    where the state machine gave up, not what Amazon was showing — a rejected
+    code, a fresh challenge and a silent timeout all read identically."""
+    w = _batch_watcher(tmp_path, [], dry_run=False)
+
+    class DeadEndPage:
+        url = "https://auth.hiring.amazon.com/#/login"
+
+        def screenshot(self, **kw):
+            Path(kw["path"]).write_bytes(b"png")
+
+        def inner_text(self, _sel):
+            return "Enter the verification code\nThat code is incorrect"
+
+    with caplog.at_level("ERROR"):
+        w._capture_relogin_failure(DeadEndPage(), "unknown")
+
+    assert "auth.hiring.amazon.com" in caplog.text
+    assert "That code is incorrect" in caplog.text
+
+
+def test_failure_capture_never_breaks_the_watcher(tmp_path):
+    """Diagnostics are the last thing that should take a run down."""
+    w = _batch_watcher(tmp_path, [], dry_run=False)
+
+    class Hostile:
+        url = property(lambda self: (_ for _ in ()).throw(RuntimeError("gone")))
+
+        def screenshot(self, **kw):
+            raise RuntimeError("no screen")
+
+        def inner_text(self, _sel):
+            raise RuntimeError("no body")
+
+    w._capture_relogin_failure(Hostile(), "unknown")   # must not raise

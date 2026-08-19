@@ -493,6 +493,29 @@ class Watcher:
             )
         return False
 
+    def _capture_relogin_failure(self, page, status: str) -> None:
+        """Screenshot and describe the page a failed login died on.
+
+        Best-effort throughout: diagnostics must never turn a failed re-login
+        into a crashed watcher.
+        """
+        try:
+            SCREENSHOT_DIR.mkdir(exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            shot = SCREENSHOT_DIR / f"relogin-{status}-{stamp}.png"
+            page.screenshot(path=str(shot), full_page=True)
+            log.info("re-login failure screenshot: %s", shot)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not screenshot the failure: %s", exc)
+
+        try:
+            log.error("re-login failed on: %s", (page.url or "")[:140])
+            text = (page.inner_text("body") or "").strip()
+            snippet = " | ".join(line for line in text.split(chr(10)) if line.strip())
+            log.error("the screen said: %s", snippet[:400])
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not read the failed page: %s", exc)
+
     def try_relogin(self) -> bool:
         """One automated sign-in attempt. Returns True only if verified.
 
@@ -517,6 +540,14 @@ class Watcher:
             page = self.context.new_page()
             status, detail = login_flow.attempt(page, self.cfg["site"]["base_url"])
             log.info("re-login attempt: %s (%s)", status, detail)
+
+            if status != login_flow.OK:
+                # A failed login is nearly impossible to diagnose from a status
+                # word alone. "failed at OTP_ENTRY_REQUIRED" describes where the
+                # state machine gave up, not what Amazon was actually showing —
+                # a rejected code, a fresh challenge and a silent timeout all
+                # look identical from here. So capture the screen itself.
+                self._capture_relogin_failure(page, status)
 
             if status == login_flow.CAPTCHA:
                 # Stop the cycle entirely. Retrying a CAPTCHA on a timer turns

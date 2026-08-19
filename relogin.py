@@ -203,6 +203,11 @@ class StateDetector:
         # Check for text CAPTCHA
         if self._is_text_captcha(text):
             return CaptchaType.TEXT
+
+        if any(m in text for m in ("confirm you are human", "verify you are human",
+                           "choose all the", "select all images", "captcha", "puzzle")):
+            log.warning("challenge wording but no image grid matched — treating as UNKNOWN")
+            return CaptchaType.UNKNOWN
         
         return CaptchaType.NONE
     
@@ -246,6 +251,7 @@ class StateDetector:
         """Check if OTP entry screen is visible."""
         otp_entry_markers = (
             "enter the code",
+            "enter the verification code",
             "enter verification code",
             "verification code has been sent",
         )
