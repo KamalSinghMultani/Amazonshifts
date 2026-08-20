@@ -36,10 +36,10 @@ def test_real_hold_validation_reuses_preflight_without_background_auth(monkeypat
         "config.yaml", 60, Path("state/verified.json")
     )
 
-    # The strong preflight has already verified the exact storage state used by
-    # the <=60-minute real mapping run. Do not open another isolated/headless
-    # auth worker and risk a needless CAPTCHA while the live watcher is healthy.
-    assert out["session"]["check_every_seconds"] == 0
+    # The preflight strongly verifies the exact storage state. Keep a harmless
+    # prove-only check every five minutes so v6's proof lease cannot go stale
+    # during the one-hour mapping run, but disable all actual login/recovery.
+    assert out["session"]["check_every_seconds"] == 300
     assert out["session"]["relogin_every_seconds"] == 0
     assert out["session"]["auto_relogin"] is False
     # Compare paths semantically so Windows backslashes and POSIX slashes are
