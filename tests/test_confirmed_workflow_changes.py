@@ -76,7 +76,9 @@ class HoldFlowPage:
             def is_enabled(self):
                 return self._present()
 
-            def click(self, **_kwargs):
+            def click(self, **kwargs):
+                if kwargs.get("trial"):
+                    return None
                 if "Create Application" in selector:
                     page.clicked.append("Create Application")
                     page.phase = "integrity"
@@ -93,6 +95,137 @@ class HoldFlowPage:
                         page.url = "https://hiring.amazon.ca/application/ca/#/personal-information"
 
         return L()
+
+
+def test_pointer_actionable_requires_receiving_pointer_events():
+    class Page:
+        receiving_events = False
+
+        def locator(self, _selector):
+            page = self
+
+            class L:
+                @property
+                def first(self):
+                    return self
+
+                def count(self):
+                    return 1
+
+                def is_visible(self):
+                    return True
+
+                def is_enabled(self):
+                    return True
+
+                def click(self, **kwargs):
+                    assert kwargs.get("trial") is True
+                    if not page.receiving_events:
+                        raise RuntimeError("backdrop intercepts pointer events")
+
+            return L()
+
+    page = Page()
+    assert fast_hold._pointer_actionable(page, "button") is False
+    page.receiving_events = True
+    assert fast_hold._pointer_actionable(page, "button") is True
+
+
+def test_delayed_cookie_consent_button_is_retried_until_modal_closes():
+    class Page:
+        def __init__(self):
+            self.open = True
+            self.consent_visibility_checks = 0
+            self.clicked = []
+
+        def locator(self, selector):
+            page = self
+
+            class L:
+                @property
+                def first(self):
+                    return self
+
+                def count(self):
+                    if selector in {site_selectors.MODAL_BACKDROP, site_selectors.CONSENT_MODAL}:
+                        return int(page.open)
+                    if selector == site_selectors.CONSENT_BUTTON:
+                        return int(page.open)
+                    return 0
+
+                def is_visible(self):
+                    if not page.open:
+                        return False
+                    if selector == site_selectors.CONSENT_BUTTON:
+                        page.consent_visibility_checks += 1
+                        return page.consent_visibility_checks >= 2
+                    return selector in {site_selectors.MODAL_BACKDROP, site_selectors.CONSENT_MODAL}
+
+                def is_enabled(self):
+                    return True
+
+                def click(self, **kwargs):
+                    assert "force" not in kwargs
+                    page.clicked.append(selector)
+                    page.open = False
+
+            return L()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page()
+    dismissed = site_selectors.dismiss_overlays(page, timeout_ms=100, rounds=4)
+    assert dismissed == ["cookie consent"]
+    assert page.clicked == [site_selectors.CONSENT_BUTTON]
+    assert site_selectors.blocking_overlay_visible(page) is False
+
+
+def test_cookie_consent_uses_keyboard_when_its_backdrop_intercepts_pointer():
+    class Page:
+        def __init__(self):
+            self.open = True
+            self.keys = []
+
+        def locator(self, selector):
+            page = self
+
+            class L:
+                @property
+                def first(self):
+                    return self
+
+                def count(self):
+                    return int(page.open) if selector in {
+                        site_selectors.MODAL_BACKDROP,
+                        site_selectors.CONSENT_MODAL,
+                        site_selectors.CONSENT_BUTTON,
+                    } else 0
+
+                def is_visible(self):
+                    return bool(page.open)
+
+                def is_enabled(self):
+                    return True
+
+                def click(self, **kwargs):
+                    assert "force" not in kwargs
+                    raise RuntimeError("backdrop intercepts pointer events")
+
+                def press(self, key, **_kwargs):
+                    page.keys.append(key)
+                    page.open = False
+
+            return L()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page()
+    dismissed = site_selectors.dismiss_overlays(page, timeout_ms=100, rounds=2)
+    assert dismissed == ["cookie consent (keyboard)"]
+    assert page.keys == ["Enter"]
+    assert site_selectors.blocking_overlay_visible(page) is False
 
 
 def test_liveness_route_and_text_are_identity_verification_states():

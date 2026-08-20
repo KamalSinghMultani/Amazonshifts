@@ -515,20 +515,69 @@ def find_matching_card(page: Any, shift: Shift):
 #
 # Order matters: consent first, since its backdrop covers everything else.
 MODAL_BACKDROP = "[data-test-component='StencilModalBackdrop']"
+CONSENT_MODAL = "[data-test-id='consentModal']"
+CONSENT_BUTTON = "[data-test-id='consentBtn']"
 
 OVERLAY_DISMISSERS: list[tuple[str, str]] = [
-    ("cookie consent", "[data-test-id='consentBtn']"),
+    ("cookie consent", CONSENT_BUTTON),
     ("banner", "[data-test-component='MessageBannerDismissButton']"),
     ("guided search", "[aria-label='Close guided search']"),
 ]
 
 
-def _backdrop_visible(page: Any) -> bool:
+def _selector_visible(page: Any, selector: str) -> bool:
     try:
-        backdrop = page.locator(MODAL_BACKDROP)
-        return backdrop.count() > 0 and backdrop.first.is_visible()
+        item = page.locator(selector).first
+        return item.count() > 0 and item.is_visible()
     except Exception:  # noqa: BLE001
         return False
+
+
+def blocking_overlay_visible(page: Any) -> bool:
+    """Whether a modal is currently able to block application controls.
+
+    Amazon can mount the consent modal and its backdrop in separate React
+    turns. Checking both matters: in the live failure the page looked clear in
+    the screenshot while the transparent Stencil backdrop still intercepted
+    pointer events.
+    """
+    return _selector_visible(page, MODAL_BACKDROP) or _selector_visible(page, CONSENT_MODAL)
+
+
+def _backdrop_visible(page: Any) -> bool:
+    """Backward-compatible private name used by older callers/tests."""
+    return blocking_overlay_visible(page)
+
+
+def _overlay_control_enabled(item: Any) -> bool:
+    try:
+        return bool(item.is_enabled())
+    except AttributeError:
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _press_overlay_control(item: Any, *, timeout_ms: int) -> str:
+    """Activate a visible overlay control with ordinary browser input.
+
+    Pointer click remains first choice. A keyboard Enter fallback handles the
+    observed Amazon layering race where the modal's own transparent backdrop
+    temporarily sits above its consent button. This is a normal user input,
+    not a forced/JavaScript click.
+    """
+    try:
+        item.click(timeout=timeout_ms)
+        return "pointer"
+    except Exception as pointer_error:  # noqa: BLE001
+        if not item.is_visible() or not _overlay_control_enabled(item):
+            raise pointer_error
+        try:
+            item.press("Enter", timeout=timeout_ms)
+            return "keyboard"
+        except TypeError:
+            item.press("Enter")
+            return "keyboard"
 
 
 def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list[str]:
@@ -553,7 +602,7 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
     # was accepted once in save_session.py and persists in the profile — and
     # the hold is the one place where a wasted half-second is a lost shift.
     try:
-        if not _backdrop_visible(page):
+        if not blocking_overlay_visible(page):
             if not any(
                 page.locator(selector).first.count()
                 and page.locator(selector).first.is_visible()
@@ -563,6 +612,7 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
     except Exception as exc:  # noqa: BLE001 - fall through to the full sweep
         log.debug("overlay fast path failed: %s", exc)
 
+    escape_attempted = False
     for _ in range(rounds):
         acted = False
         for label, selector in OVERLAY_DISMISSERS:
@@ -570,27 +620,46 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
                 item = page.locator(selector).first
                 if item.count() == 0 or not item.is_visible():
                     continue
-                item.click(timeout=timeout_ms)
-                dismissed.append(label)
+                method = _press_overlay_control(item, timeout_ms=timeout_ms)
+                dismissed.append(label if method == "pointer" else f"{label} (keyboard)")
                 acted = True
-                page.wait_for_timeout(250)
+                page.wait_for_timeout(50)
             except Exception as exc:  # noqa: BLE001 - absence is the normal case
                 log.debug("could not dismiss %s: %s", label, exc)
 
-        if not _backdrop_visible(page):
+        if not blocking_overlay_visible(page):
             break
 
         if not acted:
-            # Something is covering the page that we have no button for.
+            # The consent modal and button can arrive in separate React turns.
+            # Do not give up (or press Escape) while that known control is still
+            # mounting; the caller will also retry if it outlives this sweep.
+            try:
+                consent_present = (
+                    page.locator(CONSENT_MODAL).first.count() > 0
+                    or page.locator(CONSENT_BUTTON).first.count() > 0
+                )
+            except Exception:  # noqa: BLE001
+                consent_present = False
+            if consent_present:
+                page.wait_for_timeout(50)
+                continue
+
+            # Something unknown is covering the page. Escape is ordinary
+            # browser input and remains a bounded fallback for dismissible UI.
+            if escape_attempted:
+                page.wait_for_timeout(50)
+                continue
             try:
                 page.keyboard.press("Escape")
                 dismissed.append("escape")
-                page.wait_for_timeout(250)
+                escape_attempted = True
+                page.wait_for_timeout(50)
             except Exception as exc:  # noqa: BLE001
                 log.debug("escape failed: %s", exc)
-            if _backdrop_visible(page):
-                log.warning("a modal is still covering the page after Escape")
-                break
+
+    if blocking_overlay_visible(page):
+        log.warning("a modal is still covering the page after bounded dismissal attempts")
 
     if dismissed:
         log.info("dismissed overlays: %s", ", ".join(dismissed))

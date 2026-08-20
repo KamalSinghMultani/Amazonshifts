@@ -98,7 +98,7 @@ def test_fast_hold_detects_unavailable_after_integrity():
 
 def test_fast_hold_does_not_capture_before_create_click():
     source = inspect.getsource(fast_hold.hold)
-    start = source.index("if create_ready and not create_clicked:")
+    start = source.index("if create_actionable and not create_clicked:")
     end = source.index("if create_clicked:", start)
     critical = source[start:end]
     click = critical.index("page.locator(CREATE).first.click")

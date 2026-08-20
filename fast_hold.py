@@ -59,6 +59,23 @@ def _enabled(page: Any, selector: str) -> bool:
         return False
 
 
+def _pointer_actionable(page: Any, selector: str, *, timeout_ms: int = 200) -> bool:
+    """Use Playwright's trial action to prove a control can receive a click.
+
+    Visible + enabled is insufficient when a transparent modal backdrop is on
+    top. ``trial=True`` runs the normal browser actionability checks without
+    firing the click, so timing labels and submit decisions reflect reality.
+    """
+    try:
+        item = page.locator(selector).first
+        if item.count() == 0 or not item.is_visible() or not item.is_enabled():
+            return False
+        item.click(timeout=max(1, int(timeout_ms)), trial=True)
+        return True
+    except Exception:
+        return False
+
+
 def _body_text(page: Any) -> str:
     try:
         return " ".join((page.inner_text("body") or "").split())
@@ -190,12 +207,14 @@ def hold(
         create_visible_seen = False
         create_enabled_seen = False
         create_actionable_seen = False
+        application_action_ready_seen = False
         agree_visible_seen = False
         agree_enabled_seen = False
         agree_actionable_seen = False
         observer_update_marked = False
         integrity_overlay_checked = False
         integrity_click_error = ""
+        create_click_error = ""
 
         while time.perf_counter() < deadline:
             if observer.confirmed:
@@ -257,22 +276,39 @@ def hold(
             if create_ready and not create_enabled_seen:
                 create_enabled_seen = True
                 mark("create application enabled")
-            if (next_ready or create_ready) and not overlay_checked:
-                mark("application action ready")
-                site_selectors.dismiss_overlays(
+            if (next_ready or create_ready) and (
+                not overlay_checked or site_selectors.blocking_overlay_visible(page)
+            ):
+                if not application_action_ready_seen:
+                    application_action_ready_seen = True
+                    mark("application action ready")
+                dismissed = site_selectors.dismiss_overlays(
                     page, timeout_ms=min(timeout_ms, 1500), rounds=2
                 )
-                overlay_checked = True
+                if dismissed:
+                    mark("application overlay dismissed")
+                overlay_checked = not site_selectors.blocking_overlay_visible(page)
                 next_ready = _enabled(page, NEXT)
                 create_ready = _enabled(page, CREATE)
 
-            if create_ready and overlay_checked and not create_actionable_seen:
+            next_actionable = (
+                next_ready
+                and overlay_checked
+                and _pointer_actionable(page, NEXT, timeout_ms=min(timeout_ms, 200))
+            )
+            create_actionable = (
+                create_ready
+                and overlay_checked
+                and _pointer_actionable(page, CREATE, timeout_ms=min(timeout_ms, 200))
+            )
+
+            if create_actionable and not create_actionable_seen:
                 create_actionable_seen = True
                 mark("create application actionable")
 
-            if not next_clicked and next_ready:
+            if not next_clicked and next_actionable:
                 try:
-                    page.locator(NEXT).first.click(timeout=min(timeout_ms, 2000))
+                    page.locator(NEXT).first.click(timeout=min(timeout_ms, 1000))
                     next_clicked = True
                     overlay_checked = False
                     mark("next clicked")
@@ -281,7 +317,7 @@ def hold(
                 except Exception:
                     pass
 
-            if create_ready and not create_clicked:
+            if create_actionable and not create_clicked:
                 # Critical-path rule: never screenshot before the committing
                 # click. The 2026-08-19 live run spent ~723ms between button
                 # ready and click while a diagnostic screenshot was taken.
@@ -297,7 +333,7 @@ def hold(
                         observer.detail(),
                     )
                 try:
-                    page.locator(CREATE).first.click(timeout=min(timeout_ms, 2000))
+                    page.locator(CREATE).first.click(timeout=min(timeout_ms, 1000))
                     create_clicked = True
                     mark("create application clicked")
                     # Give Playwright an event-loop turn so response handlers can
@@ -305,22 +341,15 @@ def hold(
                     page.wait_for_timeout(10)
                     continue
                 except Exception as exc:  # noqa: BLE001
-                    captured = failure_capture.capture(
-                        page,
-                        getattr(page, "context", None),
-                        base_url,
-                        "hold-create-click",
-                        extra={"error": str(exc)[:200]},
-                    )
-                    return (
-                        site_selectors.HoldResult(
-                            site_selectors.FAILED,
-                            f"could not press Create Application: {str(exc)[:120]}; screenshot: {captured.get('screenshot') or '<none>'}",
-                            url=getattr(page, "url", ""),
-                            timings=timings,
-                        ),
-                        observer.detail(),
-                    )
+                    # Actionability can change between the trial and real click
+                    # if Amazon mounts another overlay. Re-probe and retry
+                    # within the existing bounded deadline instead of failing
+                    # the whole attempt after one transient race.
+                    create_click_error = type(exc).__name__
+                    overlay_checked = False
+                    mark("create application click retry")
+                    page.wait_for_timeout(10)
+                    continue
 
             if create_clicked:
                 on_integrity = _integrity_notice(page)
@@ -376,19 +405,33 @@ def hold(
                     # Do no blocking wait from the route marker: the route can
                     # arrive before React inserts/enables the real button.
                     if auto_integrity_agree and agree_enabled and not integrity_agree_clicked:
-                        if not integrity_overlay_checked:
-                            site_selectors.dismiss_overlays(
+                        if (
+                            not integrity_overlay_checked
+                            or site_selectors.blocking_overlay_visible(page)
+                        ):
+                            dismissed = site_selectors.dismiss_overlays(
                                 page, timeout_ms=min(timeout_ms, 1500), rounds=2
                             )
-                            integrity_overlay_checked = True
+                            if dismissed:
+                                mark("integrity overlay dismissed")
+                            integrity_overlay_checked = not site_selectors.blocking_overlay_visible(page)
                             agree_enabled = _enabled(page, INTEGRITY_AGREE)
-                        if agree_enabled:
+                        agree_actionable = (
+                            agree_enabled
+                            and integrity_overlay_checked
+                            and _pointer_actionable(
+                                page,
+                                INTEGRITY_AGREE,
+                                timeout_ms=min(timeout_ms, 200),
+                            )
+                        )
+                        if agree_actionable:
                             if not agree_actionable_seen:
                                 agree_actionable_seen = True
                                 mark("integrity agree actionable")
                             try:
                                 page.locator(INTEGRITY_AGREE).first.click(
-                                    timeout=min(timeout_ms, 2000)
+                                    timeout=min(timeout_ms, 1000)
                                 )
                                 integrity_agree_clicked = True
                                 mark("integrity agree clicked")
@@ -410,6 +453,7 @@ def hold(
                                 # terminal click failure. Keep polling the same
                                 # normal browser control until the deadline.
                                 integrity_click_error = type(exc).__name__
+                                integrity_overlay_checked = False
 
                 if integrity_seen and not integrity_left and not on_integrity:
                     integrity_left = True
@@ -555,6 +599,7 @@ def hold(
         getattr(page, "context", None),
         base_url,
         "hold-timeout-after-create" if create_clicked else "hold-application-not-ready",
+        extra={"create_click_error_type": create_click_error},
     )
     if create_clicked:
         return (
@@ -569,7 +614,9 @@ def hold(
     return (
         site_selectors.HoldResult(
             site_selectors.FAILED,
-            f"application never became actionable; screenshot: {captured.get('screenshot') or '<none>'}",
+            "application never became pointer-actionable before the timeout"
+            + (f" (last click error: {create_click_error})" if create_click_error else "")
+            + f"; screenshot: {captured.get('screenshot') or '<none>'}",
             url=getattr(page, "url", ""),
             timings=timings,
         ),
