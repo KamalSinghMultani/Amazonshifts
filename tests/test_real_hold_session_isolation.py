@@ -42,4 +42,6 @@ def test_real_hold_validation_reuses_preflight_without_background_auth(monkeypat
     assert out["session"]["check_every_seconds"] == 0
     assert out["session"]["relogin_every_seconds"] == 0
     assert out["session"]["auto_relogin"] is False
-    assert out["browser"]["storage_state"] == "state/verified.json"
+    # Compare paths semantically so Windows backslashes and POSIX slashes are
+    # treated as the same location.
+    assert Path(out["browser"]["storage_state"]) == Path("state/verified.json")
