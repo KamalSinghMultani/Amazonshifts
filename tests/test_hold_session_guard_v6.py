@@ -20,6 +20,14 @@ def test_bat_launches_v6():
     assert "watcher_v5.py --config" not in text
 
 
+def test_live_startup_proof_is_not_tied_to_auto_relogin():
+    source = inspect.getsource(watcher_v6.HoldReadyWatcher._loop)
+    assert "startup strong hold-session proof" in source
+    assert "self.auto_relogin" not in source
+    assert "self.session_ok is not True" in source
+    assert "watcher_v3.OptimizedWatcher._loop" in source
+
+
 def test_health_probe_never_attempts_login():
     source = inspect.getsource(session_guard_worker._prove)
     assert "prove_existing_session" in source
