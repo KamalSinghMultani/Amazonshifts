@@ -93,6 +93,17 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     return cfg
 
 
+def _reset_test_state(cfg: dict) -> None:
+    for key in ("path", "detections_path"):
+        value = (cfg.get("state") or {}).get(key)
+        if not value:
+            continue
+        try:
+            Path(value).unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not reset real-test state %s: %s", value, exc)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run one explicitly acknowledged, time-bounded real Canada hold test."
@@ -126,6 +137,8 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     cfg = _prepare_cfg(args.config, args.minutes, verified_state)
+    _reset_test_state(cfg)
+    metrics_before = hold_metrics.count()
     deadline = datetime.now() + timedelta(minutes=args.minutes)
     print("SESSION READY — real hold validation is armed.")
     print(f"Canada-wide matching ends automatically at {deadline:%Y-%m-%d %H:%M:%S} local time.")
@@ -141,9 +154,9 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         timer.cancel()
 
-    latest = hold_metrics.latest()
+    latest = hold_metrics.latest_after(metrics_before)
     if latest:
-        print("LATEST HOLD TIMING")
+        print("THIS RUN HOLD TIMING")
         print(f"  status:             {latest.get('status')}")
         print(f"  poll -> dispatch:   {latest.get('poll_to_dispatch_ms')} ms")
         print(f"  poll -> final:      {latest.get('total_from_poll_ms')} ms")
