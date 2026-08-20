@@ -60,6 +60,20 @@ def test_live_protected_application_consent_counts_as_authenticated():
     assert detector.detect_state() == relogin.AuthState.AUTHENTICATED
 
 
+def test_locale_header_text_does_not_override_protected_application_proof():
+    # The normal Hiring header can contain the same wording the auth page uses.
+    # Protected consent evidence must be evaluated before generic body phrases.
+    page = FakePage(
+        url="https://hiring.amazon.ca/application/ca/#/consent",
+        body_text="Select your country and language\nBy applying, you confirm that:",
+        evidence=_live_consent_evidence(),
+    )
+    detector = relogin.StateDetector(page)
+
+    assert detector._is_authenticated() is True
+    assert detector.detect_state() == relogin.AuthState.AUTHENTICATED
+
+
 def test_body_or_create_button_can_prove_same_consent_state():
     page = FakePage(
         url="https://hiring.amazon.ca/application/ca/#/consent",
