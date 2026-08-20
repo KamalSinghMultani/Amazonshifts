@@ -13,9 +13,11 @@ uses Amazon's frontend and passively observes its reserve response.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 
 import fast_hold
 import hold_metrics
@@ -30,6 +32,61 @@ log = logging.getLogger("watcher")
 
 class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
     """Final layer used for the real hold validation run."""
+
+    def _start_api_mode(self, browser_cfg: dict) -> None:
+        """Prime a persistent live profile from the latest saved verified state.
+
+        Playwright ignores storage_state when launch_persistent_context is used.
+        Without this, verify_session.py could prove/save a fresh application
+        session while run_watcher.bat initially used older cookies/localStorage
+        from browser_profile.  Import the saved state into that live context
+        before the polling loop starts; v4's background proof remains the
+        authoritative verification/recovery layer afterwards.
+        """
+        saved_payload = None
+        if browser_cfg.get("user_data_dir"):
+            try:
+                path = Path(self.cfg["browser"]["storage_state"])
+                if path.exists():
+                    saved_payload = json.loads(path.read_text("utf-8"))
+                    cookies = saved_payload.get("cookies") if isinstance(saved_payload, dict) else None
+                    if cookies:
+                        self.context.add_cookies(cookies)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("could not prime persistent cookies from saved state: %s", exc)
+                saved_payload = None
+
+        super()._start_api_mode(browser_cfg)
+
+        if not (browser_cfg.get("user_data_dir") and isinstance(saved_payload, dict)):
+            return
+
+        expected_origin = watcher_v4._origin(self.cfg["site"]["base_url"])
+        local_entries = []
+        for item in saved_payload.get("origins") or []:
+            if watcher_v4._origin(str(item.get("origin") or "")) == expected_origin:
+                local_entries.extend(item.get("localStorage") or [])
+
+        try:
+            if self.page is not None and local_entries:
+                self.page.evaluate(
+                    """entries => {
+                        for (const item of entries) {
+                            if (item && typeof item.name === 'string') {
+                                localStorage.setItem(item.name, item.value ?? '');
+                            }
+                        }
+                    }""",
+                    local_entries,
+                )
+                if self.token_source is not None:
+                    self.token_source.refresh()
+            log.info(
+                "primed persistent live context from saved verified state: %d localStorage item(s)",
+                len(local_entries),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("saved session cookies loaded but localStorage priming failed: %s", exc)
 
     def _record_hold_metric(
         self,
