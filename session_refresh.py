@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -71,10 +72,6 @@ def _diagnose_auth_failure(page, manager, returned_state, base_url: str = "") ->
         and expected_host
         and final_host == expected_host
     ):
-        # Important distinction: this is exactly what a cleared challenge can
-        # look like when Amazon lands on a country page that our positive UI
-        # markers do not yet recognize. This is NOT authentication proof, but it
-        # is also not evidence that the challenge is still blocking the flow.
         category = "post_auth_page_unrecognized"
     elif returned_state == login_flow.AuthState.SESSION_ERROR:
         category = "state_machine_error"
@@ -88,6 +85,41 @@ def _diagnose_auth_failure(page, manager, returned_state, base_url: str = "") ->
         "challenge_type": challenge_type,
         "final_host": final_host,
     }
+
+
+def _late_auth_recheck(page, manager, state, base_url: str, *, timeout_seconds: float = 4.0):
+    """Catch a protected app page that finishes mounting just after auth timeout.
+
+    This is intentionally a state re-check only. It does not solve, submit, or
+    bypass any challenge. The patched detector still requires strong protected
+    application evidence; a country URL by itself cannot pass.
+    """
+    if state == login_flow.AuthState.AUTHENTICATED:
+        return state
+    if state != login_flow.AuthState.SESSION_ERROR:
+        return state
+    if _host(getattr(page, "url", "")) != _host(base_url):
+        return state
+
+    detector = manager.auth_machine.detector
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            observed = detector.detect_state()
+        except Exception:
+            return state
+
+        if observed == login_flow.AuthState.AUTHENTICATED:
+            manager.auth_machine.state = observed
+            return observed
+
+        if time.monotonic() >= deadline:
+            return state
+
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            time.sleep(0.25)
 
 
 def _forced_login(page, base_url: str) -> tuple[str, str, dict]:
@@ -112,6 +144,11 @@ def _forced_login(page, base_url: str) -> tuple[str, str, dict]:
             },
         )
 
+    # Live evidence showed the CAPTCHA clearing and the Canadian consent page
+    # becoming fully mounted immediately after the state-machine wait expired.
+    # Give that already-cleared page a tiny grace window to be recognised by
+    # the strict detector instead of throwing away a valid recovered session.
+    state = _late_auth_recheck(page, manager, state, base_url)
     diagnostics = _diagnose_auth_failure(page, manager, state, base_url)
 
     if state == login_flow.AuthState.AUTHENTICATED:
@@ -162,8 +199,6 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
     storage = Path(cfg["browser"]["storage_state"])
     base_url = cfg["site"]["base_url"]
 
-    # Never reuse the live persistent profile from another process. Seed an
-    # isolated context with the last saved storage state instead.
     browser_cfg = dict(cfg["browser"])
     browser_cfg["user_data_dir"] = None
     browser_cfg["headless"] = True
@@ -181,9 +216,6 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
 
             precheck = None
             if not force_login:
-                # Reuse a known-good session instead of provoking a fresh login
-                # on every restart. This proof is deliberately stronger than
-                # the old /application/ shell check.
                 precheck = session_proof.prove_existing_session(page, base_url, settle_ms=1500)
                 if precheck.passed:
                     rc = _persist_success(
@@ -192,8 +224,6 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
                     browser_launch.close_context(browser, context)
                     return rc
 
-            # Strong proof failed (or caller explicitly requested a fresh
-            # login), so now run the EXISTING relogin.py authentication system.
             status, detail, diagnostics = _forced_login(page, base_url)
 
             if status == login_flow.OK:
@@ -225,9 +255,6 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
                 browser_launch.close_context(browser, context)
                 return 2
 
-            # A challenge can disappear and still leave the state machine on an
-            # unrecognised country page. Capture structural evidence here rather
-            # than weakening the detector and calling that URL authenticated.
             evidence = auth_evidence.collect(page, context, base_url)
             _write(
                 result_path,
@@ -239,7 +266,7 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
             )
             browser_launch.close_context(browser, context)
             return 2
-    except Exception as exc:  # noqa: BLE001 - parent needs a result, not traceback-only death
+    except Exception as exc:  # noqa: BLE001
         _write(result_path, status="error", detail=str(exc)[:500])
         return 3
 
