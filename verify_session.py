@@ -1,12 +1,13 @@
-"""Force a fresh Hiring login and print non-destructive session proof.
+"""Prove the Hiring application session without reserving a shift.
 
 Usage:
-    python verify_session.py
     python verify_session.py --config config.yaml
+    python verify_session.py --config config.yaml --force-fresh-login
 
-This never creates an application or reserves a shift. It proves a fresh login
-on the configured country host and application-shell access, then writes the
-same storage state the watcher can import.
+Default behavior mirrors the live watcher: strongly prove the saved session
+first and only run the existing login flow if that proof fails. The optional
+flag deliberately forces a new login for a targeted authentication test.
+Neither mode creates an application or reserves a shift.
 """
 
 from __future__ import annotations
@@ -21,6 +22,11 @@ import session_refresh
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument(
+        "--force-fresh-login",
+        action="store_true",
+        help="skip saved-session proof and exercise the existing login flow",
+    )
     args = parser.parse_args(argv)
 
     state_dir = Path("state")
@@ -31,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         args.config,
         output_state=output_state,
         result_path=result_path,
-        force_login=True,
+        force_login=args.force_fresh_login,
     )
 
     try:
@@ -43,9 +49,18 @@ def main(argv: list[str] | None = None) -> int:
     status = result.get("status")
     detail = result.get("detail") or ""
     proof = result.get("proof") or {}
+    diagnostics = result.get("auth_diagnostics") or {}
+    precheck = result.get("precheck") or {}
 
-    if rc == 0 and status == "ok" and proof.get("passed") is True:
+    if rc == 0 and status in ("ok", "healthy") and proof.get("passed") is True:
         print("SESSION PROOF PASSED")
+        print(
+            "  path:               "
+            + ("fresh login requested" if args.force_fresh_login else (
+                "saved session strongly verified" if status == "healthy"
+                else "saved proof failed; login recovered session"
+            ))
+        )
         print(f"  expected host:      {proof.get('expected_host')}")
         print(f"  authenticated host: {proof.get('authenticated_host')}")
         print(f"  auth state:         {proof.get('authenticated_state')}")
@@ -58,6 +73,14 @@ def main(argv: list[str] | None = None) -> int:
     print("SESSION PROOF FAILED")
     print(f"  status: {status}")
     print(f"  detail: {detail}")
+    if precheck:
+        print(f"  saved-session proof: {precheck.get('reason') or 'failed'}")
+    if diagnostics:
+        print(f"  failure category:   {diagnostics.get('category')}")
+        print(f"  returned state:     {diagnostics.get('returned_state')}")
+        print(f"  machine state:      {diagnostics.get('machine_state')}")
+        print(f"  challenge type:     {diagnostics.get('challenge_type')}")
+        print(f"  final host:         {diagnostics.get('final_host')}")
     if proof:
         print(f"  expected host:      {proof.get('expected_host')}")
         print(f"  authenticated host: {proof.get('authenticated_host')}")
