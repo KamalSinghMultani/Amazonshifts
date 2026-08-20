@@ -24,11 +24,16 @@ def apply_patch(module) -> None:
     def _application_auth_evidence(self) -> bool:
         """Recognize the protected application consent state without token values.
 
-        Live evidence after the WAF challenge cleared showed Amazon returning to
-        `/application/ca/#/consent` with the consent UI mounted and auth-token
-        *keys* present in localStorage. URL alone is deliberately insufficient:
-        we require both the protected application UI and token-key structure.
-        No token/storage values are read or logged.
+        Live Canadian evidence after the WAF challenge cleared showed Amazon
+        returning to `/application/ca/#/consent` with:
+
+        * the application layout mounted;
+        * the consent-page title/body state;
+        * no login controls; and
+        * both `accessToken` and `idToken` key names in localStorage.
+
+        URL alone is deliberately insufficient. No token/storage values are read
+        or logged; only structural booleans and key *names* are inspected.
         """
         url = (self.page.url or "").lower().strip()
         if "hiring.amazon." not in url or "/application/" not in url:
@@ -37,27 +42,59 @@ def apply_patch(module) -> None:
         try:
             evidence = self.page.evaluate(
                 """() => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const s = getComputedStyle(el);
+                        const r = el.getBoundingClientRect();
+                        return s.visibility !== 'hidden' && s.display !== 'none' &&
+                               r.width > 0 && r.height > 0;
+                    };
                     const text = (document.body?.innerText || '').toLowerCase();
+                    const title = (document.title || '').toLowerCase();
                     const buttons = Array.from(document.querySelectorAll('button'));
                     const createVisible = buttons.some(btn => {
-                        const s = getComputedStyle(btn);
-                        const r = btn.getBoundingClientRect();
-                        const visible = s.visibility !== 'hidden' && s.display !== 'none' &&
-                                        r.width > 0 && r.height > 0;
                         const label = (btn.innerText || btn.textContent || '').toLowerCase();
-                        return visible && label.includes('create application');
+                        return visible(btn) && label.includes('create application');
                     });
-                    const consentMounted =
-                        text.includes('by applying, you confirm that') || createVisible;
+                    const loginSelectors = [
+                        "[data-test-id='input-test-id-login']",
+                        "[data-test-id='input-test-id-confirmOtp'] input",
+                        "[data-test-id='input-test-id-pin']",
+                        "#country-toggle-button"
+                    ];
                     const keys = new Set(Object.keys(localStorage));
-                    const tokenStructure = keys.has('accessToken') || keys.has('idToken');
-                    return {consentMounted, tokenStructure};
+                    return {
+                        routeConsent:
+                            location.pathname.toLowerCase().includes('/application/') &&
+                            location.hash.toLowerCase().includes('/consent'),
+                        layoutVisible: visible(document.querySelector("[data-test-id='layout']")),
+                        titleConsent: title.includes('by applying, you confirm that'),
+                        bodyConsent: text.includes('by applying, you confirm that'),
+                        createVisible,
+                        loginVisible: loginSelectors.some(sel => {
+                            try { return visible(document.querySelector(sel)); }
+                            catch (_) { return false; }
+                        }),
+                        tokenStructure: keys.has('accessToken') && keys.has('idToken')
+                    };
                 }"""
             )
+            if not isinstance(evidence, dict):
+                return False
+
+            protected_ui = bool(
+                evidence.get("routeConsent")
+                and evidence.get("layoutVisible")
+                and (
+                    evidence.get("titleConsent")
+                    or evidence.get("bodyConsent")
+                    or evidence.get("createVisible")
+                )
+            )
             return bool(
-                isinstance(evidence, dict)
-                and evidence.get("consentMounted")
+                protected_ui
                 and evidence.get("tokenStructure")
+                and not evidence.get("loginVisible")
             )
         except Exception:
             return False
@@ -108,8 +145,8 @@ def apply_patch(module) -> None:
             if self._is_visible(selector):
                 return True
 
-        # Live Canadian auth flow can land directly on the protected consent
-        # page without rendering the generic account-menu markers above.
+        # Live Canadian auth can land directly on the protected consent page
+        # without rendering the generic account-menu markers above.
         if _application_auth_evidence(self):
             return True
 
