@@ -62,6 +62,65 @@ def test_auth_failure_diagnostics_identify_uncleared_challenge_without_solving(m
     assert result["final_host"] == "auth.hiring.amazon.com"
 
 
+def test_late_auth_recheck_accepts_strong_state_after_state_machine_timeout(monkeypatch):
+    observed = iter([
+        login_flow.AuthState.UNKNOWN_PAGE,
+        login_flow.AuthState.AUTHENTICATED,
+    ])
+
+    class Detector:
+        def detect_state(self):
+            return next(observed)
+
+    machine = SimpleNamespace(
+        state=login_flow.AuthState.UNKNOWN_PAGE,
+        detector=Detector(),
+    )
+    manager = SimpleNamespace(auth_machine=machine)
+    page = SimpleNamespace(
+        url="https://hiring.amazon.ca/application/ca/#/consent",
+        wait_for_timeout=lambda _ms: None,
+    )
+
+    state = session_refresh._late_auth_recheck(
+        page,
+        manager,
+        login_flow.AuthState.SESSION_ERROR,
+        "https://hiring.amazon.ca",
+        timeout_seconds=1.0,
+    )
+
+    assert state == login_flow.AuthState.AUTHENTICATED
+    assert machine.state == login_flow.AuthState.AUTHENTICATED
+
+
+def test_late_auth_recheck_does_not_trust_country_url_alone():
+    class Detector:
+        def detect_state(self):
+            return login_flow.AuthState.UNKNOWN_PAGE
+
+    manager = SimpleNamespace(
+        auth_machine=SimpleNamespace(
+            state=login_flow.AuthState.UNKNOWN_PAGE,
+            detector=Detector(),
+        )
+    )
+    page = SimpleNamespace(
+        url="https://hiring.amazon.ca/app#/jobSearch",
+        wait_for_timeout=lambda _ms: None,
+    )
+
+    state = session_refresh._late_auth_recheck(
+        page,
+        manager,
+        login_flow.AuthState.SESSION_ERROR,
+        "https://hiring.amazon.ca",
+        timeout_seconds=0,
+    )
+
+    assert state == login_flow.AuthState.SESSION_ERROR
+
+
 def test_diagnostics_do_not_contain_credentials_or_solver_tokens():
     source = inspect.getsource(session_refresh._diagnose_auth_failure)
     assert "AMAZON_LOGIN_EMAIL" not in source
