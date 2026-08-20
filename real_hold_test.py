@@ -131,14 +131,14 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     # Normal watcher/headless configuration is untouched.
     cfg["browser"]["headless"] = False
 
-    # The preflight immediately above already performed the strong protected
-    # application-session proof and wrote the exact storage state this watcher
-    # will consume. Starting the normal background proof/re-login helper again
-    # would open a second isolated/headless browser for no benefit during this
-    # <=60-minute mapping run. Disable maintenance only in this isolated test;
-    # the normal long-running watcher keeps prove-only health checks + recovery.
+    # The preflight immediately above already performed a strong protected
+    # application-session proof. Keep only the harmless prove-only health check
+    # during this <=60-minute run so the v6 proof lease is renewed before it can
+    # become stale. Do NOT run proactive or expiry-triggered login/recovery in
+    # this mapping test: health proof never enters credentials or solves a
+    # challenge, while the normal long-running watcher keeps full recovery.
     session_cfg = cfg.setdefault("session", {})
-    session_cfg["check_every_seconds"] = 0
+    session_cfg["check_every_seconds"] = 300
     session_cfg["relogin_every_seconds"] = 0
     session_cfg["auto_relogin"] = False
 
@@ -211,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     print("SESSION READY — reservation-only validation is armed.")
     print(f"Canada-wide matching ends automatically at {deadline:%Y-%m-%d %H:%M:%S} local time.")
     print("A visible Chrome window will stay open for this first integrity transition test.")
-    print("The preflight-verified session is reused directly; no redundant background login worker runs during this <=60-minute test.")
+    print("The preflight-verified session is reused directly; prove-only health checks renew hold readiness every 5 minutes, with no background login/recovery in this test.")
     print("Flow: detect -> exact schedule -> Create Application -> I Agree -> reserve result.")
     print("Confirmed or uncertain -> STOP. Explicit unavailable -> try next ranked schedule (up to 3+ configured attempts).")
     print("Later personal-info/documents/assessment/identity steps are never filled or clicked.")
