@@ -123,6 +123,19 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     # Normal watcher/headless configuration is untouched.
     cfg["browser"]["headless"] = False
 
+    # The preflight immediately above already performed the strong protected
+    # application-session proof and wrote the exact storage state this watcher
+    # will consume. Starting v4's normal background proof/re-login helper again
+    # would open a second isolated/headless browser for no benefit during this
+    # <=60-minute mapping run. In the 2026-08-20 live test that redundant helper
+    # eventually hit a CAPTCHA while the main visible watcher remained healthy.
+    # Disable maintenance only in this isolated validation config; the normal
+    # long-running watcher keeps its configured health/re-login behavior.
+    session_cfg = cfg.setdefault("session", {})
+    session_cfg["check_every_seconds"] = 0
+    session_cfg["relogin_every_seconds"] = 0
+    session_cfg["auto_relogin"] = False
+
     # Validation must neither skip candidates already seen by the normal
     # watcher nor contaminate its dedup/history files. Give it an isolated
     # state namespace that disappears into the normal gitignored state/ tree.
@@ -134,11 +147,10 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
 def _write_runtime_config(cfg: dict) -> Path:
     """Write the in-memory test config for background session workers.
 
-    v3 session workers receive a config path, not the parent's in-memory dict.
-    Pointing them at normal config.yaml would make a worker reopen the old
-    auth_state.json immediately after preflight had proved/recovered a newer
-    real_test_verified_state.json. This gitignored runtime config keeps the
-    main watcher and every helper on the exact same proved session source.
+    The real validation currently disables those workers because its strong
+    preflight already produced the exact verified state it consumes. Keeping a
+    runtime config still makes the test self-contained if a future diagnostic
+    helper is added and avoids accidentally pointing helpers at normal config.
     """
     runtime = copy.deepcopy(cfg)
     # validate_config recreates this derived value when the worker reloads.
@@ -200,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     print("SESSION READY — reservation-only validation is armed.")
     print(f"Canada-wide matching ends automatically at {deadline:%Y-%m-%d %H:%M:%S} local time.")
     print("A visible Chrome window will stay open for this first integrity transition test.")
+    print("The preflight-verified session is reused directly; no redundant background login worker runs during this <=60-minute test.")
     print("Flow: detect -> exact schedule -> Create Application -> I Agree -> reserve result.")
     print("Confirmed or uncertain -> STOP. Explicit unavailable -> try next ranked schedule (up to 3+ configured attempts).")
     print("Later personal-info/documents/assessment/identity steps are never filled or clicked.")
@@ -207,8 +220,6 @@ def main(argv: list[str] | None = None) -> int:
     print("Timing records: logs/hold_timings.jsonl")
 
     watcher = RealHoldTestWatcher(cfg, live_override=True)
-    # Make v4/v3 background health/re-login workers use the same isolated,
-    # preflight-verified test state instead of normal config.yaml.
     watcher.config_path = str(runtime_config)
     timer = threading.Timer(args.minutes * 60, watcher.stop_event.set)
     timer.daemon = True
