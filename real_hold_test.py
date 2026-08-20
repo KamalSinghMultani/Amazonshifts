@@ -84,6 +84,12 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     # This mutation exists only in memory for this validation process.
     cfg["browser"]["storage_state"] = str(verified_state)
     cfg["browser"]["user_data_dir"] = None
+
+    # Validation must neither skip candidates already seen by the normal
+    # watcher nor contaminate its dedup/history files.  Give it an isolated
+    # state namespace that disappears into the normal gitignored state/ tree.
+    cfg.setdefault("state", {})["path"] = "state/real_hold_test_seen.json"
+    cfg["state"]["detections_path"] = "state/real_hold_test_detections.jsonl"
     return cfg
 
 
