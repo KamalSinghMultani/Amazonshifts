@@ -107,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
 
     load_dotenv()
     cfg_for_logging = load_config(args.config)
-    setup_logging(cfg_for_logging.get("logging") or {})
+    setup_logging(cfg_for_logging)
 
     print("Running strong Canada application-session preflight...")
     ok, verified_state, detail = _preflight(args.config)
