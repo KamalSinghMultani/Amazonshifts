@@ -1,8 +1,8 @@
 """Focused runtime fixes for relogin.py.
 
 Kept separate so the large, battle-tested CAPTCHA/login module does not need a
-broad rewrite. apply_patch() replaces only the two methods covered by the
-regressions found in the PR test run.
+broad rewrite. apply_patch() replaces only the methods covered by regressions
+and live evidence from the Hiring authentication flow.
 """
 
 from __future__ import annotations
@@ -21,12 +21,54 @@ def apply_patch(module) -> None:
     PIN_INPUT_SELECTORS = module.PIN_INPUT_SELECTORS
     SEND_CODE_BUTTON = module.SEND_CODE_BUTTON
 
+    def _application_auth_evidence(self) -> bool:
+        """Recognize the protected application consent state without token values.
+
+        Live evidence after the WAF challenge cleared showed Amazon returning to
+        `/application/ca/#/consent` with the consent UI mounted and auth-token
+        *keys* present in localStorage. URL alone is deliberately insufficient:
+        we require both the protected application UI and token-key structure.
+        No token/storage values are read or logged.
+        """
+        url = (self.page.url or "").lower().strip()
+        if "hiring.amazon." not in url or "/application/" not in url:
+            return False
+
+        try:
+            evidence = self.page.evaluate(
+                """() => {
+                    const text = (document.body?.innerText || '').toLowerCase();
+                    const buttons = Array.from(document.querySelectorAll('button'));
+                    const createVisible = buttons.some(btn => {
+                        const s = getComputedStyle(btn);
+                        const r = btn.getBoundingClientRect();
+                        const visible = s.visibility !== 'hidden' && s.display !== 'none' &&
+                                        r.width > 0 && r.height > 0;
+                        const label = (btn.innerText || btn.textContent || '').toLowerCase();
+                        return visible && label.includes('create application');
+                    });
+                    const consentMounted =
+                        text.includes('by applying, you confirm that') || createVisible;
+                    const keys = new Set(Object.keys(localStorage));
+                    const tokenStructure = keys.has('accessToken') || keys.has('idToken');
+                    return {consentMounted, tokenStructure};
+                }"""
+            )
+            return bool(
+                isinstance(evidence, dict)
+                and evidence.get("consentMounted")
+                and evidence.get("tokenStructure")
+            )
+        except Exception:
+            return False
+
     def _is_authenticated(self) -> bool:
-        """Require positive account evidence; a hiring.amazon URL is not enough.
+        """Require positive account/application evidence; URL alone is not enough.
 
         The public job-search URL is reachable while signed out, so URL-only
         detection produced false SESSION_READY results. Negative login evidence
-        wins first, then explicit account UI/text is required for a positive.
+        wins first, then explicit account UI/text or protected-application
+        evidence is required for a positive.
         """
         url = (self.page.url or "").lower().strip()
 
@@ -66,6 +108,11 @@ def apply_patch(module) -> None:
             if self._is_visible(selector):
                 return True
 
+        # Live Canadian auth flow can land directly on the protected consent
+        # page without rendering the generic account-menu markers above.
+        if _application_auth_evidence(self):
+            return True
+
         return False
 
     def _request_otp(self) -> bool:
@@ -100,5 +147,6 @@ def apply_patch(module) -> None:
         module.log.warning("No OTP entry or CAPTCHA appeared within 60 seconds")
         return False
 
+    module.StateDetector._application_auth_evidence = _application_auth_evidence
     module.StateDetector._is_authenticated = _is_authenticated
     module.AuthenticationStateMachine._request_otp = _request_otp
