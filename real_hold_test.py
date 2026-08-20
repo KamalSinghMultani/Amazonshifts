@@ -1,14 +1,15 @@
-"""Explicit, time-bounded real Canada hold validation.
+"""Explicit, time-bounded real Canada reservation validation.
 
 This command is intentionally separate from run_watcher.bat. It mutates only
 an in-memory config copy, never config.yaml. It broadens matching to whatever
 the already-Canadian API returns, runs for at most N minutes (max 60), and stops
-after the first confirmed or uncertain hold attempt.
+after the first committed reservation attempt.
 
-The validation browser is visible. If Amazon inserts its Application Integrity
-Notice after Create Application, the watcher keeps its passive reserve observer
-attached while the applicant clicks I Agree manually. The test never clicks
-that attestation itself. A confirmed run creates a real Amazon candidate
+For this validation only, the browser-driven fast path may click the observed
+Application Integrity Notice's I Agree control after Create Application, then
+passively wait for either a verified soft reserve or an unavailable result. It
+does not fill personal information, documents, assessments, identity checks, or
+any later application fields. A confirmed run creates a real Amazon candidate
 application / soft reserve.
 """
 
@@ -37,13 +38,22 @@ log = logging.getLogger("watcher")
 class RealHoldTestWatcher(watcher_v5.PreLiveWatcher):
     def _hold(self, shift, poll_started=None):
         result = super()._hold(shift, poll_started=poll_started)
+        integrity_attempted = bool(
+            result is not None
+            and any(
+                name == "integrity agree clicked"
+                for name, _ms in (getattr(result, "timings", ()) or ())
+            )
+        )
         if result is not None and (
-            result.held or result.status == site_selectors.UNCERTAIN
+            result.held
+            or result.status == site_selectors.UNCERTAIN
+            or integrity_attempted
         ):
-            # Never create a second application during a validation run. An
-            # uncertain result means Create Application may already have been
-            # accepted, so it is treated as stop-now just like confirmation.
-            log.info("real hold validation stopping after first committed/uncertain attempt")
+            # This validation maps exactly one committed application attempt.
+            # Stop even when the integrity transition proves the schedule lost
+            # the race, so a first test never creates a second application.
+            log.info("real hold validation stopping after first committed reservation attempt")
             self.stop_event.set()
         return result
 
@@ -72,20 +82,21 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     cfg = copy.deepcopy(load_config(config_path))
     end = datetime.now() + timedelta(minutes=minutes)
 
-    # Explicit live validation, one reservation at most per poll and one total
-    # because RealHoldTestWatcher stops after the first committed/uncertain one.
+    # Explicit live validation: exactly one candidate schedule is attempted in
+    # the poll that reaches the integrity step, and the watcher stops after it.
     cfg["dry_run"] = False
     cfg["hold"]["enabled"] = True
     cfg["hold"]["direct_apply"] = True
     cfg["hold"]["stop_before_submit"] = False
     cfg["hold"]["max_per_poll"] = 1
+    cfg["hold"]["job_attempts"] = 1
 
-    # Live CA 2026-08-19 inserted an Application Integrity Notice between
-    # Create Application and the reserve confirmation. Keep the passive backend
-    # observer alive for up to two minutes while the applicant handles that
-    # page manually in the visible browser.
-    cfg["hold"]["manual_integrity_wait"] = True
+    # Reservation-only integrity mode. The fast path clicks only I Agree, then
+    # waits for JOB_SELECTED + exact schedule + soft reserve expiry, or a narrow
+    # visible unavailable result. It never continues into later form fields.
+    cfg["hold"]["manual_integrity_wait"] = False
     cfg["hold"]["manual_integrity_timeout_ms"] = 120000
+    cfg["hold"]["auto_integrity_agree"] = True
 
     # The API request itself is already scoped to Canada. This bypasses only
     # the user's normal title/location preferences, and expires automatically.
@@ -97,8 +108,9 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     cfg["browser"]["storage_state"] = str(verified_state)
     cfg["browser"]["user_data_dir"] = None
 
-    # The integrity handoff must be visible so the applicant can perform that
-    # one manual action. Normal watcher/headless configuration is untouched.
+    # Keep the first automated integrity validation visible so the exact page
+    # after I Agree can be inspected if Amazon returns an unexpected state.
+    # Normal watcher/headless configuration is untouched.
     cfg["browser"]["headless"] = False
 
     # Validation must neither skip candidates already seen by the normal
@@ -140,14 +152,14 @@ def _reset_test_state(cfg: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run one explicitly acknowledged, time-bounded real Canada hold test."
+        description="Run one explicitly acknowledged, time-bounded real Canada reservation test."
     )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--minutes", type=int, default=60)
     parser.add_argument(
         "--ack-real-hold",
         action="store_true",
-        help="required: acknowledge that Create Application can reserve a real shift",
+        help="required: acknowledge that the test can create an application and reserve a real shift",
     )
     args = parser.parse_args(argv)
 
@@ -175,12 +187,12 @@ def main(argv: list[str] | None = None) -> int:
     runtime_config = _write_runtime_config(cfg)
     metrics_before = hold_metrics.count()
     deadline = datetime.now() + timedelta(minutes=args.minutes)
-    print("SESSION READY — real hold validation is armed.")
+    print("SESSION READY — reservation-only validation is armed.")
     print(f"Canada-wide matching ends automatically at {deadline:%Y-%m-%d %H:%M:%S} local time.")
-    print("A visible Chrome window will stay open for the validation.")
-    print("If the Application Integrity Notice appears, click I Agree yourself promptly.")
-    print("The watcher will keep observing the reserve response and will not click I Agree for you.")
-    print("The process stops after the first confirmed or uncertain hold attempt.")
+    print("A visible Chrome window will stay open for this first integrity transition test.")
+    print("Flow: detect -> exact schedule -> Create Application -> I Agree -> reserve result -> STOP.")
+    print("Later personal-info/documents/assessment/identity steps are never filled or clicked.")
+    print("The process stops after the first committed reservation attempt, including an unavailable race loss.")
     print("Timing records: logs/hold_timings.jsonl")
 
     watcher = RealHoldTestWatcher(cfg, live_override=True)
