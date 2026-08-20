@@ -35,12 +35,24 @@ class FakePage:
         return dict(self.evidence)
 
 
+def _live_consent_evidence(**overrides):
+    evidence = {
+        "routeConsent": True,
+        "layoutVisible": True,
+        "titleConsent": True,
+        "bodyConsent": False,
+        "createVisible": False,
+        "loginVisible": False,
+        "tokenStructure": True,
+    }
+    evidence.update(overrides)
+    return evidence
 
-def test_protected_application_consent_with_token_structure_counts_as_authenticated():
+
+def test_live_protected_application_consent_counts_as_authenticated():
     page = FakePage(
         url="https://hiring.amazon.ca/application/ca/#/consent",
-        body_text="By applying, you confirm that:",
-        evidence={"consentMounted": True, "tokenStructure": True},
+        evidence=_live_consent_evidence(),
     )
     detector = relogin.StateDetector(page)
 
@@ -48,10 +60,37 @@ def test_protected_application_consent_with_token_structure_counts_as_authentica
     assert detector.detect_state() == relogin.AuthState.AUTHENTICATED
 
 
-def test_application_url_without_protected_ui_is_not_authenticated():
+def test_body_or_create_button_can_prove_same_consent_state():
+    page = FakePage(
+        url="https://hiring.amazon.ca/application/ca/#/consent",
+        evidence=_live_consent_evidence(
+            titleConsent=False,
+            bodyConsent=True,
+        ),
+    )
+    assert relogin.StateDetector(page)._is_authenticated() is True
+
+    page.evidence = _live_consent_evidence(
+        titleConsent=False,
+        createVisible=True,
+    )
+    assert relogin.StateDetector(page)._is_authenticated() is True
+
+
+def test_application_url_without_consent_route_is_not_authenticated():
     page = FakePage(
         url="https://hiring.amazon.ca/application/ca/",
-        evidence={"consentMounted": False, "tokenStructure": True},
+        evidence=_live_consent_evidence(routeConsent=False),
+    )
+    detector = relogin.StateDetector(page)
+
+    assert detector._is_authenticated() is False
+
+
+def test_consent_route_without_layout_is_not_authenticated():
+    page = FakePage(
+        url="https://hiring.amazon.ca/application/ca/#/consent",
+        evidence=_live_consent_evidence(layoutVisible=False),
     )
     detector = relogin.StateDetector(page)
 
@@ -61,8 +100,17 @@ def test_application_url_without_protected_ui_is_not_authenticated():
 def test_application_ui_without_token_structure_is_not_authenticated():
     page = FakePage(
         url="https://hiring.amazon.ca/application/ca/#/consent",
-        body_text="By applying, you confirm that:",
-        evidence={"consentMounted": True, "tokenStructure": False},
+        evidence=_live_consent_evidence(tokenStructure=False),
+    )
+    detector = relogin.StateDetector(page)
+
+    assert detector._is_authenticated() is False
+
+
+def test_visible_login_control_overrides_protected_page_evidence():
+    page = FakePage(
+        url="https://hiring.amazon.ca/application/ca/#/consent",
+        evidence=_live_consent_evidence(loginVisible=True),
     )
     detector = relogin.StateDetector(page)
 
@@ -72,7 +120,7 @@ def test_application_ui_without_token_structure_is_not_authenticated():
 def test_public_job_search_url_still_does_not_count_as_authenticated():
     page = FakePage(
         url="https://hiring.amazon.ca/app#/jobSearch",
-        evidence={"consentMounted": True, "tokenStructure": True},
+        evidence=_live_consent_evidence(),
     )
     detector = relogin.StateDetector(page)
 
