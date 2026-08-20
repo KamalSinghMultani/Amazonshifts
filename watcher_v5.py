@@ -175,7 +175,21 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
             backend_detail=backend_detail,
         )
 
-        if result.held or result.status == site_selectors.UNCERTAIN:
+        integrity_attempted = any(
+            name == "integrity agree clicked"
+            for name, _ms in (getattr(result, "timings", ()) or ())
+        )
+        if (
+            result.held
+            or result.status == site_selectors.UNCERTAIN
+            or integrity_attempted
+        ):
+            # Once I Agree was attempted, never run the old compatibility path
+            # against the same schedule. A known unavailable result is a real
+            # race loss, not a reason to create/advance the same application a
+            # second time through the slower card/detail flow.
+            if integrity_attempted and result.status == site_selectors.FAILED:
+                log.info("integrity reservation attempt finished without a reserve; skipping compatibility fallback")
             self._report_hold(shift, result, shot, poll_started)
             return result
 
