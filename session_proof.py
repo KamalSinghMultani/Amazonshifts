@@ -6,12 +6,13 @@ It proves the strongest things we can verify without a live shift:
 1. the authenticated page is on the configured country host;
 2. the login state detector has positive authenticated evidence (URL alone is
    not accepted);
-3. a saved session can open a protected country-specific application route
-   without being bounced back to the auth domain.
+3. the protected application shell is reachable without an auth redirect; and
+4. the shell's own harmless authenticated candidate read succeeds.
 
-A real reservation can only be proven when a real schedule exists, but this
-closes the gap where the public job API worked while the application session
-was actually signed out.
+The backend read is observed passively from the page's normal network traffic.
+No authorization/cookie/token values are read or logged. A real reservation can
+only be proven when a real schedule exists, but this prevents stale UI/storage
+from falsely re-arming holding after the application session has expired.
 """
 
 from __future__ import annotations
@@ -23,6 +24,9 @@ import relogin as login_flow
 import site_selectors
 
 
+_PROTECTED_CANDIDATE_PATH = "/application/api/candidate-application/candidate"
+
+
 @dataclass(frozen=True)
 class SessionProof:
     passed: bool
@@ -31,6 +35,8 @@ class SessionProof:
     authenticated_state: str
     application_host: str
     application_redirected_to_login: bool
+    application_backend_authenticated: bool
+    application_backend_unauthorized: bool
     reason: str
 
     def to_dict(self) -> dict:
@@ -41,8 +47,59 @@ class SessionProof:
             f"fresh_auth={self.authenticated_state}@{self.authenticated_host or '<none>'}; "
             f"application={self.application_host or '<none>'}; "
             f"redirected_to_login={self.application_redirected_to_login}; "
+            f"backend_authenticated={self.application_backend_authenticated}; "
+            f"backend_unauthorized={self.application_backend_unauthorized}; "
             f"passed={self.passed}"
         )
+
+
+class _ProtectedBackendProbe:
+    """Observe the app's own candidate GET without inspecting headers or body."""
+
+    def __init__(self, expected_host: str) -> None:
+        self.expected_host = expected_host
+        self.authenticated = False
+        self.unauthorized = False
+        self.seen = False
+
+    def observe(self, response) -> None:
+        try:
+            url = str(getattr(response, "url", "") or "")
+            parsed = urlparse(url)
+            if (parsed.hostname or "").lower() != self.expected_host:
+                return
+            if parsed.path.rstrip("/").lower() != _PROTECTED_CANDIDATE_PATH:
+                return
+
+            request = getattr(response, "request", None)
+            method = str(getattr(request, "method", "GET") or "GET").upper()
+            if method != "GET":
+                return
+
+            status = int(getattr(response, "status", 0) or 0)
+            self.seen = True
+            if 200 <= status < 300:
+                self.authenticated = True
+                self.unauthorized = False
+            elif status == 401:
+                # A 401 from this same-origin protected candidate read is strong
+                # evidence that the application auth is no longer accepted.
+                self.unauthorized = True
+                self.authenticated = False
+            # 403 is deliberately NOT treated as definitive expiry because the
+            # site is WAF-fronted and a block must remain inconclusive.
+        except Exception:
+            # Proof is fail-closed. If observation itself fails, no backend
+            # success is recorded and the proof cannot re-arm holding.
+            return
+
+    def attach(self, page) -> None:
+        try:
+            page.on("response", self.observe)
+        except Exception:
+            # A page that cannot expose response events cannot produce the
+            # required protected-backend proof.
+            return
 
 
 def _host(url: str) -> str:
@@ -50,12 +107,7 @@ def _host(url: str) -> str:
 
 
 def _application_probe_url(base_url: str) -> str:
-    """Country-specific protected route used only to prove a saved session.
-
-    Live Canadian auth returns to /application/ca/#/consent. Using that route
-    avoids the ambiguous bare /application/ landing which can sit on an empty
-    #/pre-consent shell even after authentication succeeded.
-    """
+    """Country-specific protected route used only to prove a saved session."""
     host = _host(base_url)
     if host.endswith("amazon.ca"):
         country = "ca"
@@ -73,6 +125,8 @@ def _failed(
     authenticated_state: str,
     application_host: str = "",
     redirected: bool = False,
+    backend_authenticated: bool = False,
+    backend_unauthorized: bool = False,
     reason: str,
 ) -> SessionProof:
     return SessionProof(
@@ -82,12 +136,20 @@ def _failed(
         authenticated_state=authenticated_state,
         application_host=application_host,
         application_redirected_to_login=redirected,
+        application_backend_authenticated=backend_authenticated,
+        application_backend_unauthorized=backend_unauthorized,
         reason=reason,
     )
 
 
 def _prove_current_application_page(page, base_url: str, *, reason: str) -> SessionProof:
-    """Prove the currently loaded protected application page."""
+    """Collect the protected application's UI/auth state.
+
+    This is necessary evidence but is no longer sufficient by itself. Stale
+    application DOM plus stale localStorage token *keys* survived a real logout
+    during live testing and produced false RESTORED messages. Final success is
+    awarded only by _wait_for_application_proof after a protected backend read.
+    """
     expected_host = _host(base_url)
     current_host = _host(getattr(page, "url", ""))
     redirected = (
@@ -131,6 +193,8 @@ def _prove_current_application_page(page, base_url: str, *, reason: str) -> Sess
             reason="application shell lacked positive authenticated evidence",
         )
 
+    # UI-only success is deliberately provisional. The caller must pair it with
+    # a successful protected backend read before returning passed=True.
     return SessionProof(
         passed=True,
         expected_host=expected_host,
@@ -138,6 +202,8 @@ def _prove_current_application_page(page, base_url: str, *, reason: str) -> Sess
         authenticated_state=state_name,
         application_host=current_host,
         application_redirected_to_login=False,
+        application_backend_authenticated=False,
+        application_backend_unauthorized=False,
         reason=reason,
     )
 
@@ -147,37 +213,100 @@ def _wait_for_application_proof(
     base_url: str,
     *,
     reason: str,
+    backend_probe: _ProtectedBackendProbe,
     timeout_ms: int = 6000,
 ) -> SessionProof:
-    """Return as soon as the protected app proves auth or definitely redirects.
-
-    React can mount after DOMContentLoaded. Polling strong evidence avoids both a
-    fixed multi-second sleep and the false negative seen when #/pre-consent was
-    inspected before any application elements had mounted.
-    """
+    """Require both protected UI evidence and a successful candidate API read."""
     waited = 0
     last = _prove_current_application_page(page, base_url, reason=reason)
-    while not last.passed and waited < timeout_ms:
+
+    while True:
         if last.application_redirected_to_login:
             return last
         if last.application_host and last.application_host != _host(base_url):
             return last
+
+        if backend_probe.unauthorized:
+            return _failed(
+                expected_host=_host(base_url),
+                authenticated_host=last.authenticated_host,
+                authenticated_state=last.authenticated_state,
+                application_host=last.application_host,
+                backend_unauthorized=True,
+                reason="protected candidate read returned 401; application session is not authenticated",
+            )
+
+        if last.passed and backend_probe.authenticated:
+            return SessionProof(
+                passed=True,
+                expected_host=last.expected_host,
+                authenticated_host=last.authenticated_host,
+                authenticated_state=last.authenticated_state,
+                application_host=last.application_host,
+                application_redirected_to_login=False,
+                application_backend_authenticated=True,
+                application_backend_unauthorized=False,
+                reason=reason + "; protected candidate read returned 2xx",
+            )
+
+        if waited >= timeout_ms:
+            break
+
         try:
             page.wait_for_timeout(250)
         except Exception:
-            return last
+            break
         waited += 250
         last = _prove_current_application_page(page, base_url, reason=reason)
+
+    if last.passed:
+        return _failed(
+            expected_host=last.expected_host,
+            authenticated_host=last.authenticated_host,
+            authenticated_state=last.authenticated_state,
+            application_host=last.application_host,
+            reason=(
+                "protected application UI looked authenticated but no successful "
+                "protected candidate read was observed"
+            ),
+        )
     return last
+
+
+def _probe_application(page, base_url: str, target_url: str, *, reason: str, timeout_ms: int) -> SessionProof:
+    """Navigate harmlessly while observing the shell's protected candidate GET."""
+    expected_host = _host(base_url)
+    backend_probe = _ProtectedBackendProbe(expected_host)
+    backend_probe.attach(page)
+
+    try:
+        page.goto(target_url, wait_until="domcontentloaded")
+    except Exception as exc:  # noqa: BLE001
+        return _failed(
+            expected_host=expected_host,
+            authenticated_host=_host(getattr(page, "url", "")),
+            authenticated_state="UNKNOWN",
+            application_host=_host(getattr(page, "url", "")),
+            reason=f"could not open protected application route: {str(exc)[:200]}",
+        )
+
+    return _wait_for_application_proof(
+        page,
+        base_url,
+        reason=reason,
+        backend_probe=backend_probe,
+        timeout_ms=timeout_ms,
+    )
 
 
 def prove_fresh_session(page, base_url: str, *, settle_ms: int = 1500) -> SessionProof:
     """Verify a just-authenticated session without creating an application.
 
-    Crucially, if the auth state machine already landed on a protected
-    application page, do not navigate away from that proven page. The old proof
-    navigated to bare /application/, which changed a good /#/consent landing into
-    an unmounted /#/pre-consent shell and discarded the recovered session.
+    A fresh login's UI state is checked first, then the same protected page is
+    re-probed (or the country-specific consent route is opened) so a normal
+    protected candidate GET can prove the backend accepts the session. Reusing
+    the same application URL avoids the old bad behavior of navigating a good
+    country-specific landing to ambiguous bare /application/.
     """
     expected_host = _host(base_url)
     authenticated_host = _host(getattr(page, "url", ""))
@@ -204,33 +333,13 @@ def prove_fresh_session(page, base_url: str, *, settle_ms: int = 1500) -> Sessio
             reason="fresh login did not have positive authenticated UI evidence",
         )
 
-    current_url = (getattr(page, "url", "") or "").lower()
-    if "/application/" in current_url:
-        return SessionProof(
-            passed=True,
-            expected_host=expected_host,
-            authenticated_host=authenticated_host,
-            authenticated_state=state_name,
-            application_host=authenticated_host,
-            application_redirected_to_login=False,
-            reason="fresh country-specific authentication verified on protected application page",
-        )
-
-    application_url = _application_probe_url(base_url)
-    try:
-        page.goto(application_url, wait_until="domcontentloaded")
-    except Exception as exc:  # noqa: BLE001
-        return _failed(
-            expected_host=expected_host,
-            authenticated_host=authenticated_host,
-            authenticated_state=state_name,
-            reason=f"could not open protected application route: {str(exc)[:200]}",
-        )
-
-    proof = _wait_for_application_proof(
+    current_url = str(getattr(page, "url", "") or "")
+    target_url = current_url if "/application/" in current_url.lower() else _application_probe_url(base_url)
+    proof = _probe_application(
         page,
         base_url,
-        reason="fresh country-specific authentication and application access verified",
+        target_url,
+        reason="fresh country-specific authentication and application backend access verified",
         timeout_ms=max(6000, settle_ms),
     )
     if proof.passed:
@@ -241,6 +350,8 @@ def prove_fresh_session(page, base_url: str, *, settle_ms: int = 1500) -> Sessio
             authenticated_state=state_name,
             application_host=proof.application_host,
             application_redirected_to_login=False,
+            application_backend_authenticated=True,
+            application_backend_unauthorized=False,
             reason=proof.reason,
         )
     return proof
@@ -249,28 +360,14 @@ def prove_fresh_session(page, base_url: str, *, settle_ms: int = 1500) -> Sessio
 def prove_existing_session(page, base_url: str, *, settle_ms: int = 1500) -> SessionProof:
     """Strong health check for an existing saved session.
 
-    Do not use the public job-search page as auth proof and do not use the bare
-    /application/ landing. Navigate directly to the country-specific protected
-    consent route and return as soon as strict application evidence appears.
-    An expired session should instead redirect to the auth host and fail.
+    The page must both render positive protected-application evidence and make
+    its own authenticated candidate GET successfully. A stale consent shell or
+    stale localStorage token key names can no longer produce a green proof.
     """
-    expected_host = _host(base_url)
-    application_url = _application_probe_url(base_url)
-
-    try:
-        page.goto(application_url, wait_until="domcontentloaded")
-    except Exception as exc:  # noqa: BLE001
-        return _failed(
-            expected_host=expected_host,
-            authenticated_host=_host(getattr(page, "url", "")),
-            authenticated_state="UNKNOWN",
-            application_host=_host(getattr(page, "url", "")),
-            reason=f"could not open protected application route: {str(exc)[:200]}",
-        )
-
-    return _wait_for_application_proof(
+    return _probe_application(
         page,
         base_url,
+        _application_probe_url(base_url),
         reason="saved country-specific application session strongly verified",
         timeout_ms=max(6000, settle_ms),
     )
