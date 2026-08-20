@@ -4,7 +4,7 @@ import watcher_v3
 import watcher_v4
 
 
-def test_live_watcher_forces_fresh_session_before_detector_loop(monkeypatch):
+def test_live_watcher_starts_strong_session_proof_before_detector_loop(monkeypatch):
     watcher = object.__new__(watcher_v4.AutoSessionWatcher)
     watcher.auto_relogin = True
     watcher.dry_run = False
@@ -26,7 +26,9 @@ def test_live_watcher_forces_fresh_session_before_detector_loop(monkeypatch):
 
     watcher_v4.AutoSessionWatcher._loop(watcher, once=False)
 
-    assert calls[0] == ("session", True, "startup fresh Canadian session proof")
+    # False means: prove/reuse a valid saved session first. session_refresh is
+    # responsible for running the existing auth flow only when that proof fails.
+    assert calls[0] == ("session", False, "startup strong session proof/recovery")
     assert calls[1] == ("detector", False)
     assert watcher.next_session_check == 1300.0
 
