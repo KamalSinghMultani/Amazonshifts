@@ -58,10 +58,26 @@ def append_record(
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def latest(path: Path = DEFAULT_PATH) -> dict | None:
+def _lines(path: Path = DEFAULT_PATH) -> list[str]:
     if not path.exists():
-        return None
-    lines = [line for line in path.read_text("utf-8").splitlines() if line.strip()]
+        return []
+    return [line for line in path.read_text("utf-8").splitlines() if line.strip()]
+
+
+def count(path: Path = DEFAULT_PATH) -> int:
+    return len(_lines(path))
+
+
+def latest(path: Path = DEFAULT_PATH) -> dict | None:
+    lines = _lines(path)
     if not lines:
+        return None
+    return json.loads(lines[-1])
+
+
+def latest_after(start_count: int, path: Path = DEFAULT_PATH) -> dict | None:
+    """Latest record created after a caller's starting line count."""
+    lines = _lines(path)
+    if len(lines) <= max(0, int(start_count)):
         return None
     return json.loads(lines[-1])
