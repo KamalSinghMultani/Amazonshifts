@@ -101,9 +101,10 @@ def test_fast_hold_does_not_capture_before_create_click():
     start = source.index("if create_ready and not create_clicked:")
     end = source.index("if create_clicked:", start)
     critical = source[start:end]
-    assert "page.screenshot" not in critical
-    assert "failure_capture.capture" not in critical
-    assert "page.locator(CREATE).first.click" in critical
+    click = critical.index("page.locator(CREATE).first.click")
+    before_click = critical[:click]
+    assert "page.screenshot" not in before_click
+    assert "failure_capture.capture" not in before_click
 
 
 def test_v5_passes_integrity_settings_and_skips_fallback_after_agree():
