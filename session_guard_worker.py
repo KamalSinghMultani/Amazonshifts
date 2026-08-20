@@ -65,11 +65,14 @@ def _prove(config_path: str, input_state: Path, output_state: Path, result_path:
                 browser_launch.close_context(browser, context)
                 return 0
 
-            # Only a real redirect to the login flow is authoritative proof that
-            # the application session is dead. A slow React mount, network error,
-            # or WAF page is inconclusive and must not trigger an unnecessary
-            # authentication attempt.
-            definitive = bool(proof.application_redirected_to_login)
+            # A real auth redirect or a 401 from the protected candidate read is
+            # authoritative expiry evidence. Slow React, missing response events,
+            # network errors, and WAF/403 responses stay inconclusive so a health
+            # check never turns into an unnecessary authentication attempt.
+            definitive = bool(
+                proof.application_redirected_to_login
+                or proof.application_backend_unauthorized
+            )
             _write(
                 result_path,
                 status="expired" if definitive else "inconclusive",
