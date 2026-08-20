@@ -103,9 +103,10 @@ def apply_patch(module) -> None:
         """Require positive account/application evidence; URL alone is not enough.
 
         The public job-search URL is reachable while signed out, so URL-only
-        detection produced false SESSION_READY results. Negative login evidence
-        wins first, then explicit account UI/text or protected-application
-        evidence is required for a positive.
+        detection produced false SESSION_READY results. Negative login controls
+        win first. A protected application page is then allowed to prove auth
+        before generic text checks, because normal Hiring headers can contain
+        phrases such as "Select your country" that also appear in the login UI.
         """
         url = (self.page.url or "").lower().strip()
 
@@ -114,9 +115,16 @@ def apply_patch(module) -> None:
         if "auth.hiring.amazon" in url:
             return False
 
+        # Real visible login controls are authoritative negative evidence.
         for selector in (EMAIL_INPUT, CODE_INPUT, COUNTRY_TOGGLE, *PIN_INPUT_SELECTORS):
             if self._is_visible(selector):
                 return False
+
+        # Live Canadian auth can land directly on the protected consent page.
+        # Check this BEFORE generic body-text rejection: the ordinary locale
+        # header can itself say "Select your country" on an authenticated page.
+        if _application_auth_evidence(self):
+            return True
 
         text = self._get_text()
         if any(phrase in text for phrase in (
@@ -144,11 +152,6 @@ def apply_patch(module) -> None:
         ):
             if self._is_visible(selector):
                 return True
-
-        # Live Canadian auth can land directly on the protected consent page
-        # without rendering the generic account-menu markers above.
-        if _application_auth_evidence(self):
-            return True
 
         return False
 
