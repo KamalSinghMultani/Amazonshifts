@@ -18,6 +18,8 @@ import site_selectors
 
 NEXT = "[data-test-id='layout'] button:has-text('Next')"
 CREATE = "[data-test-id='layout'] button:has-text('Create Application')"
+INTEGRITY_AGREE = "[data-test-id='integrity-notice-agree-button']"
+INTEGRITY_ROUTE = "application-integrity-notice"
 HOLD_TEXT = "holding a spot"
 
 
@@ -49,6 +51,23 @@ def _banner(page: Any) -> str:
     return " ".join(text[idx:idx + 220].split())
 
 
+def _integrity_notice(page: Any) -> bool:
+    """Whether Amazon advanced to its applicant-only integrity attestation.
+
+    Live 2026-08-19: after Create Application the Canadian flow routed to an
+    Application Integrity Notice whose I Agree button certifies that the sole
+    applicant is completing the application and is not using bots/AI/third
+    parties to complete it.  Detect that page immediately, but never click the
+    attestation from automation.
+    """
+    try:
+        if INTEGRITY_ROUTE in (getattr(page, "url", "") or "").lower():
+            return True
+    except Exception:
+        pass
+    return _visible(page, INTEGRITY_AGREE)
+
+
 def hold(
     page: Any,
     application_url: str,
@@ -63,7 +82,9 @@ def hold(
 
     Polling is 50ms and readiness-driven.  After Create Application is pressed,
     the function returns immediately when Amazon's own update-application
-    response proves JOB_SELECTED + expected schedule + reserve expiry.
+    response proves JOB_SELECTED + expected schedule + reserve expiry.  If the
+    site instead advances to its applicant-only integrity attestation, return
+    immediately for manual action rather than wasting the confirmation timeout.
     """
     began = time.perf_counter()
     timings: list[tuple[str, float]] = []
@@ -151,11 +172,9 @@ def hold(
                     pass
 
             if create_ready and not create_clicked:
-                if screenshot_path:
-                    try:
-                        page.screenshot(path=screenshot_path, full_page=False)
-                    except Exception:
-                        pass
+                # Critical-path rule: do not screenshot before the committing
+                # click.  The 2026-08-19 live run spent ~723ms between button
+                # ready and click while a diagnostic screenshot was taken.
                 mark("create application ready")
                 if stop_before_submit:
                     return (
@@ -189,6 +208,32 @@ def hold(
                     )
 
             if create_clicked:
+                # New live CA behavior observed 2026-08-19. Create Application
+                # succeeded and navigated here, but no JOB_SELECTED reserve was
+                # observed. The next button is a personal integrity attestation,
+                # so surface it immediately rather than clicking it or waiting
+                # another ~16 seconds for a confirmation that cannot arrive yet.
+                if _integrity_notice(page):
+                    mark("integrity notice reached")
+                    captured = failure_capture.capture(
+                        page,
+                        getattr(page, "context", None),
+                        base_url,
+                        "hold-integrity-notice",
+                        extra={"reserve_confirmed": False},
+                    )
+                    return (
+                        site_selectors.HoldResult(
+                            site_selectors.UNCERTAIN,
+                            "Create Application advanced to Amazon's Application Integrity Notice, "
+                            "but the shift reserve was not confirmed. Manual applicant action is "
+                            "required; automation stopped without clicking I Agree. "
+                            f"Screenshot: {captured.get('screenshot') or '<none>'}",
+                            url=getattr(page, "url", ""), timings=timings,
+                        ),
+                        observer.detail(),
+                    )
+
                 banner = _banner(page)
                 if banner:
                     mark("holding banner seen")
