@@ -59,25 +59,33 @@ def _prove(config_path: str, input_state: Path, output_state: Path, result_path:
                     status="healthy",
                     detail=proof.reason + "; " + proof.summary(),
                     proof=proof.to_dict(),
+                    definitive_expiry=False,
                     mode="prove",
                 )
                 browser_launch.close_context(browser, context)
                 return 0
 
+            # Only a real redirect to the login flow is authoritative proof that
+            # the application session is dead. A slow React mount, network error,
+            # or WAF page is inconclusive and must not trigger an unnecessary
+            # authentication attempt.
+            definitive = bool(proof.application_redirected_to_login)
             _write(
                 result_path,
-                status="unhealthy",
+                status="expired" if definitive else "inconclusive",
                 detail=proof.reason + "; " + proof.summary(),
                 proof=proof.to_dict(),
+                definitive_expiry=definitive,
                 mode="prove",
             )
             browser_launch.close_context(browser, context)
             return 2
-    except Exception as exc:  # noqa: BLE001 - worker reports, never leaks request headers
+    except Exception as exc:  # noqa: BLE001 - worker reports, never exposes request headers
         _write(
             result_path,
             status="error",
             detail=f"session proof worker failed ({type(exc).__name__})",
+            definitive_expiry=False,
             mode="prove",
         )
         return 3
