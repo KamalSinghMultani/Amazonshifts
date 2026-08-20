@@ -41,9 +41,10 @@ def test_recovery_is_explicit_separate_mode():
     assert "force_login=True" in source
 
 
-def test_proof_worker_marks_only_login_redirect_as_definite_expiry():
+def test_proof_worker_marks_redirect_or_candidate_401_as_definite_expiry():
     source = inspect.getsource(session_guard_worker._prove)
     assert "application_redirected_to_login" in source
+    assert "application_backend_unauthorized" in source
     assert 'status="expired" if definitive else "inconclusive"' in source
     assert "definitive_expiry=definitive" in source
 
