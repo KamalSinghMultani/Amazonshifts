@@ -273,22 +273,59 @@ def _wait_for_application_proof(
     return last
 
 
-def _probe_application(page, base_url: str, target_url: str, *, reason: str, timeout_ms: int) -> SessionProof:
-    """Navigate harmlessly while observing the shell's protected candidate GET."""
+def _probe_application(
+    page,
+    base_url: str,
+    target_url: str,
+    *,
+    reason: str,
+    timeout_ms: int,
+    force_reload: bool = False,
+) -> SessionProof:
+    """Navigate harmlessly while observing the shell's protected candidate GET.
+
+    Fresh authentication can finish on the exact consent URL we need to probe.
+    Calling ``goto`` with that same SPA URL is not guaranteed to rebuild the
+    application shell, so no candidate request may be emitted even when login
+    succeeded. For a fresh-login proof we therefore force a real browser reload
+    after attaching the response observer. Existing-session checks still use a
+    normal navigation from their blank worker page.
+    """
     expected_host = _host(base_url)
     backend_probe = _ProtectedBackendProbe(expected_host)
     backend_probe.attach(page)
 
     try:
-        page.goto(target_url, wait_until="domcontentloaded")
+        current_url = str(getattr(page, "url", "") or "")
+        if force_reload and current_url == target_url and hasattr(page, "reload"):
+            page.reload(wait_until="domcontentloaded")
+        else:
+            page.goto(target_url, wait_until="domcontentloaded")
     except Exception as exc:  # noqa: BLE001
-        return _failed(
-            expected_host=expected_host,
-            authenticated_host=_host(getattr(page, "url", "")),
-            authenticated_state="UNKNOWN",
-            application_host=_host(getattr(page, "url", "")),
-            reason=f"could not open protected application route: {str(exc)[:200]}",
-        )
+        # A reload may fail during a just-finished auth navigation. One ordinary
+        # navigation is a safe fallback and still cannot create an application.
+        if force_reload:
+            try:
+                page.goto(target_url, wait_until="domcontentloaded")
+            except Exception as fallback_exc:  # noqa: BLE001
+                return _failed(
+                    expected_host=expected_host,
+                    authenticated_host=_host(getattr(page, "url", "")),
+                    authenticated_state="UNKNOWN",
+                    application_host=_host(getattr(page, "url", "")),
+                    reason=(
+                        "could not re-open protected application route after login: "
+                        f"{str(fallback_exc)[:200]}"
+                    ),
+                )
+        else:
+            return _failed(
+                expected_host=expected_host,
+                authenticated_host=_host(getattr(page, "url", "")),
+                authenticated_state="UNKNOWN",
+                application_host=_host(getattr(page, "url", "")),
+                reason=f"could not open protected application route: {str(exc)[:200]}",
+            )
 
     return _wait_for_application_proof(
         page,
@@ -303,10 +340,10 @@ def prove_fresh_session(page, base_url: str, *, settle_ms: int = 1500) -> Sessio
     """Verify a just-authenticated session without creating an application.
 
     A fresh login's UI state is checked first, then the same protected page is
-    re-probed (or the country-specific consent route is opened) so a normal
-    protected candidate GET can prove the backend accepts the session. Reusing
-    the same application URL avoids the old bad behavior of navigating a good
-    country-specific landing to ambiguous bare /application/.
+    force-reloaded (or the country-specific consent route is opened) so the
+    application really boots and emits its protected candidate GET. Reusing the
+    country-specific route avoids the old bad behavior of navigating a good
+    landing to ambiguous bare /application/.
     """
     expected_host = _host(base_url)
     authenticated_host = _host(getattr(page, "url", ""))
@@ -341,6 +378,7 @@ def prove_fresh_session(page, base_url: str, *, settle_ms: int = 1500) -> Sessio
         target_url,
         reason="fresh country-specific authentication and application backend access verified",
         timeout_ms=max(6000, settle_ms),
+        force_reload=True,
     )
     if proof.passed:
         return SessionProof(
