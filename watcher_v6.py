@@ -3,6 +3,7 @@
 v5 separates health proof from login recovery and gates every hold on a recent
 strong application-session proof. v6 tightens classification further:
 
+* live holding always gets a startup proof, even if auto-relogin is disabled;
 * only a definite redirect to the login flow marks the live session expired;
 * inconclusive network/WAF/React health probes never trigger a login attempt;
 * inconclusive probes are retried soon and the verification lease prevents a
@@ -17,6 +18,7 @@ import logging
 import time
 
 import watcher as base
+import watcher_v3
 import watcher_v5
 
 log = logging.getLogger("watcher")
@@ -24,6 +26,36 @@ log = logging.getLogger("watcher")
 
 class HoldReadyWatcher(watcher_v5.PreLiveWatcher):
     """v5 with fail-closed hold readiness and conservative proof classification."""
+
+    def _loop(self, once: bool = False) -> None:
+        # Session health is a prerequisite for live holding, not an auto-login
+        # feature. Always start a harmless prove-only worker for a normal live
+        # watcher. Recovery remains controlled separately by auto_relogin.
+        #
+        # A caller such as real_hold_test may already mark the exact preflight
+        # state verified before run(); in that case do not prove it twice.
+        live_holder = (
+            not once
+            and not self.dry_run
+            and bool((self.cfg.get("hold") or {}).get("enabled"))
+        )
+        if live_holder and self.session_ok is not True:
+            if self._start_session_worker(
+                force_login=False,
+                reason="startup strong hold-session proof",
+            ):
+                now = time.monotonic()
+                if self.session_check_every:
+                    self.next_session_check = now + self.session_check_every
+                log.info(
+                    "startup protected-session proof running in background; "
+                    "detection continues, holding stays gated until proof succeeds"
+                )
+
+        # Skip v4's older startup hook (which tied proof to auto_relogin) and
+        # enter v3's non-blocking detection/maintenance loop directly. Dynamic
+        # dispatch still calls all v6/v5 overrides below.
+        watcher_v3.OptimizedWatcher._loop(self, once=once)
 
     def _hold_session_ready(self) -> bool:
         if self.session_ok is not True:
