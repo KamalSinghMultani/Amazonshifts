@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -31,8 +33,269 @@ from shift_matcher import Shift
 log = logging.getLogger("watcher")
 
 
+class SessionBlockedResult(site_selectors.HoldResult):
+    """A global session gate failure: keep the schedule retryable, stop the batch."""
+
+    def worth_retrying(self) -> bool:
+        return False
+
+
 class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
-    """Final layer used for the real hold validation run."""
+    """Final layer used for live watching and the real hold validation run."""
+
+    def __init__(self, cfg: dict, live_override: bool = False) -> None:
+        super().__init__(cfg, live_override=live_override)
+        state_dir = Path(cfg["state"]["path"]).parent
+        self.session_probe_input_path = state_dir / "session_probe_input_state.json"
+        self._session_worker_force_login = False
+        self.session_last_verified_monotonic: float | None = None
+        self.session_last_verified_at: datetime | None = None
+        self.session_status_reason = "application session has not been strongly verified yet"
+        self._session_outage_alerted = False
+        self._session_ready_announced = False
+        self._session_block_alerted = False
+
+        # If health workers ever stall or fail silently, do not trust a proof
+        # forever. Normal 5-minute health checks renew this comfortably before
+        # the lease expires. The real one-shot test marks its preflight session
+        # verified explicitly in RealHoldTestWatcher.
+        check_every = max(0.0, float(self.session_check_every or 0))
+        self.session_verification_lease_seconds = max(600.0, check_every * 2.0)
+
+    # ── session truth / gating ──────────────────────────────────────────────
+    def _mark_session_verified(self, reason: str, *, notify: bool = True) -> None:
+        was = self.session_ok
+        self.session_ok = True
+        self.session_last_verified_monotonic = time.monotonic()
+        self.session_last_verified_at = datetime.now()
+        self.session_status_reason = reason
+        self.relogin_tried = False
+        self._session_outage_alerted = False
+        self._session_block_alerted = False
+
+        if was is False:
+            log.info("LIVE HOLD SESSION RESTORED — holding re-armed (%s)", reason)
+            if notify and self.alert_on_expiry:
+                self.notify_async(
+                    self.notifier.send_text,
+                    "✅ <b>Amazon hold session restored</b>\n"
+                    "Holding is re-armed; detection never stopped.",
+                )
+        elif not self._session_ready_announced:
+            log.info("LIVE HOLD SESSION VERIFIED — reservations armed (%s)", reason)
+            if notify and self.alert_on_expiry and not self.dry_run:
+                self.notify_async(
+                    self.notifier.send_text,
+                    "✅ <b>Amazon hold session verified</b>\n"
+                    "Reservations are armed.",
+                )
+            self._session_ready_announced = True
+
+    def _verified_age_seconds(self) -> float | None:
+        if self.session_last_verified_monotonic is None:
+            return None
+        return max(0.0, time.monotonic() - self.session_last_verified_monotonic)
+
+    def _verified_age_text(self) -> str:
+        age = self._verified_age_seconds()
+        if age is None:
+            return "never verified"
+        if age < 60:
+            return f"verified {age:.0f}s ago"
+        return f"verified {age / 60:.1f} min ago"
+
+    def _hold_session_ready(self) -> bool:
+        if self.session_ok is not True:
+            return False
+        age = self._verified_age_seconds()
+        if age is not None and age <= self.session_verification_lease_seconds:
+            return True
+
+        # A stale proof is not proof. Start a non-login health check and keep
+        # any newly found schedule retryable until that check comes back.
+        self.session_ok = None
+        self.session_status_reason = "strong session proof became stale"
+        log.warning(
+            "hold session proof is stale (%s); holding temporarily gated until re-verified",
+            self._verified_age_text(),
+        )
+        if self.session_worker is None and not self.holding:
+            self._start_session_worker(force_login=False, reason="stale hold-session proof")
+        return False
+
+    def _mark_live_session_unhealthy(self, detail: str) -> None:
+        was = self.session_ok
+        self.session_ok = False
+        self.session_status_reason = detail
+        log.error("LIVE HOLD SESSION NOT VERIFIED — holding disabled: %s", detail)
+        if self.alert_on_expiry and (was is not False or not self._session_outage_alerted):
+            self.notify_async(
+                self.notifier.notify_error,
+                "🚨 <b>Amazon hold session is not verified</b>\n"
+                "Holding is DISABLED so the watcher cannot silently miss a shift while signed out.\n"
+                "Detection is still running and matching schedules stay retryable.\n"
+                "Automatic recovery will be attempted if it is available.",
+            )
+            self._session_outage_alerted = True
+
+    # ── isolated proof / recovery workers ──────────────────────────────────
+    def _start_session_worker(self, *, force_login: bool, reason: str) -> bool:
+        """Start either a prove-only worker or an explicit recovery worker.
+
+        Health proof never logs in. A CAPTCHA/re-login block therefore cannot
+        disable future health checks; it only prevents additional recovery
+        attempts. This keeps live-session truth separate from login success.
+        """
+        if self.session_worker is not None or self.holding:
+            return False
+        self._roll_failed_relogin_day()
+
+        if force_login:
+            if self.relogin_blocked or not self._failure_budget_left():
+                return False
+
+        self.refresh_state_path.parent.mkdir(parents=True, exist_ok=True)
+        for path in (self.refresh_state_path, self.refresh_result_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        try:
+            # Prove exactly what the live watcher is carrying right now rather
+            # than an old auth_state.json snapshot.
+            self.context.storage_state(path=str(self.session_probe_input_path))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not snapshot live session for %s: %s", reason, exc)
+            return False
+
+        mode = "recover" if force_login else "prove"
+        cmd = [
+            sys.executable,
+            str(Path(__file__).with_name("session_guard_worker.py")),
+            "--config", self.config_path,
+            "--input-state", str(self.session_probe_input_path),
+            "--output-state", str(self.refresh_state_path),
+            "--result", str(self.refresh_result_path),
+            "--mode", mode,
+        ]
+
+        try:
+            self.session_worker = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=str(Path(__file__).resolve().parent),
+            )
+            self.session_worker_reason = reason
+            self._session_worker_force_login = force_login
+            log.info("session %s started in background (%s)", mode, reason)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not start background session %s: %s", mode, exc)
+            return False
+
+    def _poll_session_worker(self) -> None:
+        worker = self.session_worker
+        if worker is None or worker.poll() is None:
+            return
+
+        reason = self.session_worker_reason or "session maintenance"
+        forced = bool(self._session_worker_force_login)
+        self.session_worker = None
+        self.session_worker_reason = ""
+        self._session_worker_force_login = False
+
+        status = "error"
+        detail = f"session worker exited {worker.returncode}"
+        try:
+            result = json.loads(self.refresh_result_path.read_text("utf-8"))
+            status = str(result.get("status") or status)
+            detail = str(result.get("detail") or detail)
+        except Exception as exc:  # noqa: BLE001
+            detail = f"could not read session worker result ({type(exc).__name__})"
+
+        if status in ("ok", "healthy"):
+            try:
+                if self.refresh_state_path.exists():
+                    self._apply_refreshed_state()
+                self._mark_session_verified(
+                    "fresh recovery strongly proved" if forced else "existing live session strongly proved"
+                )
+                log.info("background session %s succeeded (%s)", "recovery" if forced else "proof", detail)
+                return
+            except Exception as exc:  # noqa: BLE001
+                status = "error"
+                detail = f"verified state could not be imported ({type(exc).__name__})"
+
+        if forced:
+            # A replacement-login failure does NOT prove the currently running
+            # session died. Preserve its live hold-ready state until an actual
+            # prove-only health check says otherwise.
+            self.failed_relogins_today += 1
+            log.warning(
+                "session recovery/refresh failed (%s): %s [failed today %d/%s]",
+                status,
+                detail,
+                self.failed_relogins_today,
+                self.max_failed_relogins_per_day or "unlimited",
+            )
+            if status == "captcha":
+                self.relogin_blocked = True
+                log.error("CAPTCHA blocked recovery; further login attempts paused, health proofs remain enabled")
+            if not self._failure_budget_left():
+                self.relogin_blocked = True
+                log.error("failed-login budget exhausted; recovery paused until tomorrow")
+
+            # Re-check the still-running live session soon. This proof never logs
+            # in, so even a CAPTCHA-blocked recovery cannot blind session health.
+            if self.session_check_every:
+                self.next_session_check = min(
+                    self.next_session_check or float("inf"),
+                    time.monotonic() + 60.0,
+                )
+
+            if self.alert_on_expiry:
+                if self.session_ok is True:
+                    self.notify_async(
+                        self.notifier.notify_error,
+                        "⚠️ <b>Amazon session refresh failed</b>\n"
+                        f"The current live hold session is still verified ({self._verified_age_text()}); "
+                        "holding remains armed. A prove-only health check will run again soon."
+                        + (
+                            "\nAutomatic login recovery is paused because Amazon presented a challenge."
+                            if status == "captcha" else ""
+                        ),
+                    )
+                else:
+                    self.notify_async(
+                        self.notifier.notify_error,
+                        "🚨 <b>Amazon session recovery failed</b>\n"
+                        "Holding remains DISABLED; detection continues and schedules remain retryable."
+                        + (
+                            "\nAutomatic login recovery is paused because Amazon presented a challenge."
+                            if status == "captcha" else ""
+                        ),
+                    )
+            return
+
+        # A prove-only failure is authoritative for the copied live session and
+        # never attempted authentication. Gate holding immediately, then launch
+        # one separate recovery attempt if allowed.
+        self._mark_live_session_unhealthy(detail)
+        if self.auto_relogin and not self.relogin_blocked and self._failure_budget_left():
+            started = self._start_session_worker(
+                force_login=True,
+                reason=f"recovery after failed health proof ({reason})",
+            )
+            if started:
+                log.warning("hold session proof failed; automatic recovery started")
+        elif self.alert_on_expiry and self.relogin_blocked:
+            self.notify_async(
+                self.notifier.notify_error,
+                "🚨 <b>Amazon hold session needs manual attention</b>\n"
+                "Holding is disabled and automatic login recovery is paused. Detection is still running.",
+            )
 
     def _start_api_mode(self, browser_cfg: dict) -> None:
         """Prime a persistent live profile from the latest saved verified state.
@@ -150,14 +413,10 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
         else:
             log.info("FAST HOLD dispatch schedule=%s", schedule_id)
 
-        # Diagnostic-only browser-side MutationObserver. It starts before the
-        # application document JavaScript and pushes only a few milestone
-        # events back to Python, so profiling does not add a 50ms polling loop
-        # or delay the reservation click. The resulting markers let us compare
-        # DOM insertion/enabled time against Playwright actionability.
         probe = hold_dom_probe.HoldDomProbe(page)
         probe.start()
         result = None
+        backend_detail = ""
         try:
             result, backend_detail = fast_hold.hold(
                 page,
@@ -191,6 +450,20 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
             backend_detail=backend_detail,
         )
 
+        low_message = (getattr(result, "message", "") or "").lower()
+        if "redirected to login" in low_message or site_selectors.is_login_page(page):
+            # This is direct evidence from the actual reservation path, stronger
+            # than any background helper. Stop wasting the batch on compatibility
+            # fallbacks and immediately move the watcher into recovery mode.
+            self._mark_live_session_unhealthy("actual hold path redirected to login")
+            if self.auto_relogin and self.session_worker is None and not self.relogin_blocked:
+                self._start_session_worker(
+                    force_login=True,
+                    reason="actual hold path proved session dead",
+                )
+            self._report_hold(shift, result, shot, poll_started)
+            return result
+
         integrity_attempted = any(
             name == "integrity agree clicked"
             for name, _ms in (getattr(result, "timings", ()) or ())
@@ -200,19 +473,11 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
             or result.status == site_selectors.UNCERTAIN
             or integrity_attempted
         ):
-            # Once I Agree was attempted, never run the old compatibility path
-            # against the same schedule. A known unavailable result is a real
-            # race loss, not a reason to create/advance the same application a
-            # second time through the slower card/detail flow.
             if integrity_attempted and result.status == site_selectors.FAILED:
                 log.info("integrity reservation attempt finished without a reserve; skipping compatibility fallback")
             self._report_hold(shift, result, shot, poll_started)
             return result
 
-        # Keep the original click path as a compatibility fallback. Disable
-        # direct_apply only for this call so v3._hold falls through to v2's
-        # proven card/detail/schedule flow instead of recursively retrying this
-        # direct route.
         log.warning(
             "fast direct route failed (%s); trying original click fallback",
             (result.message or "")[:140],
@@ -235,8 +500,6 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
             self.cfg["hold"]["direct_apply"] = original
 
         if fallback is not None:
-            # Separate record so the first live test tells us whether the fast
-            # path won or the compatibility path had to rescue it.
             fallback_shift = Shift(
                 id=shift.id,
                 title=shift.title,
@@ -253,6 +516,25 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
                 backend_detail="compatibility fallback",
             )
         return fallback
+
+    def _hold(self, shift, poll_started: float | None = None):
+        if not self._hold_session_ready():
+            if not self._session_block_alerted and self.alert_on_expiry:
+                self.notify_async(
+                    self.notifier.notify_error,
+                    "⚠️ <b>Shift found, but holding is temporarily gated</b>\n"
+                    "The application session is not currently strongly verified. "
+                    "The schedule remains retryable while verification/recovery runs.",
+                )
+                self._session_block_alerted = True
+            if self.session_worker is None and not self.holding:
+                self._start_session_worker(force_login=False, reason="shift found while hold session unverified")
+            return SessionBlockedResult(
+                site_selectors.FAILED,
+                "holding blocked: application session is not currently verified; schedule remains retryable",
+                url=getattr(self.page, "url", "") if self.page is not None else "",
+            )
+        return super()._hold(shift, poll_started=poll_started)
 
     def _stop_session_worker(self) -> None:
         worker = getattr(self, "session_worker", None)
