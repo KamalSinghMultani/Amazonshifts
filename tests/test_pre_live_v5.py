@@ -15,6 +15,14 @@ def test_v5_extends_v4_instead_of_replacing_original_stack():
     assert issubclass(watcher_v5.PreLiveWatcher, watcher_v4.AutoSessionWatcher)
 
 
+def test_v5_primes_persistent_context_before_poll_loop():
+    source = inspect.getsource(watcher_v5.PreLiveWatcher._start_api_mode)
+    assert "self.context.add_cookies" in source
+    assert "localStorage.setItem" in source
+    assert "super()._start_api_mode" in source
+    assert "browser_cfg.get(\"user_data_dir\")" in source
+
+
 def test_fast_hold_is_browser_driven_and_passively_observes_backend():
     source = inspect.getsource(fast_hold)
     assert "SoftReserveObserver" in source
