@@ -9,13 +9,14 @@ class FakePage:
     def __init__(self, url="https://hiring.amazon.ca/app#/jobSearch"):
         self.url = url
         self.visited = []
+        self.waits = []
 
     def goto(self, url, **_kwargs):
         self.visited.append(url)
         self.url = url
 
-    def wait_for_timeout(self, _ms):
-        pass
+    def wait_for_timeout(self, ms):
+        self.waits.append(ms)
 
 
 def _patch_authenticated(monkeypatch, state_name="AUTHENTICATED"):
@@ -55,7 +56,20 @@ def test_fresh_proof_rejects_url_without_positive_auth_state(monkeypatch):
     assert "positive authenticated UI evidence" in proof.reason
 
 
-def test_fresh_proof_requires_application_shell_to_stay_on_canada(monkeypatch):
+def test_fresh_proof_does_not_navigate_away_from_authenticated_application(monkeypatch):
+    _patch_authenticated(monkeypatch)
+    page = FakePage("https://hiring.amazon.ca/application/ca/#/consent")
+
+    proof = session_proof.prove_fresh_session(page, "https://hiring.amazon.ca")
+
+    assert proof.passed is True
+    assert proof.authenticated_state == "AUTHENTICATED"
+    assert proof.application_host == "hiring.amazon.ca"
+    assert page.visited == []
+    assert "protected application page" in proof.reason
+
+
+def test_fresh_proof_requires_application_probe_to_stay_on_canada(monkeypatch):
     _patch_authenticated(monkeypatch)
     page = FakePage("https://hiring.amazon.ca/app#/jobSearch")
 
@@ -72,7 +86,7 @@ def test_fresh_proof_requires_application_shell_to_stay_on_canada(monkeypatch):
     assert proof.application_redirected_to_login is True
 
 
-def test_fresh_proof_passes_only_with_strong_canadian_auth_and_application_access(monkeypatch):
+def test_fresh_proof_uses_country_specific_consent_probe(monkeypatch):
     _patch_authenticated(monkeypatch)
     page = FakePage("https://hiring.amazon.ca/app#/jobSearch")
     monkeypatch.setattr(session_proof.site_selectors, "is_login_page", lambda _page: False)
@@ -84,10 +98,10 @@ def test_fresh_proof_passes_only_with_strong_canadian_auth_and_application_acces
     assert proof.authenticated_host == "hiring.amazon.ca"
     assert proof.authenticated_state == "AUTHENTICATED"
     assert proof.application_host == "hiring.amazon.ca"
-    assert page.visited == ["https://hiring.amazon.ca/application/"]
+    assert page.visited == ["https://hiring.amazon.ca/application/ca/#/consent"]
 
 
-def test_existing_session_first_loads_country_job_search_then_application(monkeypatch):
+def test_existing_session_probes_protected_country_route_directly(monkeypatch):
     _patch_authenticated(monkeypatch)
     page = FakePage("about:blank")
     monkeypatch.setattr(session_proof.site_selectors, "is_login_page", lambda _page: False)
@@ -95,7 +109,16 @@ def test_existing_session_first_loads_country_job_search_then_application(monkey
     proof = session_proof.prove_existing_session(page, "https://hiring.amazon.ca")
 
     assert proof.passed is True
-    assert page.visited == [
-        "https://hiring.amazon.ca/app#/jobSearch",
-        "https://hiring.amazon.ca/application/",
-    ]
+    assert page.visited == ["https://hiring.amazon.ca/application/ca/#/consent"]
+
+
+def test_us_probe_uses_us_application_route():
+    assert session_proof._application_probe_url("https://hiring.amazon.com") == (
+        "https://hiring.amazon.com/application/us/#/consent"
+    )
+
+
+def test_ca_probe_uses_ca_application_route():
+    assert session_proof._application_probe_url("https://hiring.amazon.ca") == (
+        "https://hiring.amazon.ca/application/ca/#/consent"
+    )
