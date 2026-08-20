@@ -18,6 +18,8 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import yaml
+
 import hold_metrics
 import session_refresh
 import site_selectors
@@ -93,6 +95,24 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     return cfg
 
 
+def _write_runtime_config(cfg: dict) -> Path:
+    """Write the in-memory test config for background session workers.
+
+    v3 session workers receive a config path, not the parent's in-memory dict.
+    Pointing them at normal config.yaml would make a worker reopen the old
+    auth_state.json immediately after preflight had proved/recovered a newer
+    real_test_verified_state.json.  This gitignored runtime config keeps the
+    main watcher and every helper on the exact same proved session source.
+    """
+    runtime = copy.deepcopy(cfg)
+    # validate_config recreates this derived value when the worker reloads.
+    (runtime.get("polling") or {}).pop("hot_windows_parsed", None)
+    path = Path("state/real_hold_test_runtime.yaml")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(runtime, sort_keys=False), "utf-8")
+    return path
+
+
 def _reset_test_state(cfg: dict) -> None:
     for key in ("path", "detections_path"):
         value = (cfg.get("state") or {}).get(key)
@@ -138,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = _prepare_cfg(args.config, args.minutes, verified_state)
     _reset_test_state(cfg)
+    runtime_config = _write_runtime_config(cfg)
     metrics_before = hold_metrics.count()
     deadline = datetime.now() + timedelta(minutes=args.minutes)
     print("SESSION READY — real hold validation is armed.")
@@ -146,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
     print("Timing records: logs/hold_timings.jsonl")
 
     watcher = RealHoldTestWatcher(cfg, live_override=True)
+    # Make v4/v3 background health/re-login workers use the same isolated,
+    # preflight-verified test state instead of normal config.yaml.
+    watcher.config_path = str(runtime_config)
     timer = threading.Timer(args.minutes * 60, watcher.stop_event.set)
     timer.daemon = True
     timer.start()
