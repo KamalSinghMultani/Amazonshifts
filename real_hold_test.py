@@ -3,14 +3,16 @@
 This command is intentionally separate from run_watcher.bat. It mutates only
 an in-memory config copy, never config.yaml. It broadens matching to whatever
 the already-Canadian API returns, runs for at most N minutes (max 60), and stops
-after the first committed reservation attempt.
+when a reserve is confirmed or the post-commit state is genuinely uncertain.
 
 For this validation only, the browser-driven fast path may click the observed
 Application Integrity Notice's I Agree control after Create Application, then
-passively wait for either a verified soft reserve or an unavailable result. It
-does not fill personal information, documents, assessments, identity checks, or
-any later application fields. A confirmed run creates a real Amazon candidate
-application / soft reserve.
+passively wait for either a verified soft reserve or an unavailable result. A
+narrow, explicit unavailable result is retryable: the watcher may move to the
+next ranked schedule within its normal attempt budget. It does not fill personal
+information, documents, assessments, identity checks, or later application
+fields. A confirmed run creates a real Amazon candidate application / soft
+reserve.
 """
 
 from __future__ import annotations
@@ -45,16 +47,24 @@ class RealHoldTestWatcher(watcher_v5.PreLiveWatcher):
                 for name, _ms in (getattr(result, "timings", ()) or ())
             )
         )
+
         if result is not None and (
-            result.held
-            or result.status == site_selectors.UNCERTAIN
-            or integrity_attempted
+            result.held or result.status == site_selectors.UNCERTAIN
         ):
-            # This validation maps exactly one committed application attempt.
-            # Stop even when the integrity transition proves the schedule lost
-            # the race, so a first test never creates a second application.
-            log.info("real hold validation stopping after first committed reservation attempt")
+            # Confirmed means we won. UNCERTAIN means a committed application
+            # may exist, so trying another schedule could create ambiguity.
+            log.info("real hold validation stopping after confirmed/uncertain reservation attempt")
             self.stop_event.set()
+        elif (
+            result is not None
+            and integrity_attempted
+            and result.status == site_selectors.FAILED
+        ):
+            # The fast path only returns this post-I-Agree FAILED state when it
+            # has narrow visible evidence that the schedule is unavailable.
+            # No reserve was confirmed, so let v3's normal retry loop advance
+            # immediately to the next ranked candidate within the attempt budget.
+            log.info("schedule explicitly unavailable after I Agree; trying next ranked schedule if available")
         return result
 
 
@@ -82,14 +92,14 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     cfg = copy.deepcopy(load_config(config_path))
     end = datetime.now() + timedelta(minutes=minutes)
 
-    # Explicit live validation: exactly one candidate schedule is attempted in
-    # the poll that reaches the integrity step, and the watcher stops after it.
+    # One reserve maximum, but up to three ranked candidates may be attempted
+    # when earlier ones return the explicit post-I-Agree unavailable state.
     cfg["dry_run"] = False
     cfg["hold"]["enabled"] = True
     cfg["hold"]["direct_apply"] = True
     cfg["hold"]["stop_before_submit"] = False
     cfg["hold"]["max_per_poll"] = 1
-    cfg["hold"]["job_attempts"] = 1
+    cfg["hold"]["job_attempts"] = max(3, int(cfg["hold"].get("job_attempts", 3)))
 
     # Reservation-only integrity mode. The fast path clicks only I Agree, then
     # waits for JOB_SELECTED + exact schedule + soft reserve expiry, or a narrow
@@ -190,9 +200,10 @@ def main(argv: list[str] | None = None) -> int:
     print("SESSION READY — reservation-only validation is armed.")
     print(f"Canada-wide matching ends automatically at {deadline:%Y-%m-%d %H:%M:%S} local time.")
     print("A visible Chrome window will stay open for this first integrity transition test.")
-    print("Flow: detect -> exact schedule -> Create Application -> I Agree -> reserve result -> STOP.")
+    print("Flow: detect -> exact schedule -> Create Application -> I Agree -> reserve result.")
+    print("Confirmed or uncertain -> STOP. Explicit unavailable -> try next ranked schedule (up to 3+ configured attempts).")
     print("Later personal-info/documents/assessment/identity steps are never filled or clicked.")
-    print("The process stops after the first committed reservation attempt, including an unavailable race loss.")
+    print("DOM timing markers will show document start, DOMContentLoaded, and when Create first enters/enables in the DOM.")
     print("Timing records: logs/hold_timings.jsonl")
 
     watcher = RealHoldTestWatcher(cfg, live_override=True)
