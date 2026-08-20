@@ -1,20 +1,15 @@
 """Final session bootstrap layer for the optimized watcher.
 
 v3 already keeps detection running while a child process checks/refreshes the
-Amazon Hiring session. One startup gap remained: the first health check was
-scheduled several minutes in the future. If the watcher launched with an
-expired portal session it could therefore detect shifts before it had even
-started repairing the login.
-
-v4 starts that existing background session worker immediately on a normal live
-run. It does not block detection: polling begins while the helper checks the
-session and, when necessary, performs the configured login flow. Normal
-periodic health checks and proactive refreshes remain owned by watcher_v3.
+Amazon Hiring session. v4 makes startup deterministic: a normal live run starts
+a fresh country-specific login in the background immediately, then resumes the
+normal periodic health/proactive-refresh cadence after that bootstrap.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 
 import watcher as base
 import watcher_v3
@@ -23,34 +18,28 @@ log = logging.getLogger("watcher")
 
 
 class AutoSessionWatcher(watcher_v3.OptimizedWatcher):
-    """Optimized watcher with immediate non-blocking session bootstrap."""
-
-    def __init__(self, cfg: dict, live_override: bool = False) -> None:
-        super().__init__(cfg, live_override=live_override)
-
-        # A live watcher with auto_relogin enabled should not wait five minutes
-        # before discovering that its application session is dead. Mark the
-        # health check due now. The helper still runs in a separate process, so
-        # this never stalls GraphQL detection.
-        if self.auto_relogin and not self.dry_run:
-            self.next_session_check = 0.0
+    """Optimized watcher with immediate, verified session bootstrap."""
 
     def _loop(self, once: bool = False) -> None:
-        # For the long-running watcher, start session maintenance before the
-        # first poll. _start_session_worker() returns immediately; the child
-        # process does the potentially slow page/login/OTP work while this
-        # process continues into the detector loop.
+        # A long-running live watcher should begin with a FRESH login rather
+        # than trusting an old application shell. The child process does the
+        # slow auth work, so GraphQL detection continues in this process.
         #
-        # --once intentionally remains a pure one-poll diagnostic and does not
-        # leave a background login helper running after the parent exits.
+        # --once intentionally remains a pure one-poll diagnostic, and dry-run
+        # never performs login clicks.
         if not once and self.auto_relogin and not self.dry_run:
             started = self._start_session_worker(
-                force_login=False,
-                reason="startup session bootstrap",
+                force_login=True,
+                reason="startup fresh Canadian session proof",
             )
             if started:
+                # Do not immediately launch the ordinary 5-minute health check
+                # when this worker returns. Start that cadence from now instead.
+                now = time.monotonic()
+                if self.session_check_every:
+                    self.next_session_check = now + self.session_check_every
                 log.info(
-                    "automatic session bootstrap started; detection continues while login is checked"
+                    "fresh Canadian login/proof started in background; detection continues"
                 )
 
         super()._loop(once=once)
