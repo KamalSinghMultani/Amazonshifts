@@ -73,6 +73,24 @@ def test_fast_hold_can_finish_from_backend_confirmation_without_ui_banner(monkey
     assert any(name == "backend reserve confirmed" for name, _ms in result.timings)
 
 
+def test_fast_hold_detects_integrity_notice_but_never_auto_attests():
+    source = inspect.getsource(fast_hold)
+    assert "integrity-notice-agree-button" in source
+    assert "application-integrity-notice" in source
+    assert "hold-integrity-notice" in source
+    assert "automation stopped without clicking I Agree" in source
+    assert "locator(INTEGRITY_AGREE).first.click" not in source
+
+
+def test_fast_hold_does_not_screenshot_before_create_click():
+    source = inspect.getsource(fast_hold.hold)
+    start = source.index("if create_ready and not create_clicked:")
+    end = source.index("if create_clicked:", start)
+    critical = source[start:end]
+    assert "screenshot" not in critical
+    assert "page.locator(CREATE).first.click" in critical
+
+
 def test_session_refresh_captures_failed_background_login_page():
     source = inspect.getsource(session_refresh.run)
     assert "_capture_failure" in source
