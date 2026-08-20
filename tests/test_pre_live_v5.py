@@ -155,7 +155,7 @@ def test_real_test_config_is_live_but_time_bounded_and_isolated(monkeypatch):
     assert out["hold"]["direct_apply"] is True
     assert out["hold"]["stop_before_submit"] is False
     assert out["hold"]["max_per_poll"] == 1
-    assert out["hold"]["job_attempts"] == 1
+    assert out["hold"]["job_attempts"] >= 3
     assert out["hold"]["manual_integrity_wait"] is False
     assert out["hold"]["manual_integrity_timeout_ms"] == 120000
     assert out["hold"]["auto_integrity_agree"] is True
@@ -178,19 +178,20 @@ def test_real_test_background_workers_are_repointed_to_runtime_config():
     assert "yaml.safe_dump" in writer
 
 
-def test_real_test_explains_auto_reservation_only_boundary():
+def test_real_test_explains_auto_reservation_and_retry_boundary():
     source = inspect.getsource(real_hold_test.main)
-    assert "Create Application -> I Agree -> reserve result -> STOP" in source
+    assert "Create Application -> I Agree -> reserve result" in source
+    assert "Explicit unavailable -> try next ranked schedule" in source
     assert "Later personal-info/documents/assessment/identity steps are never filled or clicked" in source
-    assert "including an unavailable race loss" in source
+    assert "DOM timing markers" in source
 
 
-def test_real_test_stops_after_integrity_attempt_even_if_unavailable():
+def test_real_test_stops_on_confirmed_or_uncertain_but_retries_explicit_unavailable():
     source = inspect.getsource(real_hold_test.RealHoldTestWatcher._hold)
-    assert "result.held" in source
-    assert "site_selectors.UNCERTAIN" in source
-    assert "integrity agree clicked" in source
+    assert "result.held or result.status == site_selectors.UNCERTAIN" in source
     assert "self.stop_event.set()" in source
+    assert "schedule explicitly unavailable after I Agree" in source
+    assert "trying next ranked schedule" in source
 
 
 def test_v5_cleans_up_background_session_worker_on_exit():
