@@ -30,19 +30,19 @@ import yaml
 import hold_metrics
 import session_refresh
 import site_selectors
-import watcher_v5
+import watcher_v6
 from config import load_config, load_dotenv, setup_logging
 
 
 log = logging.getLogger("watcher")
 
 
-class RealHoldTestWatcher(watcher_v5.PreLiveWatcher):
+class RealHoldTestWatcher(watcher_v6.HoldReadyWatcher):
     def __init__(self, cfg: dict, live_override: bool = False) -> None:
         super().__init__(cfg, live_override=live_override)
         # main() only constructs this watcher after _preflight() strongly proved
         # the exact storage state assigned to cfg.browser.storage_state. The
-        # normal v5 watcher begins unverified and proves itself in the background;
+        # normal watcher begins unverified and proves itself in the background;
         # this isolated <=60-minute test can safely start armed immediately.
         self._mark_session_verified("real-test preflight strongly proved this exact state", notify=False)
 
@@ -133,12 +133,10 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
 
     # The preflight immediately above already performed the strong protected
     # application-session proof and wrote the exact storage state this watcher
-    # will consume. Starting v4's normal background proof/re-login helper again
+    # will consume. Starting the normal background proof/re-login helper again
     # would open a second isolated/headless browser for no benefit during this
-    # <=60-minute mapping run. In the 2026-08-20 live test that redundant helper
-    # eventually hit a CAPTCHA while the main visible watcher remained healthy.
-    # Disable maintenance only in this isolated validation config; the normal
-    # long-running watcher keeps its configured health/re-login behavior.
+    # <=60-minute mapping run. Disable maintenance only in this isolated test;
+    # the normal long-running watcher keeps prove-only health checks + recovery.
     session_cfg = cfg.setdefault("session", {})
     session_cfg["check_every_seconds"] = 0
     session_cfg["relogin_every_seconds"] = 0
@@ -153,15 +151,8 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
 
 
 def _write_runtime_config(cfg: dict) -> Path:
-    """Write the in-memory test config for background session workers.
-
-    The real validation currently disables those workers because its strong
-    preflight already produced the exact verified state it consumes. Keeping a
-    runtime config still makes the test self-contained if a future diagnostic
-    helper is added and avoids accidentally pointing helpers at normal config.
-    """
+    """Write the in-memory test config for any diagnostic helper."""
     runtime = copy.deepcopy(cfg)
-    # validate_config recreates this derived value when the worker reloads.
     (runtime.get("polling") or {}).pop("hot_windows_parsed", None)
     path = Path("state/real_hold_test_runtime.yaml")
     path.parent.mkdir(parents=True, exist_ok=True)
