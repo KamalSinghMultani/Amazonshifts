@@ -163,6 +163,9 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
             manual_integrity_timeout_ms=int(
                 self.cfg["hold"].get("manual_integrity_timeout_ms", 120000)
             ),
+            auto_integrity_agree=bool(
+                self.cfg["hold"].get("auto_integrity_agree", False)
+            ),
         )
         self._record_hold_metric(
             shift,
