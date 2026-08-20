@@ -1,10 +1,10 @@
 """Final session bootstrap layer for the optimized watcher.
 
 v3 already keeps detection running while a child process checks/refreshes the
-Amazon Hiring session. v4 makes startup deterministic: a normal live run starts
-a fresh country-specific login in the background immediately, then imports the
-verified cookies AND country-site localStorage into the live watcher before
-resuming the normal periodic health/proactive-refresh cadence.
+Amazon Hiring session. v4 makes startup deterministic without throwing away a
+known-good browser session: it first asks the helper for STRONG country/session
+proof, and that helper only performs a fresh login when the proof fails. A
+verified child state is then imported as cookies plus country-site localStorage.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def _origin(url: str) -> str:
 
 
 class AutoSessionWatcher(watcher_v3.OptimizedWatcher):
-    """Optimized watcher with immediate, verified session bootstrap."""
+    """Optimized watcher with immediate, verified session bootstrap/recovery."""
 
     def _apply_refreshed_state(self) -> None:
         """Import the verified child-session state into the live context.
@@ -87,25 +87,26 @@ class AutoSessionWatcher(watcher_v3.OptimizedWatcher):
         )
 
     def _loop(self, once: bool = False) -> None:
-        # A long-running live watcher should begin with a FRESH login rather
-        # than trusting an old application shell. The child process does the
-        # slow auth work, so GraphQL detection continues in this process.
+        # A long-running live watcher must not mistake public API access for an
+        # authenticated application session, but it also should not force a new
+        # login every launch. The child first runs the strict existing-session
+        # proof. If that fails, session_refresh runs the project's existing auth
+        # state machine and verifies the recovered session before returning it.
         #
-        # --once intentionally remains a pure one-poll diagnostic, and dry-run
-        # never performs login clicks.
+        # The helper runs in a child process, so GraphQL detection continues.
+        # --once stays a pure one-poll diagnostic and dry-run never logs in.
         if not once and self.auto_relogin and not self.dry_run:
             started = self._start_session_worker(
-                force_login=True,
-                reason="startup fresh Canadian session proof",
+                force_login=False,
+                reason="startup strong session proof/recovery",
             )
             if started:
-                # Do not immediately launch the ordinary 5-minute health check
-                # when this worker returns. Start that cadence from now instead.
                 now = time.monotonic()
                 if self.session_check_every:
                     self.next_session_check = now + self.session_check_every
                 log.info(
-                    "fresh Canadian login/proof started in background; detection continues"
+                    "strong Canadian session proof/recovery started in background; "
+                    "detection continues"
                 )
 
         super()._loop(once=once)
