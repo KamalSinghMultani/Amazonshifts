@@ -106,7 +106,9 @@ class HoldReadyWatcher(watcher_v5.PreLiveWatcher):
                         "A shift was found, but no hold was attempted because the protected "
                         "application session needs a login. Detection continues and the "
                         "schedule remains retryable while recovery runs.\n"
-                        f"Try manually: {manual_url}"
+                        f"Try manually: {manual_url}\n"
+                        "If automatic recovery cannot restore the session, run: "
+                        "<code>python save_session.py</code>"
                     )
                 else:
                     text = (
@@ -289,7 +291,8 @@ class HoldReadyWatcher(watcher_v5.PreLiveWatcher):
                 self.notifier.notify_error,
                 "🚨 <b>Amazon hold session needs manual attention</b>\n"
                 "The protected application session redirected to login. Holding is disabled; "
-                "detection continues and schedules remain retryable.",
+                "detection continues and schedules remain retryable.\n"
+                "Run <code>python save_session.py</code> to restore it manually.",
             )
 
 
