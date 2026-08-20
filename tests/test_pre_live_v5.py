@@ -78,7 +78,9 @@ def test_fast_hold_detects_integrity_notice_but_never_auto_attests():
     assert "integrity-notice-agree-button" in source
     assert "application-integrity-notice" in source
     assert "hold-integrity-notice" in source
-    assert "automation stopped without clicking I Agree" in source
+    assert "manual_integrity_wait" in source
+    assert "MANUAL ACTION REQUIRED" in source
+    assert "integrity notice left manually" in source
     assert "locator(INTEGRITY_AGREE).first.click" not in source
 
 
@@ -89,6 +91,13 @@ def test_fast_hold_does_not_screenshot_before_create_click():
     critical = source[start:end]
     assert "screenshot" not in critical
     assert "page.locator(CREATE).first.click" in critical
+
+
+def test_v5_passes_manual_integrity_settings_to_fast_hold():
+    source = inspect.getsource(watcher_v5.PreLiveWatcher._direct_hold)
+    assert "manual_integrity_wait" in source
+    assert "manual_integrity_timeout_ms" in source
+    assert "120000" in source
 
 
 def test_session_refresh_captures_failed_background_login_page():
@@ -115,6 +124,7 @@ def test_real_test_config_is_live_but_time_bounded_and_isolated(monkeypatch):
         "browser": {
             "storage_state": "auth_state.json",
             "user_data_dir": "browser_profile",
+            "headless": True,
         },
         "state": {
             "path": "state/seen_shifts.json",
@@ -129,8 +139,11 @@ def test_real_test_config_is_live_but_time_bounded_and_isolated(monkeypatch):
     assert out["hold"]["direct_apply"] is True
     assert out["hold"]["stop_before_submit"] is False
     assert out["hold"]["max_per_poll"] == 1
+    assert out["hold"]["manual_integrity_wait"] is True
+    assert out["hold"]["manual_integrity_timeout_ms"] == 120000
     assert out["browser"]["storage_state"] == "verified.json"
     assert out["browser"]["user_data_dir"] is None
+    assert out["browser"]["headless"] is False
     assert out["state"]["path"] == "state/real_hold_test_seen.json"
     assert out["state"]["detections_path"] == "state/real_hold_test_detections.jsonl"
     until = datetime.fromisoformat(out["filters"]["accept_everything_until"])
@@ -145,6 +158,13 @@ def test_real_test_background_workers_are_repointed_to_runtime_config():
     assert "real_hold_test_runtime.yaml" in writer
     assert "hot_windows_parsed" in writer
     assert "yaml.safe_dump" in writer
+
+
+def test_real_test_explains_visible_manual_integrity_handoff():
+    source = inspect.getsource(real_hold_test.main)
+    assert "visible Chrome window" in source
+    assert "click I Agree yourself" in source
+    assert "will not click I Agree for you" in source
 
 
 def test_real_test_stops_after_uncertain_or_confirmed_commit():
