@@ -83,6 +83,11 @@ CODE_INPUT = "[data-test-id='input-test-id-confirmOtp'] input"
 VERIFY_BUTTON = "[data-test-id='button-test-id-verifyAccount']"
 COUNTRY_TOGGLE = "#country-toggle-button"
 
+OTP_CONTINUE_BUTTONS = (
+    "[data-test-id='layout'] button:has-text('Continue')",
+    "button:has-text('Continue')",
+)
+
 PIN_INPUT_SELECTORS = (
     "[data-test-id='input-test-id-pin']",
     "[data-test-id*='pin'] input",
@@ -995,15 +1000,23 @@ class AuthenticationStateMachine:
             pass
 
     def _select_country(self, country: str) -> bool:
+        """Select a rendered country picker without waiting for an absent one.
+
+        The Canadian auth flow normally carries country context from the
+        callback URL and does not render this control.  Absence is therefore a
+        normal, non-blocking outcome rather than a failed login step.
+        """
         try:
-            self.page.locator(COUNTRY_TOGGLE).first.click(timeout=10000)
-            self.page.wait_for_timeout(500)
+            toggle = self.page.locator(COUNTRY_TOGGLE).first
+            if toggle.count() == 0 or not toggle.is_visible():
+                log.debug("optional country selector is not present")
+                return True
+            toggle.click(timeout=1500)
             option = self.page.locator(f"{COUNTRY_OPTION}:has-text('{country}')").first
-            option.click(timeout=10000)
-            self.page.wait_for_timeout(500)
+            option.click(timeout=3000)
             return True
         except Exception as exc:
-            log.warning(f"Could not select country {country}: {exc}")
+            log.warning("rendered country selector could not select %s: %s", country, exc)
             return False
 
     def _country_for(self, base_url: str) -> str:
@@ -1020,7 +1033,7 @@ class AuthenticationStateMachine:
         try:
             country = getattr(self, "country", None) or self._country_for(self.page.url)
             if not self._select_country(country):
-                log.warning("Could not select country, continuing anyway")
+                log.warning("country selector was present but could not be used; continuing")
             email_input = self.page.locator(EMAIL_INPUT).first
             email_input.wait_for(state="visible", timeout=10000)
             email_input.fill(email)
@@ -1090,11 +1103,13 @@ class AuthenticationStateMachine:
             self._log_transition("CAPTCHA_FAILED")
             return False
 
-        moved_forward = self._wait_for_state([
-            AuthState.OTP_SEND_REQUIRED,
-            AuthState.OTP_ENTRY_REQUIRED,
-            AuthState.AUTHENTICATED,
-        ], timeout_ms=30000)
+        # When Send verification code already led to this challenge, Amazon's
+        # orange Confirm advances directly to OTP entry.  Accepting the old
+        # delivery state here would let the next loop click Send a second time.
+        expected = [AuthState.OTP_ENTRY_REQUIRED, AuthState.AUTHENTICATED]
+        if self.otp_requested_at is None:
+            expected.insert(0, AuthState.OTP_SEND_REQUIRED)
+        moved_forward = self._wait_for_state(expected, timeout_ms=30000)
 
         if not moved_forward:
             self._log_transition("CAPTCHA_FAILED:NO_STATE_TRANSITION")
@@ -1145,13 +1160,59 @@ class AuthenticationStateMachine:
                 if code_input.count() and code_input.is_visible():
                     code_input.fill(code)
                     entered = True
-            if entered:
-                if login_flow.submit_code(self.page):
-                    self._log_transition("OTP_SUBMITTED")
-                    return self._wait_for_state([AuthState.AUTHENTICATED])
-                log.error("code entered but Verify could not be pressed")
-            else:
+            if not entered:
                 log.error("code %s could not be typed into any field on screen", "*" * len(code))
+                return False
+
+            verify = self.page.locator(VERIFY_BUTTON).first
+            verify.wait_for(state="visible", timeout=20000)
+            if hasattr(verify, "is_enabled") and not verify.is_enabled():
+                deadline = time.monotonic() + 20.0
+                while time.monotonic() < deadline and not verify.is_enabled():
+                    self.page.wait_for_timeout(100)
+            if hasattr(verify, "is_enabled") and not verify.is_enabled():
+                log.error("verification code was entered but Verify stayed disabled")
+                return False
+
+            verify.click(timeout=5000)
+            self._log_transition("OTP_VERIFY_SUBMITTED")
+
+            # Confirmed flow: Verify first, then Amazon shows a green accepted
+            # state and exposes Continue.  Never press a generic action blindly
+            # or repeat Verify while the page is transitioning.
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                state = self.detector.detect_state()
+                if state == AuthState.AUTHENTICATED:
+                    self._log_transition("OTP_ACCEPTED:AUTH_COMPLETE")
+                    return True
+                if state == AuthState.BAD_CREDENTIALS:
+                    self.state = state
+                    return False
+
+                for selector in OTP_CONTINUE_BUTTONS:
+                    action = self.page.locator(selector).first
+                    try:
+                        # The accepted/green state replaces Verify with
+                        # Continue. Seeing a generic Continue while Verify is
+                        # still present is not enough to advance.
+                        if self.detector._is_visible(VERIFY_BUTTON):
+                            continue
+                        if action.count() == 0 or not action.is_visible():
+                            continue
+                        if hasattr(action, "is_enabled") and not action.is_enabled():
+                            continue
+                        self._log_transition("OTP_ACCEPTED")
+                        action.click(timeout=5000)
+                        self._log_transition("OTP_CONTINUE_SUBMITTED")
+                        return self._wait_for_state(
+                            [AuthState.AUTHENTICATED], timeout_ms=30000
+                        )
+                    except Exception:
+                        continue
+                self.page.wait_for_timeout(100)
+
+            log.error("Verify was pressed but the accepted Continue state never appeared")
         except Exception as exc:
             log.error(f"OTP submission failed: {exc}")
         return False
@@ -1165,7 +1226,10 @@ class AuthenticationStateMachine:
                     return True
             elif self.state in expected_states:
                 return True
-            time.sleep(0.5)
+            try:
+                self.page.wait_for_timeout(100)
+            except Exception:
+                time.sleep(0.1)
         log.warning("Timeout waiting for states: %s", expected_states)
         return False
 

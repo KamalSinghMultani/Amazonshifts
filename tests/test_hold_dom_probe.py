@@ -29,6 +29,8 @@ def test_dom_probe_uses_browser_mutation_observer_not_python_polling():
     assert "MutationObserver" in source
     assert "dom create inserted" in source
     assert "dom create enabled" in source
+    assert "dom integrity agree inserted" in source
+    assert "dom integrity agree enabled" in source
     assert "dom next inserted" in source
     assert "dom content loaded" in source
     assert "setInterval" not in source

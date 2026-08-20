@@ -57,7 +57,11 @@ class RealHoldTestWatcher(watcher_v6.HoldReadyWatcher):
         )
 
         if result is not None and (
-            result.held or result.status == site_selectors.UNCERTAIN
+            result.held
+            or result.status in (
+                site_selectors.UNCERTAIN,
+                site_selectors.IDENTITY_VERIFICATION_REQUIRED,
+            )
         ):
             # Confirmed means we won. UNCERTAIN means a committed application
             # may exist, so trying another schedule could create ambiguity.
@@ -84,7 +88,7 @@ def _preflight(config_path: str) -> tuple[bool, Path, str]:
         config_path,
         output_state=verified_state,
         result_path=result_path,
-        force_login=False,
+        force_login=True,
     )
     try:
         result = json.loads(result_path.read_text("utf-8"))
@@ -196,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg_for_logging = load_config(args.config)
     setup_logging(cfg_for_logging)
 
-    print("Running strong Canada application-session preflight...")
+    print("Running fresh Canada login and strict application-session proof...")
     ok, verified_state, detail = _preflight(args.config)
     if not ok:
         print(f"NOT STARTED — session preflight failed: {detail}")
@@ -211,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     print("SESSION READY — reservation-only validation is armed.")
     print(f"Canada-wide matching ends automatically at {deadline:%Y-%m-%d %H:%M:%S} local time.")
     print("A visible Chrome window will stay open for this first integrity transition test.")
-    print("The preflight-verified session is reused directly; prove-only health checks renew hold readiness every 5 minutes, with no background login/recovery in this test.")
+    print("The freshly proved session is reused directly; prove-only health checks renew hold readiness every 5 minutes, with no mid-test login/recovery.")
     print("Flow: detect -> exact schedule -> Create Application -> I Agree -> reserve result.")
     print("Confirmed or uncertain -> STOP. Explicit unavailable -> try next ranked schedule (up to 3+ configured attempts).")
     print("Later personal-info/documents/assessment/identity steps are never filled or clicked.")

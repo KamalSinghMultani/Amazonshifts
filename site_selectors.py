@@ -636,10 +636,11 @@ def _hold_confirmation(page: Any, timeout_ms: int = 10000) -> str:
 CONFIRMED = "confirmed"
 FAILED = "failed"
 UNCERTAIN = "uncertain"
+IDENTITY_VERIFICATION_REQUIRED = "identity_verification_required"
 
 
 class HoldResult:
-    """What happened, in three states rather than two.
+    """What happened, including uncertainty and required identity verification.
 
     The middle state is the point. "Pressed Create Application but never saw
     the holding banner" is neither success nor failure: the application may
@@ -682,7 +683,7 @@ class HoldResult:
     @property
     def needs_you(self):
         """Should this interrupt the human right now?"""
-        return self.status in (FAILED, UNCERTAIN)
+        return self.status in (FAILED, UNCERTAIN, IDENTITY_VERIFICATION_REQUIRED)
 
     def timing_summary(self):
         return ", ".join("{} {:.0f}ms".format(label, ms) for label, ms in self.timings)

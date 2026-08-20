@@ -366,7 +366,14 @@ class OptimizedWatcher(watcher_v2.ScheduleAwareWatcher):
                 outcome = self._hold(shift, poll_started=started)
                 tried += 1
                 done_key, _ = self._candidate_key(shift)
-                if outcome is None or outcome.held or outcome.status == site_selectors.UNCERTAIN:
+                if (
+                    outcome is None
+                    or outcome.held
+                    or outcome.status in (
+                        site_selectors.UNCERTAIN,
+                        site_selectors.IDENTITY_VERIFICATION_REQUIRED,
+                    )
+                ):
                     self.state.mark_seen(done_key, shift.summary())
                     held += 1
                     continue

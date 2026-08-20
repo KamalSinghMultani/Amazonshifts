@@ -81,7 +81,7 @@ def test_fast_hold_integrity_agree_is_explicit_opt_in_and_reservation_only():
     assert "integrity-notice-agree-button" in inspect.getsource(fast_hold)
     assert "application-integrity-notice" in inspect.getsource(fast_hold)
     assert "if auto_integrity_agree:" in source
-    assert "agree.click" in source
+    assert "page.locator(INTEGRITY_AGREE).first.click" in source
     assert "integrity agree clicked" in source
     assert "backend reserve confirmed" in source
     assert "later application fields will not be touched" in source
@@ -188,7 +188,8 @@ def test_real_test_explains_auto_reservation_and_retry_boundary():
 
 def test_real_test_stops_on_confirmed_or_uncertain_but_retries_explicit_unavailable():
     source = inspect.getsource(real_hold_test.RealHoldTestWatcher._hold)
-    assert "result.held or result.status == site_selectors.UNCERTAIN" in source
+    assert "site_selectors.UNCERTAIN" in source
+    assert "site_selectors.IDENTITY_VERIFICATION_REQUIRED" in source
     assert "self.stop_event.set()" in source
     assert "schedule explicitly unavailable after I Agree" in source
     assert "trying next ranked schedule" in source

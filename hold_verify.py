@@ -7,6 +7,7 @@ responses Amazon's own frontend receives after Create Application is clicked.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -20,6 +21,10 @@ class SoftReserveObserver:
         self.expiration = None
         self.schedule_id = None
         self.application_id = None
+        self.relevant_update_seen = False
+        self.last_update_at: float | None = None
+        self.last_state = None
+        self.last_schedule_matched = False
         self._handler = None
 
     def __enter__(self):
@@ -43,6 +48,11 @@ class SoftReserveObserver:
                     not self.expected_schedule_id
                     or schedule_id == self.expected_schedule_id
                 )
+                self.last_state = state
+                self.last_schedule_matched = bool(schedule_id and schedule_matches)
+                if self.last_schedule_matched:
+                    self.relevant_update_seen = True
+                    self.last_update_at = time.monotonic()
                 if schedule_matches and expiration and state == "JOB_SELECTED":
                     self.confirmed = True
                     log.info(
@@ -62,6 +72,23 @@ class SoftReserveObserver:
                 self.page.remove_listener("response", self._handler)
         except Exception:
             pass
+
+    def settled_without_confirmation(self, *, quiet_ms: int = 2500) -> bool:
+        """Whether a relevant passive update settled without reserve proof.
+
+        This is only an early UNCERTAIN signal.  It can never confirm or deny a
+        reserve.  A JOB_SELECTED response missing only its expiration is given
+        the full confirmation window because a follow-up response may complete
+        the proof.
+        """
+        if (
+            self.confirmed
+            or not self.relevant_update_seen
+            or self.last_update_at is None
+            or self.last_state == "JOB_SELECTED"
+        ):
+            return False
+        return (time.monotonic() - self.last_update_at) * 1000 >= max(0, quiet_ms)
 
     def detail(self) -> str:
         if not self.confirmed:

@@ -470,7 +470,10 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
         )
         if (
             result.held
-            or result.status == site_selectors.UNCERTAIN
+            or result.status in (
+                site_selectors.UNCERTAIN,
+                site_selectors.IDENTITY_VERIFICATION_REQUIRED,
+            )
             or integrity_attempted
         ):
             if integrity_attempted and result.status == site_selectors.FAILED:

@@ -64,6 +64,12 @@ _INIT_SCRIPT = r"""
     const create = findButton("Create Application");
     if (create) emit("dom create inserted");
     if (isEnabled(create)) emit("dom create enabled");
+
+    const agree = document.querySelector(
+      "[data-test-id='integrity-notice-agree-button']"
+    );
+    if (agree) emit("dom integrity agree inserted");
+    if (isEnabled(agree)) emit("dom integrity agree enabled");
   };
 
   emit("dom document start");

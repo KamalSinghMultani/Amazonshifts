@@ -1101,10 +1101,12 @@ class Watcher:
         # Failed or uncertain both need a human, and quickly — an uncertain
         # hold may be a real reservation ticking down its three hours.
         log.error("hold %s: %s", result.status, result.message)
-        urgency = (
-            "⚠️ <b>CHECK THIS NOW</b>" if result.status == site_selectors.UNCERTAIN
-            else "❌ <b>Hold failed</b>"
-        )
+        if result.status == site_selectors.UNCERTAIN:
+            urgency = "⚠️ <b>CHECK THIS NOW</b>"
+        elif result.status == site_selectors.IDENTITY_VERIFICATION_REQUIRED:
+            urgency = "⚠️ <b>IDENTITY VERIFICATION REQUIRED</b>"
+        else:
+            urgency = "❌ <b>Hold failed</b>"
         link = f"\n{result.url}" if result.url else ""
         self.notify_async(
             self.notifier.notify_error,
