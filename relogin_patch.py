@@ -8,6 +8,45 @@ and live evidence from the Hiring authentication flow.
 from __future__ import annotations
 
 import time
+from urllib.parse import quote, urlencode, urlparse
+
+
+def auth_entry_url(base_url: str) -> str:
+    """Build the non-destructive Hiring login URL with Amazon's own callback.
+
+    A real Apply redirect does not enter the auth SPA at bare ``#/login``. It
+    carries a country/locale plus ``redirectUrl`` back through ``app#/auth-return``
+    and a ``destinationUrl`` on the country-specific application site. That
+    callback is what lets the Hiring frontend finish its post-auth session
+    handoff. Using bare login can leave an authenticated-looking consent shell
+    while the protected candidate API still returns 401.
+
+    The destination below is only the generic consent shell. It has no jobId or
+    scheduleId, so this login bootstrap cannot create an application or reserve
+    a shift.
+    """
+    base = (base_url or "").rstrip("/")
+    host = (urlparse(base).hostname or "").lower()
+    if host.endswith("amazon.ca"):
+        country_code, locale, application_country = "CA", "en-CA", "ca"
+    else:
+        country_code, locale, application_country = "US", "en-US", "us"
+
+    redirect_url = base + "/app#/auth-return"
+    destination_url = base + f"/application/{application_country}/#/consent"
+    query = urlencode(
+        {
+            "countryCode": country_code,
+            "locale": locale,
+            "onDemandSync": "true",
+            "referrer": "CS",
+            "redirectUrl": redirect_url,
+            "destinationUrl": destination_url,
+        },
+        quote_via=quote,
+        safe="",
+    )
+    return "https://auth.hiring.amazon.com/#/login?" + query
 
 
 def apply_patch(module) -> None:
@@ -107,6 +146,10 @@ def apply_patch(module) -> None:
         win first. A protected application page is then allowed to prove auth
         before generic text checks, because normal Hiring headers can contain
         phrases such as "Select your country" that also appear in the login UI.
+
+        This remains only a state-machine transition hint. session_refresh.py
+        still requires the protected application backend proof before a recovery
+        is ever reported successful or imported into the live watcher.
         """
         url = (self.page.url or "").lower().strip()
 
@@ -187,6 +230,49 @@ def apply_patch(module) -> None:
         module.log.warning("No OTP entry or CAPTCHA appeared within 60 seconds")
         return False
 
+    def _run(self, base_url: str):
+        """Authenticate through the same callback path the real apply flow uses."""
+        self._log_transition("AUTH_START")
+        self.country = self._country_for(base_url)
+        module.log.info("logging in as %s (from %s)", self.country, base_url)
+
+        # Keep the original country-context warmup. auth.hiring.amazon.com is
+        # shared by CA/US, so this prevents a cold login from choosing the wrong
+        # country before the form has even mounted.
+        try:
+            self.page.goto(
+                base_url.rstrip("/") + "/app#/jobSearch",
+                wait_until="domcontentloaded",
+            )
+            self.page.wait_for_timeout(2000)
+        except Exception as exc:
+            module.log.debug("could not set the country context: %s", exc)
+
+        # Critical change: do not use bare #/login. Carry Amazon's normal
+        # auth-return + destination handoff so a successful login can mint the
+        # country-specific application session rather than only painting an
+        # authenticated-looking SPA shell.
+        self.page.goto(auth_entry_url(base_url), wait_until="domcontentloaded")
+        self._wait_for_state()
+        self._dismiss_consent()
+
+        max_iterations = 10
+        for _ in range(max_iterations):
+            self.state = self.detector.detect_state()
+
+            if self.state == AuthState.AUTHENTICATED:
+                self._log_transition("AUTH_VERIFIED")
+                return self.state
+
+            if self.state in (AuthState.BAD_CREDENTIALS, AuthState.SESSION_ERROR):
+                return self.state
+
+            if not self._transition_to_next():
+                return AuthState.SESSION_ERROR
+
+        return AuthState.SESSION_ERROR
+
     module.StateDetector._application_auth_evidence = _application_auth_evidence
     module.StateDetector._is_authenticated = _is_authenticated
     module.AuthenticationStateMachine._request_otp = _request_otp
+    module.AuthenticationStateMachine.run = _run
