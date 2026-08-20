@@ -36,7 +36,7 @@ def _host(url: str) -> str:
     return (urlparse(url or "").hostname or "").lower()
 
 
-def _diagnose_auth_failure(page, manager, returned_state) -> dict:
+def _diagnose_auth_failure(page, manager, returned_state, base_url: str = "") -> dict:
     """Describe why authentication stopped without exposing credentials/tokens.
 
     This deliberately observes the existing auth state machine; it does not
@@ -48,6 +48,8 @@ def _diagnose_auth_failure(page, manager, returned_state) -> dict:
     machine_name = getattr(machine_state, "name", str(machine_state or "UNKNOWN"))
     returned_name = getattr(returned_state, "name", str(returned_state or "UNKNOWN"))
     challenge_type = "NONE"
+    final_host = _host(getattr(page, "url", ""))
+    expected_host = _host(base_url)
 
     try:
         detector = manager.auth_machine.detector
@@ -62,6 +64,18 @@ def _diagnose_auth_failure(page, manager, returned_state) -> dict:
         category = "otp_timeout"
     elif machine_name in ("CAPTCHA_REQUIRED", "CAPTCHA_FAILED") or challenge_type != "NONE":
         category = "challenge_not_cleared"
+    elif (
+        returned_state == login_flow.AuthState.SESSION_ERROR
+        and machine_name == "UNKNOWN_PAGE"
+        and challenge_type == "NONE"
+        and expected_host
+        and final_host == expected_host
+    ):
+        # Important distinction: this is exactly what a cleared challenge can
+        # look like when Amazon lands on a country page that our positive UI
+        # markers do not yet recognize. This is NOT authentication proof, but it
+        # is also not evidence that the challenge is still blocking the flow.
+        category = "post_auth_page_unrecognized"
     elif returned_state == login_flow.AuthState.SESSION_ERROR:
         category = "state_machine_error"
     else:
@@ -72,7 +86,7 @@ def _diagnose_auth_failure(page, manager, returned_state) -> dict:
         "returned_state": returned_name,
         "machine_state": machine_name,
         "challenge_type": challenge_type,
-        "final_host": _host(getattr(page, "url", "")),
+        "final_host": final_host,
     }
 
 
@@ -98,7 +112,7 @@ def _forced_login(page, base_url: str) -> tuple[str, str, dict]:
             },
         )
 
-    diagnostics = _diagnose_auth_failure(page, manager, state)
+    diagnostics = _diagnose_auth_failure(page, manager, state, base_url)
 
     if state == login_flow.AuthState.AUTHENTICATED:
         return login_flow.OK, "fresh session established", diagnostics
@@ -110,6 +124,13 @@ def _forced_login(page, base_url: str) -> tuple[str, str, dict]:
         return login_flow.OTP_REQUIRED, "the code was requested but never arrived", diagnostics
     if diagnostics.get("category") == "challenge_not_cleared":
         return login_flow.CAPTCHA, "challenge solving did not produce an authenticated transition", diagnostics
+    if diagnostics.get("category") == "post_auth_page_unrecognized":
+        return (
+            login_flow.UNKNOWN,
+            "challenge is no longer present and the flow returned to the configured country site, "
+            "but the final page lacks a known positive authenticated marker",
+            diagnostics,
+        )
     return login_flow.UNKNOWN, f"authentication failed at state: {state.name}", diagnostics
 
 
