@@ -120,6 +120,15 @@ def test_real_test_config_is_live_but_time_bounded_and_isolated(monkeypatch):
     assert 3500 < delta <= 3601
 
 
+def test_real_test_background_workers_are_repointed_to_runtime_config():
+    source = inspect.getsource(real_hold_test.main)
+    writer = inspect.getsource(real_hold_test._write_runtime_config)
+    assert "watcher.config_path = str(runtime_config)" in source
+    assert "real_hold_test_runtime.yaml" in writer
+    assert "hot_windows_parsed" in writer
+    assert "yaml.safe_dump" in writer
+
+
 def test_real_test_stops_after_uncertain_or_confirmed_commit():
     source = inspect.getsource(real_hold_test.RealHoldTestWatcher._hold)
     assert "result.held" in source
