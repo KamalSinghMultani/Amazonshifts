@@ -19,6 +19,7 @@ from playwright.sync_api import sync_playwright
 
 import auth_evidence
 import browser_launch
+import failure_capture
 import relogin as login_flow
 import relogin_patch
 import session_proof
@@ -38,13 +39,7 @@ def _host(url: str) -> str:
 
 
 def _diagnose_auth_failure(page, manager, returned_state, base_url: str = "") -> dict:
-    """Describe why authentication stopped without exposing credentials/tokens.
-
-    This deliberately observes the existing auth state machine; it does not
-    alter challenge-solving behavior. The goal is to distinguish a challenge
-    that remained present from OTP/credential/state-machine failures so a live
-    test produces actionable evidence instead of a generic SESSION_ERROR.
-    """
+    """Describe why authentication stopped without exposing credentials/tokens."""
     machine_state = getattr(getattr(manager, "auth_machine", None), "state", None)
     machine_name = getattr(machine_state, "name", str(machine_state or "UNKNOWN"))
     returned_name = getattr(returned_state, "name", str(returned_state or "UNKNOWN"))
@@ -88,12 +83,7 @@ def _diagnose_auth_failure(page, manager, returned_state, base_url: str = "") ->
 
 
 def _late_auth_recheck(page, manager, state, base_url: str, *, timeout_seconds: float = 4.0):
-    """Catch a protected app page that finishes mounting just after auth timeout.
-
-    This is intentionally a state re-check only. It does not solve, submit, or
-    bypass any challenge. The patched detector still requires strong protected
-    application evidence; a country URL by itself cannot pass.
-    """
+    """Catch a protected app page that finishes mounting just after auth timeout."""
     if state == login_flow.AuthState.AUTHENTICATED:
         return state
     if state != login_flow.AuthState.SESSION_ERROR:
@@ -144,10 +134,6 @@ def _forced_login(page, base_url: str) -> tuple[str, str, dict]:
             },
         )
 
-    # Live evidence showed the CAPTCHA clearing and the Canadian consent page
-    # becoming fully mounted immediately after the state-machine wait expired.
-    # Give that already-cleared page a tiny grace window to be recognised by
-    # the strict detector instead of throwing away a valid recovered session.
     state = _late_auth_recheck(page, manager, state, base_url)
     diagnostics = _diagnose_auth_failure(page, manager, state, base_url)
 
@@ -191,6 +177,25 @@ def _persist_success(
         payload["precheck"] = precheck.to_dict()
     _write(result_path, **payload)
     return 0
+
+
+def _capture_failure(page, context, base_url: str, category: str, *, detail: str = "") -> dict:
+    """Best-effort screenshot/sidecar for unattended auth failures."""
+    try:
+        return failure_capture.capture(
+            page,
+            context,
+            base_url,
+            f"session-{category}",
+            extra={"detail": str(detail or "")[:300]},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"capture_error": str(exc)[:240], "screenshot": "", "sidecar": ""}
+
+
+def _with_capture(detail: str, captured: dict) -> str:
+    shot = str(captured.get("screenshot") or "")
+    return f"{detail}; failure screenshot: {shot}" if shot else detail
 
 
 def run(config_path: str, output_state: Path, result_path: Path, force_login: bool) -> int:
@@ -241,28 +246,36 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
                     return rc
 
                 evidence = auth_evidence.collect(page, context, base_url)
+                failure_detail = (
+                    f"authentication reported success but session proof failed: {proof.reason}"
+                )
+                captured = _capture_failure(
+                    page, context, base_url, "proof-failed", detail=failure_detail
+                )
                 _write(
                     result_path,
                     status="proof_failed",
-                    detail=(
-                        f"authentication reported success but session proof failed: {proof.reason}"
-                    ),
+                    detail=_with_capture(failure_detail, captured),
                     proof=proof.to_dict(),
                     precheck=precheck.to_dict() if precheck is not None else None,
                     auth_diagnostics=diagnostics,
                     auth_evidence=evidence,
+                    failure_capture=captured,
                 )
                 browser_launch.close_context(browser, context)
                 return 2
 
             evidence = auth_evidence.collect(page, context, base_url)
+            category = str(diagnostics.get("category") or status or "unknown")
+            captured = _capture_failure(page, context, base_url, category, detail=detail)
             _write(
                 result_path,
                 status=status,
-                detail=detail,
+                detail=_with_capture(detail, captured),
                 precheck=precheck.to_dict() if precheck is not None else None,
                 auth_diagnostics=diagnostics,
                 auth_evidence=evidence,
+                failure_capture=captured,
             )
             browser_launch.close_context(browser, context)
             return 2
