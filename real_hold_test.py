@@ -38,6 +38,14 @@ log = logging.getLogger("watcher")
 
 
 class RealHoldTestWatcher(watcher_v5.PreLiveWatcher):
+    def __init__(self, cfg: dict, live_override: bool = False) -> None:
+        super().__init__(cfg, live_override=live_override)
+        # main() only constructs this watcher after _preflight() strongly proved
+        # the exact storage state assigned to cfg.browser.storage_state. The
+        # normal v5 watcher begins unverified and proves itself in the background;
+        # this isolated <=60-minute test can safely start armed immediately.
+        self._mark_session_verified("real-test preflight strongly proved this exact state", notify=False)
+
     def _hold(self, shift, poll_started=None):
         result = super()._hold(shift, poll_started=poll_started)
         integrity_attempted = bool(
