@@ -73,15 +73,27 @@ def test_fast_hold_can_finish_from_backend_confirmation_without_ui_banner(monkey
     assert any(name == "backend reserve confirmed" for name, _ms in result.timings)
 
 
-def test_fast_hold_detects_integrity_notice_but_never_auto_attests():
-    source = inspect.getsource(fast_hold)
-    assert "integrity-notice-agree-button" in source
-    assert "application-integrity-notice" in source
-    assert "hold-integrity-notice" in source
-    assert "manual_integrity_wait" in source
-    assert "MANUAL ACTION REQUIRED" in source
-    assert "integrity notice left manually" in source
-    assert "locator(INTEGRITY_AGREE).first.click" not in source
+def test_fast_hold_integrity_agree_is_explicit_opt_in_and_reservation_only():
+    signature = inspect.signature(fast_hold.hold)
+    assert signature.parameters["auto_integrity_agree"].default is False
+
+    source = inspect.getsource(fast_hold.hold)
+    assert "integrity-notice-agree-button" in inspect.getsource(fast_hold)
+    assert "application-integrity-notice" in inspect.getsource(fast_hold)
+    assert "if auto_integrity_agree:" in source
+    assert "agree.click" in source
+    assert "integrity agree clicked" in source
+    assert "backend reserve confirmed" in source
+    assert "later application fields will not be touched" in source
+
+
+def test_fast_hold_detects_unavailable_after_integrity():
+    class Page:
+        def inner_text(self, _selector):
+            return "Sorry, this shift is no longer available. Please choose another schedule."
+
+    detail = fast_hold._availability_failure(Page())
+    assert "shift is no longer available" in detail.lower()
 
 
 def test_fast_hold_does_not_screenshot_before_create_click():
@@ -93,11 +105,13 @@ def test_fast_hold_does_not_screenshot_before_create_click():
     assert "page.locator(CREATE).first.click" in critical
 
 
-def test_v5_passes_manual_integrity_settings_to_fast_hold():
+def test_v5_passes_integrity_settings_and_skips_fallback_after_agree():
     source = inspect.getsource(watcher_v5.PreLiveWatcher._direct_hold)
     assert "manual_integrity_wait" in source
     assert "manual_integrity_timeout_ms" in source
-    assert "120000" in source
+    assert "auto_integrity_agree" in source
+    assert "integrity agree clicked" in source
+    assert "skipping compatibility fallback" in source
 
 
 def test_session_refresh_captures_failed_background_login_page():
@@ -139,8 +153,10 @@ def test_real_test_config_is_live_but_time_bounded_and_isolated(monkeypatch):
     assert out["hold"]["direct_apply"] is True
     assert out["hold"]["stop_before_submit"] is False
     assert out["hold"]["max_per_poll"] == 1
-    assert out["hold"]["manual_integrity_wait"] is True
+    assert out["hold"]["job_attempts"] == 1
+    assert out["hold"]["manual_integrity_wait"] is False
     assert out["hold"]["manual_integrity_timeout_ms"] == 120000
+    assert out["hold"]["auto_integrity_agree"] is True
     assert out["browser"]["storage_state"] == "verified.json"
     assert out["browser"]["user_data_dir"] is None
     assert out["browser"]["headless"] is False
@@ -160,17 +176,18 @@ def test_real_test_background_workers_are_repointed_to_runtime_config():
     assert "yaml.safe_dump" in writer
 
 
-def test_real_test_explains_visible_manual_integrity_handoff():
+def test_real_test_explains_auto_reservation_only_boundary():
     source = inspect.getsource(real_hold_test.main)
-    assert "visible Chrome window" in source
-    assert "click I Agree yourself" in source
-    assert "will not click I Agree for you" in source
+    assert "Create Application -> I Agree -> reserve result -> STOP" in source
+    assert "Later personal-info/documents/assessment/identity steps are never filled or clicked" in source
+    assert "including an unavailable race loss" in source
 
 
-def test_real_test_stops_after_uncertain_or_confirmed_commit():
+def test_real_test_stops_after_integrity_attempt_even_if_unavailable():
     source = inspect.getsource(real_hold_test.RealHoldTestWatcher._hold)
     assert "result.held" in source
     assert "site_selectors.UNCERTAIN" in source
+    assert "integrity agree clicked" in source
     assert "self.stop_event.set()" in source
 
 
