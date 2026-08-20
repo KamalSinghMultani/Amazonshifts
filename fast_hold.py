@@ -24,6 +24,17 @@ CREATE = "[data-test-id='layout'] button:has-text('Create Application')"
 INTEGRITY_AGREE = "[data-test-id='integrity-notice-agree-button']"
 INTEGRITY_ROUTE = "application-integrity-notice"
 HOLD_TEXT = "holding a spot"
+UNAVAILABLE_TEXT_PATTERNS = (
+    "shift is no longer available",
+    "shift is not available",
+    "shift not available anymore",
+    "this shift is no longer available",
+    "schedule is no longer available",
+    "schedule is not available",
+    "this schedule is no longer available",
+    "selected shift is no longer available",
+    "selected schedule is no longer available",
+)
 
 
 def _visible(page: Any, selector: str) -> bool:
@@ -42,20 +53,37 @@ def _enabled(page: Any, selector: str) -> bool:
         return False
 
 
-def _banner(page: Any) -> str:
+def _body_text(page: Any) -> str:
     try:
-        text = page.inner_text("body") or ""
+        return " ".join((page.inner_text("body") or "").split())
     except Exception:
         return ""
+
+
+def _banner(page: Any) -> str:
+    text = _body_text(page)
     low = text.lower()
     idx = low.find(HOLD_TEXT)
     if idx < 0:
         return ""
-    return " ".join(text[idx:idx + 220].split())
+    return text[idx:idx + 220]
+
+
+def _availability_failure(page: Any) -> str:
+    """Return a narrow visible unavailable message, or an empty string."""
+    text = _body_text(page)
+    low = text.lower()
+    for pattern in UNAVAILABLE_TEXT_PATTERNS:
+        idx = low.find(pattern)
+        if idx >= 0:
+            start = max(0, idx - 80)
+            end = min(len(text), idx + len(pattern) + 160)
+            return text[start:end]
+    return ""
 
 
 def _integrity_notice(page: Any) -> bool:
-    """Whether Amazon advanced to its applicant integrity attestation."""
+    """Whether Amazon advanced to its application-integrity notice."""
     try:
         if INTEGRITY_ROUTE in (getattr(page, "url", "") or "").lower():
             return True
@@ -75,6 +103,7 @@ def hold(
     screenshot_path: str | None = None,
     manual_integrity_wait: bool = False,
     manual_integrity_timeout_ms: int = 120000,
+    auto_integrity_agree: bool = False,
 ) -> tuple[site_selectors.HoldResult, str]:
     """Return (HoldResult, backend_detail) with minimal local waiting.
 
@@ -82,10 +111,14 @@ def hold(
     return immediately when Amazon's own update-application response proves
     JOB_SELECTED + expected schedule + reserve expiry.
 
-    The explicit real-hold validation can keep this observer alive at Amazon's
-    Application Integrity Notice while the applicant clicks I Agree manually in
-    the visible browser. This function only observes that transition; it never
-    clicks the integrity attestation itself.
+    Integrity handling has three modes:
+      * default: stop at the notice and report UNCERTAIN;
+      * manual_integrity_wait: keep the observer alive while the user clicks;
+      * auto_integrity_agree: click only the integrity notice's I Agree button,
+        then observe reserve/unavailable state and stop before later forms.
+
+    The auto mode is deliberately opt-in. It does not fill personal details,
+    documents, assessments, identity checks, or any later application fields.
     """
     began = time.perf_counter()
     timings: list[tuple[str, float]] = []
@@ -122,6 +155,7 @@ def hold(
         overlay_checked = False
         integrity_seen = False
         integrity_left = False
+        integrity_agree_clicked = False
 
         while time.perf_counter() < deadline:
             if observer.confirmed:
@@ -229,6 +263,51 @@ def hold(
                     integrity_seen = True
                     mark("integrity notice reached")
 
+                    # A cookie/modal overlay was visible on the first live
+                    # integrity capture. Clear only generic overlays before
+                    # attempting or handing off the integrity action itself.
+                    site_selectors.dismiss_overlays(
+                        page, timeout_ms=min(timeout_ms, 1500), rounds=2
+                    )
+
+                    if auto_integrity_agree:
+                        try:
+                            agree = page.locator(INTEGRITY_AGREE).first
+                            agree.wait_for(state="visible", timeout=min(timeout_ms, 3000))
+                            if not agree.is_enabled():
+                                raise RuntimeError("I Agree button is visible but disabled")
+                            agree.click(timeout=min(timeout_ms, 2000))
+                            integrity_agree_clicked = True
+                            mark("integrity agree clicked")
+                            # Start a fresh confirmation window from the click.
+                            deadline = max(
+                                deadline,
+                                time.perf_counter() + max(timeout_ms, 20000) / 1000.0,
+                            )
+                            log.info(
+                                "integrity I Agree clicked; observing reserve result only — later application fields will not be touched"
+                            )
+                            page.wait_for_timeout(10)
+                            continue
+                        except Exception as exc:  # noqa: BLE001
+                            captured = failure_capture.capture(
+                                page,
+                                getattr(page, "context", None),
+                                base_url,
+                                "hold-integrity-agree-click",
+                                extra={"error": str(exc)[:200], "reserve_confirmed": False},
+                            )
+                            return (
+                                site_selectors.HoldResult(
+                                    site_selectors.UNCERTAIN,
+                                    "Reached the Application Integrity Notice but could not press I Agree; "
+                                    f"reserve is unconfirmed. Screenshot: {captured.get('screenshot') or '<none>'}",
+                                    url=getattr(page, "url", ""),
+                                    timings=timings,
+                                ),
+                                observer.detail(),
+                            )
+
                     if not manual_integrity_wait:
                         captured = failure_capture.capture(
                             page,
@@ -250,11 +329,8 @@ def hold(
                             observer.detail(),
                         )
 
-                    # Test-only manual handoff. Keep the same response observer
+                    # Manual test-only handoff. Keep the same response observer
                     # attached while the applicant acts in the visible browser.
-                    site_selectors.dismiss_overlays(
-                        page, timeout_ms=min(timeout_ms, 1500), rounds=2
-                    )
                     deadline = max(
                         deadline,
                         time.perf_counter()
@@ -263,22 +339,50 @@ def hold(
                     log.warning(
                         "MANUAL ACTION REQUIRED — Amazon's Application Integrity Notice is open. "
                         "Click I Agree yourself in the visible browser. The watcher will only "
-                        "observe what Amazon does next and will not click that attestation."
+                        "observe what Amazon does next."
                     )
 
                 if integrity_seen and not integrity_left and not on_integrity:
                     integrity_left = True
-                    mark("integrity notice left manually")
-                    # Once the applicant has acted, give Amazon a fresh backend
-                    # confirmation window rather than consuming the original
-                    # application-load deadline.
+                    mark(
+                        "integrity notice left after auto agree"
+                        if integrity_agree_clicked
+                        else "integrity notice left manually"
+                    )
+                    # Once the integrity step has completed, give Amazon a fresh
+                    # backend confirmation window rather than consuming the
+                    # original application-load deadline.
                     deadline = max(
                         deadline,
                         time.perf_counter() + max(timeout_ms, 20000) / 1000.0,
                     )
                     log.info(
-                        "manual integrity step left; waiting for reserve confirmation or next page"
+                        "integrity step left; waiting for reserve confirmation, unavailable result, or next page"
                     )
+
+                # After I Agree, an unavailable message is terminal and is
+                # intentionally distinct from an unproven timeout.
+                if integrity_agree_clicked or integrity_left:
+                    unavailable = _availability_failure(page)
+                    if unavailable:
+                        mark("schedule unavailable after integrity")
+                        captured = failure_capture.capture(
+                            page,
+                            getattr(page, "context", None),
+                            base_url,
+                            "hold-schedule-unavailable-after-integrity",
+                            extra={"reserve_confirmed": False},
+                        )
+                        return (
+                            site_selectors.HoldResult(
+                                site_selectors.FAILED,
+                                "Schedule was no longer available after the integrity step; "
+                                f"no reserve was confirmed. Screenshot: {captured.get('screenshot') or '<none>'}",
+                                url=getattr(page, "url", ""),
+                                timings=timings,
+                            ),
+                            observer.detail(),
+                        )
 
                 banner = _banner(page)
                 if banner:
@@ -299,12 +403,25 @@ def hold(
             except Exception:
                 break
 
-    if integrity_seen and manual_integrity_wait:
-        category = (
-            "hold-after-manual-integrity-no-confirmation"
-            if integrity_left
-            else "hold-manual-integrity-timeout"
-        )
+    if integrity_seen and (manual_integrity_wait or auto_integrity_agree):
+        if auto_integrity_agree:
+            category = "hold-after-auto-integrity-no-confirmation"
+            message = (
+                "I Agree was clicked, but neither a verified reserve nor an unavailable result "
+                "was observed. Automation stopped before touching any later application fields."
+            )
+        else:
+            category = (
+                "hold-after-manual-integrity-no-confirmation"
+                if integrity_left
+                else "hold-manual-integrity-timeout"
+            )
+            message = (
+                "The Application Integrity Notice was left manually, but no reserve confirmation "
+                "was observed. Check the current page and screenshot."
+                if integrity_left
+                else "Timed out waiting for the applicant to complete the Application Integrity Notice."
+            )
         captured = failure_capture.capture(
             page,
             getattr(page, "context", None),
@@ -312,14 +429,9 @@ def hold(
             category,
             extra={
                 "reserve_confirmed": False,
-                "integrity_left_manually": integrity_left,
+                "integrity_left": integrity_left,
+                "integrity_agree_clicked": integrity_agree_clicked,
             },
-        )
-        message = (
-            "The Application Integrity Notice was left manually, but no reserve confirmation "
-            "was observed. Check the current page and screenshot."
-            if integrity_left
-            else "Timed out waiting for the applicant to complete the Application Integrity Notice."
         )
         return (
             site_selectors.HoldResult(
