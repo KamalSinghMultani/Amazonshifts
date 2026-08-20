@@ -86,22 +86,34 @@ class HoldReadyWatcher(watcher_v5.PreLiveWatcher):
             self._start_session_worker(force_login=False, reason="stale hold-session proof")
         return False
 
+    def _manual_job_url(self, shift) -> str:
+        if getattr(shift, "url", None):
+            return str(shift.url)
+        raw = getattr(shift, "raw", None) or {}
+        job_id = raw.get("jobId") or raw.get("parentJobId")
+        if job_id:
+            return f"{self.cfg['site']['base_url'].rstrip('/')}/app#/jobDetail?jobId={job_id}"
+        return self.cfg["site"]["job_search_url"]
+
     def _hold(self, shift, poll_started: float | None = None):
         status_before = self.session_ok
         if not self._hold_session_ready():
             if not self._session_block_alerted and self.alert_on_expiry:
+                manual_url = self._manual_job_url(shift)
                 if status_before is False:
                     text = (
                         "🚨 <b>Amazon hold session is dead / signed out</b>\n"
                         "A shift was found, but no hold was attempted because the protected "
                         "application session needs a login. Detection continues and the "
-                        "schedule remains retryable while recovery runs."
+                        "schedule remains retryable while recovery runs.\n"
+                        f"Try manually: {manual_url}"
                     )
                 else:
                     text = (
                         "⚠️ <b>Shift found, but holding is temporarily gated</b>\n"
                         "The protected application session is awaiting a strong verification. "
-                        "Detection continues and the schedule remains retryable."
+                        "Detection continues and the schedule remains retryable.\n"
+                        f"Manual link: {manual_url}"
                     )
                 self.notify_async(self.notifier.notify_error, text)
                 self._session_block_alerted = True
@@ -117,7 +129,7 @@ class HoldReadyWatcher(watcher_v5.PreLiveWatcher):
             return watcher_v5.SessionBlockedResult(
                 site_selectors.FAILED,
                 "session is dead or not verified; holding blocked and schedule remains retryable",
-                url=getattr(self.page, "url", "") if self.page is not None else "",
+                url=self._manual_job_url(shift),
             )
 
         result = super()._hold(shift, poll_started=poll_started)
