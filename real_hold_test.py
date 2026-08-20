@@ -78,9 +78,12 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     # the user's normal title/location preferences, and expires automatically.
     cfg.setdefault("filters", {})["accept_everything_until"] = end.isoformat(timespec="seconds")
 
-    # Use the state that just passed the strong application-session proof for
-    # this process.  Do not overwrite the user's normal config file.
+    # Use exactly the isolated storage state that just passed preflight.  A
+    # Playwright persistent profile ignores storage_state entirely, so leaving
+    # user_data_dir enabled here would prove one browser and test another.
+    # This mutation exists only in memory for this validation process.
     cfg["browser"]["storage_state"] = str(verified_state)
+    cfg["browser"]["user_data_dir"] = None
     return cfg
 
 
