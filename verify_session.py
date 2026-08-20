@@ -19,6 +19,15 @@ from pathlib import Path
 import session_refresh
 
 
+def _brief(items, limit=12):
+    values = [str(x) for x in (items or []) if x]
+    if not values:
+        return "<none>"
+    shown = values[:limit]
+    suffix = f" (+{len(values) - limit} more)" if len(values) > limit else ""
+    return ", ".join(shown) + suffix
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
@@ -51,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     proof = result.get("proof") or {}
     diagnostics = result.get("auth_diagnostics") or {}
     precheck = result.get("precheck") or {}
+    evidence = result.get("auth_evidence") or {}
 
     if rc == 0 and status in ("ok", "healthy") and proof.get("passed") is True:
         print("SESSION PROOF PASSED")
@@ -87,6 +97,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  auth state:         {proof.get('authenticated_state')}")
         print(f"  application host:   {proof.get('application_host')}")
         print(f"  login redirect:     {proof.get('application_redirected_to_login')}")
+    if evidence:
+        print("  safe page evidence:")
+        print(f"    title:             {evidence.get('title') or '<none>'}")
+        print(f"    path:              {evidence.get('path') or '<none>'}")
+        print(f"    login controls:    {evidence.get('login_controls_visible')}")
+        print(f"    account marker:    {evidence.get('account_text_marker_visible')}")
+        print(f"    application action:{evidence.get('application_action_visible')}")
+        print(f"    visible test ids:  {_brief(evidence.get('visible_test_ids'))}")
+        print(f"    visible element ids: {_brief(evidence.get('visible_element_ids'))}")
+        print(f"    localStorage keys: {_brief(evidence.get('local_storage_keys'))}")
+        print(f"    sessionStorage keys: {_brief(evidence.get('session_storage_keys'))}")
+        print(f"    cookie names:      {_brief(evidence.get('cookie_names'))}")
+        print("    note: values/credentials/tokens are intentionally not printed")
     return rc or 2
 
 
