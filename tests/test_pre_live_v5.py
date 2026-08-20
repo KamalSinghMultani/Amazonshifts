@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from datetime import datetime
 
+import config as config_mod
 import fast_hold
 import real_hold_test
 import session_refresh
@@ -21,6 +22,49 @@ def test_v5_primes_persistent_context_before_poll_loop():
     assert "localStorage.setItem" in source
     assert "super()._start_api_mode" in source
     assert "browser_cfg.get(\"user_data_dir\")" in source
+
+
+def test_v5_prewarms_a_dedicated_application_page_without_job_or_schedule_ids():
+    class Page:
+        def __init__(self):
+            self.visited = []
+
+        def is_closed(self):
+            return False
+
+        def goto(self, url, **kwargs):
+            self.visited.append((url, kwargs))
+
+    class Context:
+        def __init__(self):
+            self.created = []
+
+        def new_page(self):
+            page = Page()
+            self.created.append(page)
+            return page
+
+    watcher = watcher_v5.PreLiveWatcher.__new__(watcher_v5.PreLiveWatcher)
+    watcher.cfg = {
+        "site": {"base_url": "https://hiring.amazon.ca"},
+        "browser": {"nav_timeout_ms": 30000},
+        "hold": {"prewarm_application": True},
+    }
+    watcher.context = Context()
+    watcher.hold_page = None
+
+    assert watcher._prewarm_application_page() is True
+    assert watcher.hold_page is watcher.context.created[0]
+    target, kwargs = watcher.hold_page.visited[0]
+    assert target == "https://hiring.amazon.ca/application/ca/"
+    assert "jobId" not in target and "scheduleId" not in target
+    assert kwargs["wait_until"] == "commit"
+
+
+def test_latency_first_defaults_prewarm_and_disable_compatibility_fallback():
+    cfg = config_mod.load_config(config_mod.Path(__file__).resolve().parent.parent / "config.yaml")
+    assert cfg["hold"]["prewarm_application"] is True
+    assert cfg["hold"]["compatibility_fallback"] is False
 
 
 def test_fast_hold_is_browser_driven_and_passively_observes_backend():
@@ -114,6 +158,7 @@ def test_v5_passes_integrity_settings_and_skips_fallback_after_agree():
     assert "auto_integrity_agree" in source
     assert "integrity agree clicked" in source
     assert "skipping compatibility fallback" in source
+    assert "compatibility fallback disabled for latency" in source
 
 
 def test_session_refresh_captures_failed_background_login_page():
@@ -153,6 +198,8 @@ def test_real_test_config_is_live_but_time_bounded_and_isolated(monkeypatch):
     assert out["dry_run"] is False
     assert out["hold"]["enabled"] is True
     assert out["hold"]["direct_apply"] is True
+    assert out["hold"]["prewarm_application"] is True
+    assert out["hold"]["compatibility_fallback"] is False
     assert out["hold"]["stop_before_submit"] is False
     assert out["hold"]["max_per_poll"] == 1
     assert out["hold"]["job_attempts"] >= 3

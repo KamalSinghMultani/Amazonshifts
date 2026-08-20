@@ -109,6 +109,8 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     cfg["dry_run"] = False
     cfg["hold"]["enabled"] = True
     cfg["hold"]["direct_apply"] = True
+    cfg["hold"]["prewarm_application"] = True
+    cfg["hold"]["compatibility_fallback"] = False
     cfg["hold"]["stop_before_submit"] = False
     cfg["hold"]["max_per_poll"] = 1
     cfg["hold"]["job_attempts"] = max(3, int(cfg["hold"].get("job_attempts", 3)))

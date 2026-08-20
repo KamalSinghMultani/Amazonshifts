@@ -45,6 +45,7 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
 
     def __init__(self, cfg: dict, live_override: bool = False) -> None:
         super().__init__(cfg, live_override=live_override)
+        self.hold_page = None
         state_dir = Path(cfg["state"]["path"]).parent
         self.session_probe_input_path = state_dir / "session_probe_input_state.json"
         self._session_worker_force_login = False
@@ -72,6 +73,12 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
         self.relogin_tried = False
         self._session_outage_alerted = False
         self._session_block_alerted = False
+
+        # A recovered session is shared by every page in the context. Refresh
+        # the dedicated application shell now, while no shift is being raced,
+        # so the next direct route does not pay a cold frontend startup.
+        if getattr(self, "context", None) is not None:
+            self._prewarm_application_page(force=True)
 
         if was is False:
             log.info("LIVE HOLD SESSION RESTORED — holding re-armed (%s)", reason)
@@ -322,35 +329,81 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
 
         super()._start_api_mode(browser_cfg)
 
-        if not (browser_cfg.get("user_data_dir") and isinstance(saved_payload, dict)):
-            return
+        if browser_cfg.get("user_data_dir") and isinstance(saved_payload, dict):
+            expected_origin = watcher_v4._origin(self.cfg["site"]["base_url"])
+            local_entries = []
+            for item in saved_payload.get("origins") or []:
+                if watcher_v4._origin(str(item.get("origin") or "")) == expected_origin:
+                    local_entries.extend(item.get("localStorage") or [])
 
-        expected_origin = watcher_v4._origin(self.cfg["site"]["base_url"])
-        local_entries = []
-        for item in saved_payload.get("origins") or []:
-            if watcher_v4._origin(str(item.get("origin") or "")) == expected_origin:
-                local_entries.extend(item.get("localStorage") or [])
-
-        try:
-            if self.page is not None and local_entries:
-                self.page.evaluate(
-                    """entries => {
-                        for (const item of entries) {
-                            if (item && typeof item.name === 'string') {
-                                localStorage.setItem(item.name, item.value ?? '');
+            try:
+                if self.page is not None and local_entries:
+                    self.page.evaluate(
+                        """entries => {
+                            for (const item of entries) {
+                                if (item && typeof item.name === 'string') {
+                                    localStorage.setItem(item.name, item.value ?? '');
+                                }
                             }
-                        }
-                    }""",
-                    local_entries,
+                        }""",
+                        local_entries,
+                    )
+                    if self.token_source is not None:
+                        self.token_source.refresh()
+                log.info(
+                    "primed persistent live context from saved verified state: %d localStorage item(s)",
+                    len(local_entries),
                 )
-                if self.token_source is not None:
-                    self.token_source.refresh()
-            log.info(
-                "primed persistent live context from saved verified state: %d localStorage item(s)",
-                len(local_entries),
+            except Exception as exc:  # noqa: BLE001
+                log.warning("saved session cookies loaded but localStorage priming failed: %s", exc)
+
+        self._prewarm_application_page()
+
+    def _prewarm_application_page(self, *, force: bool = False) -> bool:
+        """Start Amazon's application frontend before a schedule is detected.
+
+        This performs only ordinary page navigation. It has no job or schedule
+        identifiers and never clicks Create Application, Integrity, or later
+        controls. The token-minting job-search page remains separate.
+        """
+        if not self.cfg.get("hold", {}).get("prewarm_application", True):
+            return False
+        if getattr(self, "context", None) is None:
+            return False
+
+        page = self.hold_page
+        try:
+            closed = page is None or page.is_closed()
+        except Exception:  # noqa: BLE001
+            closed = True
+        if closed:
+            try:
+                page = self.context.new_page()
+                self.hold_page = page
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not create application prewarm page: %s", type(exc).__name__)
+                return False
+        elif not force:
+            return True
+
+        target = f"{self.cfg['site']['base_url'].rstrip('/')}/application/ca/"
+        try:
+            began = time.perf_counter()
+            page.goto(
+                target,
+                wait_until="commit",
+                timeout=min(int(self.cfg["browser"]["nav_timeout_ms"]), 10000),
             )
+            log.info(
+                "application frontend prewarm started in %.0fms",
+                (time.perf_counter() - began) * 1000,
+            )
+            return True
         except Exception as exc:  # noqa: BLE001
-            log.warning("saved session cookies loaded but localStorage priming failed: %s", exc)
+            # Prewarm is an optimization, never session proof and never a reason
+            # to disable detection. The direct route still gets its normal try.
+            log.warning("application frontend prewarm could not start: %s", type(exc).__name__)
+            return False
 
     def _record_hold_metric(
         self,
@@ -391,10 +444,17 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
         if not (schedule_id and job_id and self.cfg["hold"].get("direct_apply", True)):
             return None
 
-        page = self.page
+        page = self.hold_page
+        try:
+            if page is not None and page.is_closed():
+                page = None
+        except Exception:  # noqa: BLE001
+            page = None
+        if page is None:
+            page = self.page
         if page is None:
             page = self.context.new_page()
-            self.page = page
+        self.hold_page = page
 
         base.SCREENSHOT_DIR.mkdir(exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
@@ -478,6 +538,14 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
         ):
             if integrity_attempted and result.status == site_selectors.FAILED:
                 log.info("integrity reservation attempt finished without a reserve; skipping compatibility fallback")
+            self._report_hold(shift, result, shot, poll_started)
+            return result
+
+        if not self.cfg.get("hold", {}).get("compatibility_fallback", False):
+            log.warning(
+                "fast direct route failed (%s); compatibility fallback disabled for latency",
+                (result.message or "")[:140],
+            )
             self._report_hold(shift, result, shot, poll_started)
             return result
 

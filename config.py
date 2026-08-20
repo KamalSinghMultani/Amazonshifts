@@ -111,6 +111,13 @@ DEFAULTS: dict[str, Any] = {
         "stop_before_submit": True,
         "max_per_poll": 1,
         "direct_apply": False,
+        # Keep the application frontend loaded on a dedicated page so a match
+        # does not pay the full cold-start cost of its React bundles.
+        "prewarm_application": True,
+        # The original job-detail click path can add tens of seconds after a
+        # direct attempt has already failed. Keep it available for diagnostics,
+        # but never use it on the latency-first production path by default.
+        "compatibility_fallback": False,
         # A slot is often gone between the flyout rendering and Apply landing.
         # Try the next schedule on the same job rather than abandoning the job.
         "schedule_attempts": 3,
