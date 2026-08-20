@@ -51,9 +51,9 @@ polling:
   #
   # ⚠️ IF YOU SWITCH BACK TO dom MODE, raise this to 45 first — a dom poll is
   # a full page load, and 14s between those already earned a 403.
-  # Keep the shipped baseline at the tested regression floor; hot mode below
-  # still uses 2s during the race-critical window.
-  interval_seconds: 3
+  # 1.25s normal polling is intentionally more aggressive than the previously
+  # measured 2s floor; watch 403/429/circuit-breaker logs closely.
+  interval_seconds: 1.25
   # Random 0..jitter_seconds added to each interval so the traffic pattern
   # is not a metronome.
   jitter_seconds: 0
@@ -68,7 +68,9 @@ polling:
   # Two triggers, either is enough:
   #   * a match just happened     -> hot for hot_duration_seconds
   #   * the clock is in a window  -> hot for as long as the window lasts
-  hot_interval_seconds: 2
+  # 0.65s is intentionally experimental and has not been live-tested for WAF
+  # tolerance. The existing circuit breaker remains the backstop.
+  hot_interval_seconds: 0.65
   hot_duration_seconds: 120
 
   # Times of day that are ALWAYS hot, in your local time. May wrap midnight
