@@ -14,9 +14,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 import session_refresh
+
+
+class _DropLiveHoldWarning(logging.Filter):
+    """Hide the config's live-mode warning in this non-destructive command.
+
+    config.yaml is intentionally configured for the real watcher to hold when
+    live, so config validation emits a prominent warning.  verify_session only
+    proves authentication and never executes the hold path; showing that same
+    warning here made a safe diagnostic command look destructive.  Keep every
+    other config warning visible and suppress only that one banner.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.getMessage().startswith("LIVE HOLD ENABLED")
 
 
 def _brief(items, limit=12):
@@ -26,6 +41,21 @@ def _brief(items, limit=12):
     shown = values[:limit]
     suffix = f" (+{len(values) - limit} more)" if len(values) > limit else ""
     return ", ".join(shown) + suffix
+
+
+def _run_session_proof(config_path: str, output_state: Path, result_path: Path, force_login: bool) -> int:
+    config_log = logging.getLogger("config")
+    warning_filter = _DropLiveHoldWarning()
+    config_log.addFilter(warning_filter)
+    try:
+        return session_refresh.run(
+            config_path,
+            output_state=output_state,
+            result_path=result_path,
+            force_login=force_login,
+        )
+    finally:
+        config_log.removeFilter(warning_filter)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     output_state = state_dir / "verified_session_state.json"
     result_path = state_dir / "verified_session_result.json"
 
-    rc = session_refresh.run(
+    rc = _run_session_proof(
         args.config,
         output_state=output_state,
         result_path=result_path,
