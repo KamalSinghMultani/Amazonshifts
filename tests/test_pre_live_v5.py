@@ -76,7 +76,7 @@ def test_real_test_requires_explicit_ack_before_loading_config():
     assert real_hold_test.main([]) == 2
 
 
-def test_real_test_config_is_live_but_time_bounded(monkeypatch):
+def test_real_test_config_is_live_but_time_bounded_and_isolated(monkeypatch):
     cfg = {
         "dry_run": True,
         "hold": {
@@ -90,6 +90,10 @@ def test_real_test_config_is_live_but_time_bounded(monkeypatch):
             "storage_state": "auth_state.json",
             "user_data_dir": "browser_profile",
         },
+        "state": {
+            "path": "state/seen_shifts.json",
+            "detections_path": "state/detections.jsonl",
+        },
     }
     monkeypatch.setattr(real_hold_test, "load_config", lambda _path: cfg)
     out = real_hold_test._prepare_cfg("config.yaml", 60, real_hold_test.Path("verified.json"))
@@ -101,6 +105,8 @@ def test_real_test_config_is_live_but_time_bounded(monkeypatch):
     assert out["hold"]["max_per_poll"] == 1
     assert out["browser"]["storage_state"] == "verified.json"
     assert out["browser"]["user_data_dir"] is None
+    assert out["state"]["path"] == "state/real_hold_test_seen.json"
+    assert out["state"]["detections_path"] == "state/real_hold_test_detections.jsonl"
     until = datetime.fromisoformat(out["filters"]["accept_everything_until"])
     delta = (until - datetime.now()).total_seconds()
     assert 3500 < delta <= 3601
