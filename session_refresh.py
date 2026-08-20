@@ -18,9 +18,14 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 import browser_launch
-import doctor
 import relogin as login_flow
+import relogin_patch
+import session_proof
 from config import load_config, load_dotenv
+
+# Make the helper self-contained. It must use the same strict auth semantics as
+# the main watcher even when launched as a standalone subprocess.
+relogin_patch.apply_patch(login_flow)
 
 
 def _write(path: Path, **payload) -> None:
@@ -29,13 +34,7 @@ def _write(path: Path, **payload) -> None:
 
 
 def _forced_login(page, base_url: str) -> tuple[str, str]:
-    """Run the auth state machine even if the existing page looks signed in.
-
-    login_flow.attempt() first asks whether the current page appears
-    authenticated. That is correct for expiry recovery, but a proactive
-    100-minute refresh must actually replace the session rather than declaring
-    the old one healthy and returning immediately.
-    """
+    """Run the auth state machine even if an old page happens to look healthy."""
     if login_flow.credentials() is None:
         return login_flow.UNKNOWN, "no credentials in .env"
 
@@ -56,10 +55,23 @@ def _forced_login(page, base_url: str) -> tuple[str, str]:
     return login_flow.UNKNOWN, f"authentication failed at state: {state.name}"
 
 
+def _persist_success(context, output_state: Path, result_path: Path, status: str, proof) -> int:
+    output_state.parent.mkdir(parents=True, exist_ok=True)
+    context.storage_state(path=str(output_state))
+    _write(
+        result_path,
+        status=status,
+        detail=proof.reason + "; " + proof.summary(),
+        proof=proof.to_dict(),
+    )
+    return 0
+
+
 def run(config_path: str, output_state: Path, result_path: Path, force_login: bool) -> int:
     load_dotenv()
     cfg = load_config(config_path)
     storage = Path(cfg["browser"]["storage_state"])
+    base_url = cfg["site"]["base_url"]
 
     # Never reuse the live persistent profile from another process. Seed an
     # isolated context with the last saved cookies instead.
@@ -78,30 +90,41 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
             context.set_default_navigation_timeout(browser_cfg["nav_timeout_ms"])
             page = context.pages[0] if context.pages else context.new_page()
 
-            # A health-only pass avoids needless login attempts. Scheduled
-            # proactive refreshes intentionally bypass this shortcut.
+            # Existing-session checks are now strong: require positive account
+            # evidence on the configured country site AND application-shell
+            # access. A public URL or a weak shell load alone is not enough.
             if not force_login:
-                check = doctor.check_portal_login(
-                    page, cfg["site"]["base_url"], settle_ms=1500
-                )
-                if check.state == doctor.OK:
-                    output_state.parent.mkdir(parents=True, exist_ok=True)
-                    context.storage_state(path=str(output_state))
-                    _write(result_path, status="healthy", detail=check.detail)
+                proof = session_proof.prove_existing_session(page, base_url, settle_ms=1500)
+                if proof.passed:
+                    rc = _persist_success(
+                        context, output_state, result_path, "healthy", proof
+                    )
                     browser_launch.close_context(browser, context)
-                    return 0
+                    return rc
 
             status, detail = (
-                _forced_login(page, cfg["site"]["base_url"])
+                _forced_login(page, base_url)
                 if force_login
-                else login_flow.attempt(page, cfg["site"]["base_url"])
+                else login_flow.attempt(page, base_url)
             )
+
             if status == login_flow.OK:
-                output_state.parent.mkdir(parents=True, exist_ok=True)
-                context.storage_state(path=str(output_state))
-                _write(result_path, status="ok", detail=detail)
+                proof = session_proof.prove_fresh_session(page, base_url, settle_ms=1500)
+                if proof.passed:
+                    rc = _persist_success(context, output_state, result_path, "ok", proof)
+                    browser_launch.close_context(browser, context)
+                    return rc
+
+                _write(
+                    result_path,
+                    status="proof_failed",
+                    detail=(
+                        f"authentication reported success but session proof failed: {proof.reason}"
+                    ),
+                    proof=proof.to_dict(),
+                )
                 browser_launch.close_context(browser, context)
-                return 0
+                return 2
 
             _write(result_path, status=status, detail=detail)
             browser_launch.close_context(browser, context)
