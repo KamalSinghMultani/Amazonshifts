@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
+import auth_evidence
 import browser_launch
 import relogin as login_flow
 import relogin_patch
@@ -188,6 +189,7 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
                     browser_launch.close_context(browser, context)
                     return rc
 
+                evidence = auth_evidence.collect(page, context, base_url)
                 _write(
                     result_path,
                     status="proof_failed",
@@ -197,16 +199,22 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
                     proof=proof.to_dict(),
                     precheck=precheck.to_dict() if precheck is not None else None,
                     auth_diagnostics=diagnostics,
+                    auth_evidence=evidence,
                 )
                 browser_launch.close_context(browser, context)
                 return 2
 
+            # A challenge can disappear and still leave the state machine on an
+            # unrecognised country page. Capture structural evidence here rather
+            # than weakening the detector and calling that URL authenticated.
+            evidence = auth_evidence.collect(page, context, base_url)
             _write(
                 result_path,
                 status=status,
                 detail=detail,
                 precheck=precheck.to_dict() if precheck is not None else None,
                 auth_diagnostics=diagnostics,
+                auth_evidence=evidence,
             )
             browser_launch.close_context(browser, context)
             return 2
