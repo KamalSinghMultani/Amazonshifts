@@ -7,7 +7,7 @@ Inheritance remains deliberately additive:
       -> watcher_v4.AutoSessionWatcher
       -> watcher_v5.PreLiveWatcher
 
-No private candidate-application request is replayed here.  The fast path still
+No private candidate-application request is replayed here. The fast path still
 uses Amazon's frontend and passively observes its reserve response.
 """
 
@@ -39,7 +39,7 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
         Playwright ignores storage_state when launch_persistent_context is used.
         Without this, verify_session.py could prove/save a fresh application
         session while run_watcher.bat initially used older cookies/localStorage
-        from browser_profile.  Import the saved state into that live context
+        from browser_profile. Import the saved state into that live context
         before the polling loop starts; v4's background proof remains the
         authoritative verification/recovery layer afterwards.
         """
@@ -157,6 +157,12 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
             stop_before_submit=self.cfg["hold"]["stop_before_submit"],
             timeout_ms=self.cfg["browser"]["action_timeout_ms"],
             screenshot_path=str(shot),
+            manual_integrity_wait=bool(
+                self.cfg["hold"].get("manual_integrity_wait", False)
+            ),
+            manual_integrity_timeout_ms=int(
+                self.cfg["hold"].get("manual_integrity_timeout_ms", 120000)
+            ),
         )
         self._record_hold_metric(
             shift,
@@ -170,7 +176,7 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
             self._report_hold(shift, result, shot, poll_started)
             return result
 
-        # Keep the original click path as a compatibility fallback.  Disable
+        # Keep the original click path as a compatibility fallback. Disable
         # direct_apply only for this call so v3._hold falls through to v2's
         # proven card/detail/schedule flow instead of recursively retrying this
         # direct route.
