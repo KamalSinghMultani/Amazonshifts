@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 import fast_hold
+import hold_dom_probe
 import hold_metrics
 import schedules as schedules_mod
 import site_selectors
@@ -149,24 +150,39 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
         else:
             log.info("FAST HOLD dispatch schedule=%s", schedule_id)
 
-        result, backend_detail = fast_hold.hold(
-            page,
-            direct,
-            str(schedule_id),
-            base_url=self.cfg["site"]["base_url"],
-            stop_before_submit=self.cfg["hold"]["stop_before_submit"],
-            timeout_ms=self.cfg["browser"]["action_timeout_ms"],
-            screenshot_path=str(shot),
-            manual_integrity_wait=bool(
-                self.cfg["hold"].get("manual_integrity_wait", False)
-            ),
-            manual_integrity_timeout_ms=int(
-                self.cfg["hold"].get("manual_integrity_timeout_ms", 120000)
-            ),
-            auto_integrity_agree=bool(
-                self.cfg["hold"].get("auto_integrity_agree", False)
-            ),
-        )
+        # Diagnostic-only browser-side MutationObserver. It starts before the
+        # application document JavaScript and pushes only a few milestone
+        # events back to Python, so profiling does not add a 50ms polling loop
+        # or delay the reservation click. The resulting markers let us compare
+        # DOM insertion/enabled time against Playwright actionability.
+        probe = hold_dom_probe.HoldDomProbe(page)
+        probe.start()
+        result = None
+        try:
+            result, backend_detail = fast_hold.hold(
+                page,
+                direct,
+                str(schedule_id),
+                base_url=self.cfg["site"]["base_url"],
+                stop_before_submit=self.cfg["hold"]["stop_before_submit"],
+                timeout_ms=self.cfg["browser"]["action_timeout_ms"],
+                screenshot_path=str(shot),
+                manual_integrity_wait=bool(
+                    self.cfg["hold"].get("manual_integrity_wait", False)
+                ),
+                manual_integrity_timeout_ms=int(
+                    self.cfg["hold"].get("manual_integrity_timeout_ms", 120000)
+                ),
+                auto_integrity_agree=bool(
+                    self.cfg["hold"].get("auto_integrity_agree", False)
+                ),
+            )
+        finally:
+            if result is not None:
+                probe.annotate(result)
+            else:
+                probe.stop()
+
         self._record_hold_metric(
             shift,
             result,
