@@ -96,12 +96,13 @@ def test_fast_hold_detects_unavailable_after_integrity():
     assert "shift is no longer available" in detail.lower()
 
 
-def test_fast_hold_does_not_screenshot_before_create_click():
+def test_fast_hold_does_not_capture_before_create_click():
     source = inspect.getsource(fast_hold.hold)
     start = source.index("if create_ready and not create_clicked:")
     end = source.index("if create_clicked:", start)
     critical = source[start:end]
-    assert "screenshot" not in critical
+    assert "page.screenshot" not in critical
+    assert "failure_capture.capture" not in critical
     assert "page.locator(CREATE).first.click" in critical
 
 
