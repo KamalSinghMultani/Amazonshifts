@@ -1,11 +1,15 @@
 """Explicit, time-bounded real Canada hold validation.
 
-This command is intentionally separate from run_watcher.bat.  It mutates only
-an in-memory config copy, never config.yaml.  It broadens matching to whatever
+This command is intentionally separate from run_watcher.bat. It mutates only
+an in-memory config copy, never config.yaml. It broadens matching to whatever
 the already-Canadian API returns, runs for at most N minutes (max 60), and stops
-immediately after the first confirmed or uncertain Create Application attempt.
+after the first confirmed or uncertain hold attempt.
 
-A confirmed run creates a real Amazon candidate application / soft reserve.
+The validation browser is visible. If Amazon inserts its Application Integrity
+Notice after Create Application, the watcher keeps its passive reserve observer
+attached while the applicant clicks I Agree manually. The test never clicks
+that attestation itself. A confirmed run creates a real Amazon candidate
+application / soft reserve.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ class RealHoldTestWatcher(watcher_v5.PreLiveWatcher):
         if result is not None and (
             result.held or result.status == site_selectors.UNCERTAIN
         ):
-            # Never create a second application during a validation run.  An
+            # Never create a second application during a validation run. An
             # uncertain result means Create Application may already have been
             # accepted, so it is treated as stop-now just like confirmation.
             log.info("real hold validation stopping after first committed/uncertain attempt")
@@ -76,19 +80,29 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     cfg["hold"]["stop_before_submit"] = False
     cfg["hold"]["max_per_poll"] = 1
 
-    # The API request itself is already scoped to Canada.  This bypasses only
+    # Live CA 2026-08-19 inserted an Application Integrity Notice between
+    # Create Application and the reserve confirmation. Keep the passive backend
+    # observer alive for up to two minutes while the applicant handles that
+    # page manually in the visible browser.
+    cfg["hold"]["manual_integrity_wait"] = True
+    cfg["hold"]["manual_integrity_timeout_ms"] = 120000
+
+    # The API request itself is already scoped to Canada. This bypasses only
     # the user's normal title/location preferences, and expires automatically.
     cfg.setdefault("filters", {})["accept_everything_until"] = end.isoformat(timespec="seconds")
 
-    # Use exactly the isolated storage state that just passed preflight.  A
+    # Use exactly the isolated storage state that just passed preflight. A
     # Playwright persistent profile ignores storage_state entirely, so leaving
     # user_data_dir enabled here would prove one browser and test another.
-    # This mutation exists only in memory for this validation process.
     cfg["browser"]["storage_state"] = str(verified_state)
     cfg["browser"]["user_data_dir"] = None
 
+    # The integrity handoff must be visible so the applicant can perform that
+    # one manual action. Normal watcher/headless configuration is untouched.
+    cfg["browser"]["headless"] = False
+
     # Validation must neither skip candidates already seen by the normal
-    # watcher nor contaminate its dedup/history files.  Give it an isolated
+    # watcher nor contaminate its dedup/history files. Give it an isolated
     # state namespace that disappears into the normal gitignored state/ tree.
     cfg.setdefault("state", {})["path"] = "state/real_hold_test_seen.json"
     cfg["state"]["detections_path"] = "state/real_hold_test_detections.jsonl"
@@ -101,7 +115,7 @@ def _write_runtime_config(cfg: dict) -> Path:
     v3 session workers receive a config path, not the parent's in-memory dict.
     Pointing them at normal config.yaml would make a worker reopen the old
     auth_state.json immediately after preflight had proved/recovered a newer
-    real_test_verified_state.json.  This gitignored runtime config keeps the
+    real_test_verified_state.json. This gitignored runtime config keeps the
     main watcher and every helper on the exact same proved session source.
     """
     runtime = copy.deepcopy(cfg)
@@ -163,7 +177,10 @@ def main(argv: list[str] | None = None) -> int:
     deadline = datetime.now() + timedelta(minutes=args.minutes)
     print("SESSION READY — real hold validation is armed.")
     print(f"Canada-wide matching ends automatically at {deadline:%Y-%m-%d %H:%M:%S} local time.")
-    print("The process also stops immediately after the first confirmed or uncertain Create Application attempt.")
+    print("A visible Chrome window will stay open for the validation.")
+    print("If the Application Integrity Notice appears, click I Agree yourself promptly.")
+    print("The watcher will keep observing the reserve response and will not click I Agree for you.")
+    print("The process stops after the first confirmed or uncertain hold attempt.")
     print("Timing records: logs/hold_timings.jsonl")
 
     watcher = RealHoldTestWatcher(cfg, live_override=True)
@@ -187,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
         stages = latest.get("stages") or []
         for stage in stages:
             print(f"  {stage.get('name')}: {stage.get('ms_from_hold_start')} ms from hold start")
+        if latest.get("backend_detail"):
+            print(f"  backend:            {latest.get('backend_detail')}")
     else:
         print("No hold attempt occurred during this validation window.")
     return rc
