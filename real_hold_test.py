@@ -146,10 +146,10 @@ def _prepare_cfg(config_path: str, minutes: int, verified_state: Path) -> dict:
     cfg["hold"]["manual_integrity_wait"] = False
     cfg["hold"]["manual_integrity_timeout_ms"] = 120000
     cfg["hold"]["auto_integrity_agree"] = True
-    # The account has already completed eKYC. Click only Amazon Hiring's
-    # launcher once so Amazon can recognize that fact and skip the gate. The
-    # hold path still stops if a real remoteKYC/selfie/document UI appears.
-    cfg["hold"]["auto_start_identity_verification"] = True
+    # The applicant explicitly authorized both identity-consent checkboxes and
+    # the launcher. Click those exact three controls so Amazon can recognize
+    # the account's completed eKYC; stop if real remoteKYC appears.
+    cfg["hold"]["auto_accept_identity_consent_and_start"] = True
 
     # The API request itself is already scoped to Canada. This bypasses only
     # the user's normal title/location preferences, and expires automatically.

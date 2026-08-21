@@ -30,6 +30,7 @@ IDENTITY_START = (
     "[role='button']:has-text('Start identity verification'), "
     "[role='button']:has-text('Start identification')"
 )
+IDENTITY_CONSENT_CHECKBOXES = "input[type='checkbox']"
 HOLD_TEXT = "holding a spot"
 UNAVAILABLE_TEXT_PATTERNS = (
     "shift is no longer available",
@@ -53,6 +54,10 @@ ACTUAL_IDENTITY_TEXT_PATTERNS = (
     "upload your identity document",
     "scan your identity document",
     "take a photo of your identity document",
+)
+IDENTITY_CONSENT_TEXT_PATTERNS = (
+    "i agree that amazon and its service providers may use artificial intelligence and machine learning",
+    "i consent to the collection and processing of my personal information",
 )
 
 
@@ -140,6 +145,20 @@ def _identity_verification_required(page: Any) -> bool:
     return any(pattern in text for pattern in IDENTITY_TEXT_PATTERNS)
 
 
+def _identity_consent_page(page: Any) -> bool:
+    """Match only Amazon's two-checkbox identity-consent launcher page."""
+    text = _body_text(page).lower().replace("(ai/ml)", "")
+    return all(pattern in text for pattern in IDENTITY_CONSENT_TEXT_PATTERNS)
+
+
+def _identity_consent_checkboxes(page: Any) -> Any:
+    """Prefer accessible checkbox roles, with a CSS fallback for test doubles."""
+    get_by_role = getattr(page, "get_by_role", None)
+    if callable(get_by_role):
+        return get_by_role("checkbox")
+    return page.locator(IDENTITY_CONSENT_CHECKBOXES)
+
+
 def _actual_identity_verification_active(
     page: Any, *, after_launcher_click: bool = False
 ) -> bool:
@@ -190,7 +209,7 @@ def hold(
     manual_integrity_wait: bool = False,
     manual_integrity_timeout_ms: int = 120000,
     auto_integrity_agree: bool = False,
-    auto_start_identity_verification: bool = False,
+    auto_accept_identity_consent_and_start: bool = False,
 ) -> tuple[site_selectors.HoldResult, str]:
     """Return (HoldResult, backend_detail) with minimal local waiting.
 
@@ -204,11 +223,11 @@ def hold(
       * auto_integrity_agree: click only the integrity notice's I Agree button,
         then observe reserve/unavailable state and stop before later forms.
 
-    ``auto_start_identity_verification`` permits exactly one normal click on
-    Amazon Hiring's Start identification launcher. This supports accounts for
-    which Amazon immediately recognizes a previously completed identity check.
-    It never selects consent checkboxes or operates remoteKYC, selfie, camera,
-    document-upload, or submission controls.
+    ``auto_accept_identity_consent_and_start`` is an explicit opt-in to check
+    the two identity/privacy consent boxes shown by Amazon Hiring and click its
+    Start identification launcher once. This supports accounts for which Amazon
+    then recognizes a previously completed identity check. It never operates
+    remoteKYC, selfie, camera, document-upload, or submission controls.
 
     The auto mode is deliberately opt-in. It does not fill personal details,
     documents, assessments, identity checks, or any later application fields.
@@ -267,6 +286,11 @@ def hold(
         identity_start_enabled_seen = False
         identity_start_actionable_seen = False
         identity_start_click_error = ""
+        identity_consent_visible_seen = [False, False]
+        identity_consent_enabled_seen = [False, False]
+        identity_consent_actionable_seen = [False, False]
+        identity_consent_checked_seen = [False, False]
+        identity_consent_click_errors = ["", ""]
 
         def identity_result(message: str) -> tuple[site_selectors.HoldResult, str]:
             return (
@@ -305,7 +329,7 @@ def hold(
                 mark("actual identity verification required")
                 return identity_result(
                     "Amazon opened the actual identity-verification experience. "
-                    "Application automation stopped before consent, selfie, ID upload, or submission; "
+                    "Application automation stopped before selfie, ID upload, or submission; "
                     "complete it manually on Amazon if you choose."
                 )
 
@@ -322,13 +346,68 @@ def hold(
                     identity_seen = True
                     mark("identity verification launcher reached")
 
-                if not auto_start_identity_verification:
+                if not auto_accept_identity_consent_and_start:
                     mark("identity verification required")
                     return identity_result(
                         "Amazon requires identity verification for this candidate account. "
                         "Application automation stopped before consent, selfie, ID upload, or submission; "
                         "complete the verification manually on Amazon if you choose."
                     )
+
+                consent_ready = False
+                if _identity_consent_page(page):
+                    try:
+                        checkboxes = _identity_consent_checkboxes(page)
+                        if checkboxes.count() >= 2:
+                            checked_states: list[bool] = []
+                            for index in range(2):
+                                checkbox = checkboxes.nth(index)
+                                label = f"identity consent {index + 1}"
+                                visible = checkbox.is_visible()
+                                if visible and not identity_consent_visible_seen[index]:
+                                    identity_consent_visible_seen[index] = True
+                                    mark(f"{label} visible")
+                                enabled = visible and checkbox.is_enabled()
+                                if enabled and not identity_consent_enabled_seen[index]:
+                                    identity_consent_enabled_seen[index] = True
+                                    mark(f"{label} enabled")
+                                checked = bool(checkbox.is_checked())
+                                if checked and not identity_consent_checked_seen[index]:
+                                    identity_consent_checked_seen[index] = True
+                                    mark(f"{label} checked")
+                                if not checked and enabled:
+                                    try:
+                                        checkbox.click(
+                                            timeout=min(timeout_ms, 200),
+                                            trial=True,
+                                        )
+                                        if not identity_consent_actionable_seen[index]:
+                                            identity_consent_actionable_seen[index] = True
+                                            mark(f"{label} actionable")
+                                        checkbox.click(timeout=min(timeout_ms, 1000))
+                                        mark(f"{label} clicked")
+                                        page.wait_for_timeout(10)
+                                        checked = bool(checkbox.is_checked())
+                                        if checked and not identity_consent_checked_seen[index]:
+                                            identity_consent_checked_seen[index] = True
+                                            mark(f"{label} checked")
+                                    except Exception as exc:  # noqa: BLE001
+                                        identity_consent_click_errors[index] = type(exc).__name__
+                                checked_states.append(checked)
+                            consent_ready = all(checked_states)
+                    except Exception as exc:  # noqa: BLE001
+                        identity_consent_click_errors[0] = type(exc).__name__
+
+                # Do not click a generic checkbox on an unexpected page, and
+                # do not click Start until both exact consent controls report
+                # checked. The next loop re-probes React state without a fixed
+                # sleep or force/JavaScript click.
+                if not consent_ready:
+                    try:
+                        page.wait_for_timeout(50)
+                    except Exception:
+                        break
+                    continue
 
                 start_visible = _visible(page, IDENTITY_START)
                 if start_visible and not identity_start_visible_seen:
@@ -368,8 +447,8 @@ def hold(
                             identity_start_click_error = type(exc).__name__
 
                 # Wait for the launcher button/automatic redirect within the
-                # existing bounded post-I-Agree window. Do not touch consent,
-                # camera, document, or remoteKYC controls.
+                # existing bounded post-I-Agree window. Do not touch camera,
+                # document, or remoteKYC controls.
                 try:
                     page.wait_for_timeout(50)
                 except Exception:
@@ -675,19 +754,24 @@ def hold(
     if identity_seen and not identity_left:
         mark("identity verification launcher timeout")
         if not identity_start_clicked:
+            consent_error = next(
+                (error for error in identity_consent_click_errors if error),
+                "",
+            )
+            last_error = identity_start_click_error or consent_error
             detail = (
-                "Amazon's Start identification control did not become actionable"
+                "Amazon's identity consent and Start identification controls did not become actionable"
                 + (
-                    f" (last click error: {identity_start_click_error})"
-                    if identity_start_click_error
+                    f" (last click error: {last_error})"
+                    if last_error
                     else ""
                 )
-                + ". Application automation stopped without operating consent, selfie, ID, or remoteKYC controls."
+                + ". Application automation stopped without operating selfie, ID, or remoteKYC controls."
             )
         else:
             detail = (
                 "Amazon did not skip the identity launcher after Start identification was clicked once. "
-                "Application automation stopped without operating consent, selfie, ID, or remoteKYC controls."
+                "Application automation stopped without operating selfie, ID, or remoteKYC controls."
             )
         return identity_result(detail)
 

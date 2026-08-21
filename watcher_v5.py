@@ -529,8 +529,8 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
                 auto_integrity_agree=bool(
                     self.cfg["hold"].get("auto_integrity_agree", False)
                 ),
-                auto_start_identity_verification=bool(
-                    self.cfg["hold"].get("auto_start_identity_verification", False)
+                auto_accept_identity_consent_and_start=bool(
+                    self.cfg["hold"].get("auto_accept_identity_consent_and_start", False)
                 ),
             )
         finally:

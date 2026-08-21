@@ -39,6 +39,7 @@ class HoldFlowPage:
         self.after_identity = after_identity
         self.url = "about:blank"
         self.clicked = []
+        self.identity_consents = [False, False]
 
     def goto(self, url, **_kwargs):
         self.phase = "create"
@@ -50,7 +51,12 @@ class HoldFlowPage:
         if self.phase == "integrity":
             return "Application Integrity Notice I Agree"
         if self.phase == "liveness":
-            return "Let's confirm it's you Start identity verification"
+            return (
+                "Let's confirm it's you Provide consent "
+                "I agree that Amazon and its service providers may use Artificial Intelligence "
+                "and Machine Learning (AI/ML). I consent to the collection and processing of "
+                "my personal information. Start identity verification"
+            )
         if self.phase == "unavailable":
             return "Sorry, this shift is no longer available."
         if self.phase == "remote_kyc":
@@ -64,9 +70,15 @@ class HoldFlowPage:
         page = self
 
         class L:
+            def __init__(self, index=None):
+                self.index = index
+
             @property
             def first(self):
-                return self
+                return L(0)
+
+            def nth(self, index):
+                return L(index)
 
             def _present(self):
                 if "Create Application" in selector:
@@ -75,21 +87,37 @@ class HoldFlowPage:
                     return page.phase == "integrity"
                 if "Start identity" in selector or "Start identification" in selector:
                     return page.phase == "liveness"
+                if selector == fast_hold.IDENTITY_CONSENT_CHECKBOXES:
+                    return page.phase == "liveness" and self.index in (0, 1)
                 return False
 
             def count(self):
+                if selector == fast_hold.IDENTITY_CONSENT_CHECKBOXES:
+                    if page.phase != "liveness":
+                        return 0
+                    return 2 if self.index is None else 1
                 return int(self._present())
 
             def is_visible(self):
                 return self._present()
 
             def is_enabled(self):
+                if "Start identity" in selector or "Start identification" in selector:
+                    return self._present() and all(page.identity_consents)
                 return self._present()
+
+            def is_checked(self):
+                if selector != fast_hold.IDENTITY_CONSENT_CHECKBOXES or self.index not in (0, 1):
+                    return False
+                return page.identity_consents[self.index]
 
             def click(self, **kwargs):
                 if kwargs.get("trial"):
                     return None
-                if "Create Application" in selector:
+                if selector == fast_hold.IDENTITY_CONSENT_CHECKBOXES:
+                    page.clicked.append(f"Identity consent {self.index + 1}")
+                    page.identity_consents[self.index] = True
+                elif "Create Application" in selector:
                     page.clicked.append("Create Application")
                     page.phase = "integrity"
                     page.url = "https://hiring.amazon.ca/application/ca/#/application-integrity-notice"
@@ -259,6 +287,18 @@ def test_liveness_route_and_text_are_identity_verification_states():
     assert fast_hold._identity_verification_required(text) is True
 
 
+def test_identity_consent_page_requires_both_exact_consent_statements():
+    complete = HoldFlowPage()
+    complete.phase = "liveness"
+    assert fast_hold._identity_consent_page(complete) is True
+
+    class UnrelatedCheckboxPage:
+        def inner_text(self, _selector):
+            return "Subscribe to updates Start identity verification"
+
+    assert fast_hold._identity_consent_page(UnrelatedCheckboxPage()) is False
+
+
 def test_create_and_agree_click_as_soon_as_actionable_then_stop_at_ekyc(monkeypatch):
     monkeypatch.setattr(fast_hold.hold_verify, "SoftReserveObserver", PassiveObserver)
     monkeypatch.setattr(fast_hold.site_selectors, "dismiss_overlays", lambda *_a, **_k: [])
@@ -306,7 +346,7 @@ def test_completed_identity_launcher_is_clicked_once_then_hold_flow_continues(mo
         stop_before_submit=False,
         timeout_ms=1000,
         auto_integrity_agree=True,
-        auto_start_identity_verification=True,
+        auto_accept_identity_consent_and_start=True,
     )
 
     assert result.status == site_selectors.FAILED
@@ -314,9 +354,13 @@ def test_completed_identity_launcher_is_clicked_once_then_hold_flow_continues(mo
     assert page.clicked == [
         "Create Application",
         "I Agree",
+        "Identity consent 1",
+        "Identity consent 2",
         "Start identity verification",
     ]
     names = [name for name, _ms in result.timings]
+    assert names.index("identity consent 1 clicked") < names.index("identity consent 2 clicked")
+    assert names.index("identity consent 2 checked") < names.index("start identification clicked")
     assert names.index("start identification visible") < names.index("start identification clicked")
     assert names.index("start identification enabled") < names.index("start identification clicked")
     assert names.index("start identification actionable") < names.index("start identification clicked")
@@ -337,13 +381,15 @@ def test_actual_remote_kyc_stops_immediately_after_launcher_click(monkeypatch):
         stop_before_submit=False,
         timeout_ms=1000,
         auto_integrity_agree=True,
-        auto_start_identity_verification=True,
+        auto_accept_identity_consent_and_start=True,
     )
 
     assert result.status == site_selectors.IDENTITY_VERIFICATION_REQUIRED
     assert page.clicked == [
         "Create Application",
         "I Agree",
+        "Identity consent 1",
+        "Identity consent 2",
         "Start identity verification",
     ]
     assert "tracking" not in result.url.lower()
@@ -378,7 +424,7 @@ def test_completed_identity_skip_can_finish_from_reserve_proof(monkeypatch):
         stop_before_submit=False,
         timeout_ms=1000,
         auto_integrity_agree=True,
-        auto_start_identity_verification=True,
+        auto_accept_identity_consent_and_start=True,
     )
 
     assert result.status == site_selectors.CONFIRMED
@@ -386,6 +432,8 @@ def test_completed_identity_skip_can_finish_from_reserve_proof(monkeypatch):
     assert page.clicked == [
         "Create Application",
         "I Agree",
+        "Identity consent 1",
+        "Identity consent 2",
         "Start identity verification",
     ]
     names = [name for name, _ms in result.timings]
