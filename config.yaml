@@ -376,12 +376,12 @@ notifications:
 lifecycle_monitor:
   enabled: true
   # Amazon's live frontend sends one getJobDetail operation per job and its
-  # resolver rejected aliases. Check the five Brampton/Mississauga documents
+  # resolver rejected aliases. Check the three Brampton documents
   # back-to-back on each lifecycle pass. This is intentionally more aggressive
   # than round-robin and increases WAF risk, but keeps known-id revisit latency
   # near the lifecycle interval instead of roughly 8.75 seconds.
   interval_seconds: 2.0
-  jobs_per_poll: 5
+  jobs_per_poll: 3
   notify_unposted: true
   notify_posted_without_capacity: true
   state_path: state/job_lifecycle.json
@@ -390,8 +390,6 @@ lifecycle_monitor:
     - {site_code: YYZ4, location: "Brampton, ON", job_id: JOB-CA-0000000557}
     - {site_code: YYZ3, location: "Brampton, ON", job_id: JOB-CA-0000000509}
     - {site_code: DDJ3, location: "Brampton, ON", job_id: JOB-CA-0000000560}
-    - {site_code: DTY4, location: "Mississauga, ON", job_id: JOB-CA-0000000511}
-    - {site_code: YYZ1, location: "Mississauga, ON", job_id: JOB-CA-0000000591}
 
 hold:
   direct_apply: true
