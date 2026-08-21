@@ -49,15 +49,16 @@ def test_real_hold_validation_reuses_preflight_without_background_auth(monkeypat
     assert Path(out["browser"]["storage_state"]) == Path("state/verified.json")
 
 
-def test_real_hold_preflight_forces_fresh_login_and_requires_proof(monkeypatch, tmp_path):
+def test_real_hold_preflight_reuses_saved_session_and_requires_proof(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     observed = {}
 
-    def refresh(config_path, output_state, result_path, force_login):
+    def refresh(config_path, output_state, result_path, force_login, *, input_state=None):
         observed.update(
             config_path=config_path,
             output_state=output_state,
             force_login=force_login,
+            input_state=input_state,
         )
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_text(
@@ -70,12 +71,81 @@ def test_real_hold_preflight_forces_fresh_login_and_requires_proof(monkeypatch, 
     ok, verified_state, detail = real_hold_test._preflight("config.yaml")
 
     assert ok is True
-    assert observed["force_login"] is True
+    assert observed["force_login"] is False
+    assert observed["input_state"] is None
     assert observed["output_state"] == verified_state
     assert "2xx" in detail
 
 
-def test_sixty_minute_timer_starts_only_after_fresh_preflight(monkeypatch, tmp_path):
+def test_real_hold_preflight_can_explicitly_force_fresh_login(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    observed = {}
+
+    def refresh(config_path, output_state, result_path, force_login, *, input_state=None):
+        observed["force_login"] = force_login
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(
+            json.dumps({"status": "ok", "detail": "protected candidate read returned 2xx"}),
+            "utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(real_hold_test.session_refresh, "run", refresh)
+    ok, _verified_state, _detail = real_hold_test._preflight(
+        "config.yaml", force_fresh_login=True
+    )
+
+    assert ok is True
+    assert observed["force_login"] is True
+
+
+def test_real_hold_preflight_reuses_its_last_strictly_verified_state(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    prior = tmp_path / "state" / "real_test_verified_state.json"
+    prior.parent.mkdir(parents=True)
+    prior.write_text("{}", "utf-8")
+    observed = {}
+
+    def refresh(config_path, output_state, result_path, force_login, *, input_state=None):
+        observed["input_state"] = input_state
+        result_path.write_text(
+            json.dumps({"status": "healthy", "detail": "protected candidate read returned 2xx"}),
+            "utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(real_hold_test.session_refresh, "run", refresh)
+    monkeypatch.setattr(
+        real_hold_test,
+        "load_config",
+        lambda _path: {"browser": {"storage_state": str(tmp_path / "auth_state.json")}},
+    )
+
+    ok, verified_state, _detail = real_hold_test._preflight("config.yaml")
+
+    assert ok is True
+    assert observed["input_state"] == verified_state == Path(
+        "state/real_test_verified_state.json"
+    )
+
+
+def test_strictly_verified_state_is_promoted_to_canonical_restart_seed(monkeypatch, tmp_path):
+    verified = tmp_path / "state" / "verified.json"
+    canonical = tmp_path / "auth_state.json"
+    verified.parent.mkdir(parents=True)
+    verified.write_text('{"cookies": [], "origins": []}', "utf-8")
+    monkeypatch.setattr(
+        real_hold_test,
+        "load_config",
+        lambda _path: {"browser": {"storage_state": str(canonical)}},
+    )
+
+    real_hold_test._promote_verified_state("config.yaml", verified)
+
+    assert canonical.read_text("utf-8") == verified.read_text("utf-8")
+
+
+def test_sixty_minute_timer_starts_only_after_strict_preflight(monkeypatch, tmp_path):
     events = []
     cfg = {
         "session": {"auto_relogin": False, "relogin_every_seconds": 0},
@@ -90,7 +160,7 @@ def test_sixty_minute_timer_starts_only_after_fresh_preflight(monkeypatch, tmp_p
     monkeypatch.setattr(
         real_hold_test,
         "_preflight",
-        lambda _path: events.append("fresh-proof") or (True, tmp_path / "verified.json", "2xx"),
+        lambda _path, **_kwargs: events.append("strict-proof") or (True, tmp_path / "verified.json", "2xx"),
     )
     monkeypatch.setattr(real_hold_test, "_prepare_cfg", lambda *_args: cfg)
     monkeypatch.setattr(real_hold_test, "_reset_test_state", lambda _cfg: None)
@@ -129,4 +199,4 @@ def test_sixty_minute_timer_starts_only_after_fresh_preflight(monkeypatch, tmp_p
     monkeypatch.setattr(real_hold_test.threading, "Timer", Timer)
 
     assert real_hold_test.main(["--ack-real-hold", "--minutes", "60"]) == 0
-    assert events[:3] == ["fresh-proof", "timer-start", "watcher-run"]
+    assert events[:3] == ["strict-proof", "timer-start", "watcher-run"]

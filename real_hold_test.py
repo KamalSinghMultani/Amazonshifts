@@ -21,6 +21,7 @@ import argparse
 import copy
 import json
 import logging
+import shutil
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,6 +37,24 @@ from config import load_config, load_dotenv, setup_logging
 
 
 log = logging.getLogger("watcher")
+
+
+def _promote_verified_state(config_path: str, verified_state: Path) -> None:
+    """Make a strict 2xx-proved state the restart seed used by all commands."""
+    if not verified_state.exists():
+        return
+    canonical = Path(load_config(config_path)["browser"]["storage_state"])
+    try:
+        if canonical.resolve() == verified_state.resolve():
+            return
+    except OSError:
+        pass
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(verified_state, canonical)
+    try:
+        canonical.chmod(0o600)
+    except OSError:
+        pass
 
 
 class RealHoldTestWatcher(watcher_v7.LifecycleWatcher):
@@ -105,7 +124,11 @@ class RealHoldTestWatcher(watcher_v7.LifecycleWatcher):
                 self.research_trace.stop()
 
 
-def _preflight(config_path: str) -> tuple[bool, Path, str]:
+def _preflight(
+    config_path: str,
+    *,
+    force_fresh_login: bool = False,
+) -> tuple[bool, Path, str]:
     state_dir = Path("state")
     verified_state = state_dir / "real_test_verified_state.json"
     result_path = state_dir / "real_test_session_result.json"
@@ -113,13 +136,18 @@ def _preflight(config_path: str) -> tuple[bool, Path, str]:
         config_path,
         output_state=verified_state,
         result_path=result_path,
-        force_login=True,
+        force_login=force_fresh_login,
+        # A successful preflight is itself a strictly proved reusable session.
+        # Seed the next test from that newer state instead of repeatedly going
+        # back to an older config-level auth_state.json snapshot.
+        input_state=verified_state if verified_state.exists() else None,
     )
     try:
         result = json.loads(result_path.read_text("utf-8"))
     except Exception as exc:  # noqa: BLE001
         return False, verified_state, f"could not read session preflight result: {exc}"
     if rc == 0 and result.get("status") in ("ok", "healthy"):
+        _promote_verified_state(config_path, verified_state)
         return True, verified_state, str(result.get("detail") or "session verified")
     detail = str(result.get("detail") or f"session preflight exited {rc}")
     return False, verified_state, detail
@@ -217,6 +245,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="required: acknowledge that the test can create an application and reserve a real shift",
     )
+    parser.add_argument(
+        "--force-fresh-login",
+        action="store_true",
+        help=(
+            "skip saved-session proof and intentionally run the complete login flow; "
+            "this may trigger a CAPTCHA"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.ack_real_hold:
@@ -231,8 +267,14 @@ def main(argv: list[str] | None = None) -> int:
     cfg_for_logging = load_config(args.config)
     setup_logging(cfg_for_logging)
 
-    print("Running fresh Canada login and strict application-session proof...")
-    ok, verified_state, detail = _preflight(args.config)
+    if args.force_fresh_login:
+        print("Forcing fresh Canada login, then requiring strict application-session proof...")
+    else:
+        print("Proving the saved Canada application session (fresh login only after definite expiry)...")
+    ok, verified_state, detail = _preflight(
+        args.config,
+        force_fresh_login=args.force_fresh_login,
+    )
     if not ok:
         print(f"NOT STARTED — session preflight failed: {detail}")
         print("Check screenshots/ for a session failure image/JSON sidecar if one was captured.")
@@ -246,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     print("SESSION READY — reservation-only validation is armed.")
     print(f"Canada-wide matching ends automatically at {deadline:%Y-%m-%d %H:%M:%S} local time.")
     print("A visible Chrome window will stay open for this first integrity transition test.")
-    print("The freshly proved session is reused directly; prove-only health checks renew hold readiness every 5 minutes, with no mid-test login/recovery.")
+    print("The strictly proved session is reused directly; prove-only health checks renew hold readiness every 5 minutes, with no mid-test login/recovery.")
     print("Flow: detect -> exact schedule -> Create Application -> I Agree -> reserve result.")
     print("Confirmed or uncertain -> STOP. Explicit unavailable -> try next ranked schedule (up to 3+ configured attempts).")
     print("Later personal-info/documents/assessment/identity steps are never filled or clicked.")

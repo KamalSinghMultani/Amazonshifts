@@ -5,7 +5,8 @@ Usage:
     python verify_session.py --config config.yaml --force-fresh-login
 
 Default behavior mirrors the live watcher: strongly prove the saved session
-first and only run the existing login flow if that proof fails. The optional
+first and only run the existing login flow if that proof establishes definite
+expiry. Inconclusive WAF/network/page results do not start login. The optional
 flag deliberately forces a new login for a targeted authentication test.
 Neither mode creates an application or reserves a shift.
 """

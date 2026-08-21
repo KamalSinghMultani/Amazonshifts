@@ -1,10 +1,11 @@
 """Refresh/prove the Amazon Hiring session in a separate process.
 
 The main watcher keeps polling while this helper proves an existing application
-session or, when that proof fails, runs the project's existing authentication
-state machine. This module does not implement a second login/CAPTCHA stack: it
-reuses relogin.py and only adds strict proof, safe failure diagnostics, and a
-storage-state handoff back to the live watcher.
+session or, when that proof establishes definite expiry, runs the project's
+existing authentication state machine. Inconclusive WAF/network/page results
+never start login. This module does not implement a second login/CAPTCHA stack:
+it reuses relogin.py and only adds strict proof, safe failure diagnostics, and
+a storage-state handoff back to the live watcher.
 """
 
 from __future__ import annotations
@@ -198,10 +199,31 @@ def _with_capture(detail: str, captured: dict) -> str:
     return f"{detail}; failure screenshot: {shot}" if shot else detail
 
 
-def run(config_path: str, output_state: Path, result_path: Path, force_login: bool) -> int:
+def _definitive_expiry(proof) -> bool:
+    """Return only strong evidence that authentication is no longer accepted.
+
+    A protected-app redirect to login and a same-origin candidate GET returning
+    401 are authoritative. Missing responses, 403/WAF blocks, browser/network
+    failures, and an incompletely rendered page are deliberately inconclusive;
+    they must never trigger a fresh login (and therefore another CAPTCHA).
+    """
+    return bool(
+        proof.application_redirected_to_login
+        or proof.application_backend_unauthorized
+    )
+
+
+def run(
+    config_path: str,
+    output_state: Path,
+    result_path: Path,
+    force_login: bool,
+    *,
+    input_state: Path | None = None,
+) -> int:
     load_dotenv()
     cfg = load_config(config_path)
-    storage = Path(cfg["browser"]["storage_state"])
+    storage = input_state or Path(cfg["browser"]["storage_state"])
     base_url = cfg["site"]["base_url"]
 
     browser_cfg = dict(cfg["browser"])
@@ -228,6 +250,22 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
                     )
                     browser_launch.close_context(browser, context)
                     return rc
+
+                if not _definitive_expiry(precheck):
+                    _write(
+                        result_path,
+                        status="inconclusive",
+                        detail=(
+                            precheck.reason
+                            + "; no login attempted because expiry was not definitively proved; "
+                            + precheck.summary()
+                        ),
+                        proof=precheck.to_dict(),
+                        precheck=precheck.to_dict(),
+                        definitive_expiry=False,
+                    )
+                    browser_launch.close_context(browser, context)
+                    return 2
 
             status, detail, diagnostics = _forced_login(page, base_url)
 
