@@ -28,6 +28,12 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
             0.0, float(lifecycle.get("health_log_interval_seconds", 60.0))
         )
         self.lifecycle_next_poll = 0.0
+        # Public search and known-job detail share Amazon's catalog edge.  Do
+        # not send both requests in one visible watcher poll: live evidence
+        # showed that the former arrangement reached a repeatable HTTP 403
+        # immediately after poll 38 (roughly 76 aggregate requests).  Healthy
+        # cycles alternate sources, preserving one upstream request per loop.
+        self.lifecycle_request_turn = True
         self.lifecycle_next_health_log = 0.0
         self.lifecycle_candidates = []
         self.lifecycle_failures = 0
@@ -47,8 +53,10 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
         ) if self.lifecycle_enabled else None
         if self.lifecycle_enabled:
             log.info(
-                "known-job lifecycle detector armed for %d job id(s) at %.2fs cadence",
-                len(self.lifecycle_monitor.known_jobs), self.lifecycle_interval,
+                "known-job lifecycle detector armed for %d job id(s); alternating "
+                "with public search at one upstream request per %.2fs watcher cycle",
+                len(self.lifecycle_monitor.known_jobs),
+                float(self.cfg["polling"]["interval_seconds"]),
             )
 
     def _record_lifecycle_success(self, completed_at: float, duration_ms: float) -> None:
@@ -90,12 +98,13 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
             )
             self.lifecycle_next_health_log = completed_at + self.lifecycle_health_log_interval
 
-    def _lifecycle_tick(self) -> None:
+    def _lifecycle_tick(self) -> bool:
+        """Run a due lifecycle request and report whether one was attempted."""
         if not self.lifecycle_enabled or self.lifecycle_monitor is None or self.api_client is None:
-            return
+            return False
         now = time.monotonic()
         if now < self.lifecycle_next_poll or now < self.lifecycle_backoff_until:
-            return
+            return False
         self.lifecycle_next_poll = now + self.lifecycle_interval
         try:
             candidates, events = self.lifecycle_monitor.poll(
@@ -162,6 +171,7 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
                 self.lifecycle_backoff_until = now + 60.0
                 self.lifecycle_failures = 0
                 log.warning("known-job lifecycle detector backing off for 60s")
+        return True
 
     def _known_job_url(self, job_id: str) -> str:
         return (
@@ -170,7 +180,16 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
         )
 
     def _fetch_shifts(self):
-        self._lifecycle_tick()
+        if not self.lifecycle_enabled:
+            return super()._fetch_shifts()
+
+        lifecycle_turn = self.lifecycle_request_turn
+        self.lifecycle_request_turn = not self.lifecycle_request_turn
+        if lifecycle_turn and self._lifecycle_tick():
+            # _batch_expand() will still merge any origin-fresh lifecycle
+            # candidates produced by this request.  Skipping public search on
+            # this cycle is what keeps aggregate traffic at one request.
+            return []
         return super()._fetch_shifts()
 
     def _batch_expand(self, jobs):

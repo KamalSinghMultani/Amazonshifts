@@ -125,6 +125,68 @@ def test_config_checks_only_yyz4_each_pass():
     assert lifecycle["health_log_interval_seconds"] == 60
 
 
+def test_v7_alternates_lifecycle_and_public_requests(monkeypatch):
+    instance = object.__new__(watcher_v7.LifecycleWatcher)
+    instance.lifecycle_enabled = True
+    instance.lifecycle_request_turn = True
+    calls = []
+
+    def lifecycle_tick():
+        calls.append("lifecycle")
+        return True
+
+    monkeypatch.setattr(instance, "_lifecycle_tick", lifecycle_tick)
+    monkeypatch.setattr(
+        watcher_v7.watcher_v6.HoldReadyWatcher,
+        "_fetch_shifts",
+        lambda _self: calls.append("public") or ["PUBLIC"],
+    )
+
+    assert instance._fetch_shifts() == []
+    assert instance._fetch_shifts() == ["PUBLIC"]
+    assert instance._fetch_shifts() == []
+    assert instance._fetch_shifts() == ["PUBLIC"]
+    assert calls == ["lifecycle", "public", "lifecycle", "public"]
+
+
+def test_v7_does_not_double_request_after_lifecycle_failure(monkeypatch):
+    instance = object.__new__(watcher_v7.LifecycleWatcher)
+    instance.lifecycle_enabled = True
+    instance.lifecycle_request_turn = True
+    calls = []
+
+    monkeypatch.setattr(
+        instance, "_lifecycle_tick", lambda: calls.append("lifecycle-failed") or True
+    )
+    monkeypatch.setattr(
+        watcher_v7.watcher_v6.HoldReadyWatcher,
+        "_fetch_shifts",
+        lambda _self: calls.append("public") or [],
+    )
+
+    assert instance._fetch_shifts() == []
+    assert calls == ["lifecycle-failed"]
+    assert instance._fetch_shifts() == []
+    assert calls == ["lifecycle-failed", "public"]
+
+
+def test_v7_uses_public_request_when_lifecycle_turn_is_backed_off(monkeypatch):
+    instance = object.__new__(watcher_v7.LifecycleWatcher)
+    instance.lifecycle_enabled = True
+    instance.lifecycle_request_turn = True
+    calls = []
+
+    monkeypatch.setattr(instance, "_lifecycle_tick", lambda: False)
+    monkeypatch.setattr(
+        watcher_v7.watcher_v6.HoldReadyWatcher,
+        "_fetch_shifts",
+        lambda _self: calls.append("public") or ["PUBLIC"],
+    )
+
+    assert instance._fetch_shifts() == ["PUBLIC"]
+    assert calls == ["public"]
+
+
 def _health_watcher():
     instance = object.__new__(watcher_v7.LifecycleWatcher)
     instance.lifecycle_monitor = SimpleNamespace(
