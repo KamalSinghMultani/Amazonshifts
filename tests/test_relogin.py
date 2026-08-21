@@ -607,31 +607,10 @@ def test_otp_clicks_verify_then_one_continue_and_tolerates_auth_return(monkeypat
     page = ConfirmedOtpPage()
     machine = relogin.AuthenticationStateMachine(page, relogin.MockCaptchaSolver())
     machine.otp_requested_at = 100.0
-    machine.otp_waiter = type(
-        "Waiter",
-        (),
-        {"result": lambda _self, timeout_s=None: "123456"},
-    )()
-    monkeypatch.setattr(
-        relogin.otp_mail,
-        "fetch_code",
-        lambda _since: (_ for _ in ()).throw(AssertionError("background result must be reused")),
-    )
+    monkeypatch.setattr(relogin.otp_mail, "fetch_code", lambda _since: "123456")
     monkeypatch.setattr(login_flow, "enter_code", lambda _page, _code: True)
-    observer_attach = []
-    machine.before_otp_continue = lambda: observer_attach.append(
-        (page.phase, list(page.clicked))
-    )
 
     assert machine._submit_otp() is True
     assert page.clicked == ["Verify", "Continue"]
-    assert observer_attach == [("accepted", ["Verify"])]
     assert page.url == "https://hiring.amazon.ca/application/ca/#/consent"
     assert machine.state is AuthState.AUTHENTICATED
-
-
-def test_send_code_starts_mailbox_wait_before_captcha_solving():
-    import inspect
-
-    source = inspect.getsource(relogin.AuthenticationStateMachine._request_otp)
-    assert source.index("_start_otp_waiter") < source.index("OTP_REQUESTED")

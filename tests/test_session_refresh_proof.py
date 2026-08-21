@@ -16,8 +16,7 @@ def test_refresh_uses_strong_existing_session_proof_not_doctor_shell_check():
 def test_failed_strong_precheck_uses_existing_auth_state_machine_for_recovery():
     source = inspect.getsource(session_refresh.run)
     assert "if precheck.passed" in source
-    assert "_forced_login(" in source
-    assert "backend_probe=early_backend_probe" in source
+    assert "_forced_login(page, base_url)" in source
     assert "login_flow.create_auth_system" in inspect.getsource(session_refresh._forced_login)
 
 
@@ -30,8 +29,7 @@ def test_successful_login_must_pass_fresh_session_proof_before_persisting():
 
 def test_forced_login_uses_configured_base_url():
     source = inspect.getsource(session_refresh.run)
-    assert "_forced_login(" in source
-    assert "base_url," in source
+    assert "_forced_login(page, base_url)" in source
     assert 'base_url = cfg["site"]["base_url"]' in source
 
 

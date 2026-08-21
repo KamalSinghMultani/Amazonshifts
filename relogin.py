@@ -579,7 +579,7 @@ class TwoCaptchaSolver(CaptchaSolver):
 
     def _solve_amazon_waf(self, page: Any, frame: Any = None,
                           challenge_element: Any = None) -> bool:
-        route_started = time.monotonic()
+        log.info("Solving Amazon WAF CAPTCHA with 2Captcha amazon_waf method")
 
         if challenge_element is None:
             try:
@@ -587,20 +587,41 @@ class TwoCaptchaSolver(CaptchaSolver):
                 if challenge_element.count() == 0: challenge_element = None
             except Exception: challenge_element = None
 
+        page.wait_for_timeout(2000)
         cap = self._collect_params(page, frame)
 
+        if not (cap.get("key") and cap.get("iv") and cap.get("context")) and challenge_element:
+            log.info("params incomplete; clicking refresh to force a new challenge fetch")
+            self._click_refresh(challenge_element)
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                time.sleep(1.0)
+                cap = self._collect_params(page, frame)
+                if cap.get("key") and cap.get("iv") and cap.get("context"):
+                    break
+
         if cap.get("key") and cap.get("iv") and cap.get("context"):
-            log.info(
-                "complete WAF token parameters detected in %.0fms; using existing token route",
-                (time.monotonic() - route_started) * 1000,
-            )
+            log.info("WAF params found (key=%.20s... iv=%.16s... context=%.16s...)",
+                     cap["key"], cap["iv"], cap["context"])
             if self._solve_via_token(page, cap): return True
             log.warning("token route failed; falling back to interactive grid")
         else:
-            log.info(
-                "interactive WAF grid routed to existing coordinate solver in %.0fms",
-                (time.monotonic() - route_started) * 1000,
-            )
+            log.warning("could not extract key/iv/context from any source; falling back to interactive grid")
+            try:
+                if challenge_element:
+                    shadow_html = challenge_element.evaluate("el => el.shadowRoot ? el.shadowRoot.innerHTML : 'no shadow root'")
+                    log.info("DEBUG: shadow root innerHTML length=%d, preview=%s", len(shadow_html), shadow_html[:1500])
+                    iframes = challenge_element.evaluate("""el => {
+                        if (!el.shadowRoot) return [];
+                        return Array.from(el.shadowRoot.querySelectorAll('iframe')).map(f => f.src);
+                    }""")
+                    log.info("DEBUG: iframes inside shadow root: %s", iframes)
+                scripts_text = page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('script')).map(s => s.innerText).join('\\n---\\n');
+                }""")
+                log.info("DEBUG: main page scripts (first 2000 chars): %s", scripts_text[:2000])
+            except Exception as exc:
+                log.error("DEBUG dump failed: %s", exc)
 
         return self._solve_image_grid(page, frame, challenge_element)
 
@@ -613,7 +634,7 @@ class TwoCaptchaSolver(CaptchaSolver):
             if cap.get("captcha_script"): kwargs["captcha_script"] = cap["captcha_script"]
 
             result = self.solver.amazon_waf(**kwargs)
-            log.info("2Captcha amazon_waf response received")
+            log.info("2Captcha amazon_waf raw result: %s", str(result)[:300])
 
             if isinstance(result, dict):
                 token = (result.get("captcha_voucher") or result.get("code") or result.get("existing_token"))
@@ -651,7 +672,7 @@ class TwoCaptchaSolver(CaptchaSolver):
             time.sleep(2.0)
             return True
         except Exception as exc:
-            log.error("amazon_waf token route failed: %s", type(exc).__name__)
+            log.error("amazon_waf token route failed: %s", exc)
             return False
 
     def _click_refresh(self, shadow_host: Any) -> None:
@@ -754,7 +775,6 @@ class TwoCaptchaSolver(CaptchaSolver):
     def _solve_image_grid(self, page: Any, frame: Any = None,
                           challenge_element: Any = None) -> bool:
         log.info("Solving image grid CAPTCHA with 2Captcha (page-level visual clicking)")
-        solve_started = time.monotonic()
 
         if challenge_element is None:
             challenge_element = page.locator(AWS_WAF_SHADOW_HOST).first
@@ -784,12 +804,9 @@ class TwoCaptchaSolver(CaptchaSolver):
                     img_base64, textinstructions=instruction, timeout=120,
                 )
                 coordinates_str = result.get("code") or ""
-                log.info(
-                    "received CAPTCHA coordinates after %.1fs",
-                    time.monotonic() - solve_started,
-                )
+                log.info("received coordinates: %s", coordinates_str[:120])
             except Exception as exc:
-                log.error("2Captcha coordinates request failed: %s", type(exc).__name__)
+                log.error("2Captcha coordinates request failed: %s", exc)
                 return False
 
             points = self._parse_coordinates(coordinates_str)
@@ -926,23 +943,7 @@ class AuthenticationStateMachine:
         self.detector = StateDetector(page)
         self.state = AuthState.LOGIN_PAGE
         self.otp_requested_at = None
-        self.otp_waiter = None
-        self.before_otp_continue = None
         self.country = "Canada"
-
-    def _start_otp_waiter(self) -> None:
-        if not self.otp_requested_at or self.otp_waiter is not None:
-            return
-        self.otp_waiter = otp_mail.OtpCodeWaiter(
-            self.otp_requested_at,
-            timeout_s=150,
-            poll_s=2,
-        ).start()
-
-    def _cancel_otp_waiter(self) -> None:
-        waiter = getattr(self, "otp_waiter", None)
-        if waiter is not None:
-            waiter.cancel()
 
     def run(self, base_url: str) -> AuthState:
         self._log_transition("AUTH_START")
@@ -1073,7 +1074,6 @@ class AuthenticationStateMachine:
             return False
 
     def _solve_captcha(self) -> bool:
-        captcha_started = time.monotonic()
         captcha_type = self.detector.detect_captcha_type()
         self._log_transition(f"CAPTCHA_DETECTED:{captcha_type.name}")
 
@@ -1100,7 +1100,6 @@ class AuthenticationStateMachine:
         )
 
         if not success:
-            self._cancel_otp_waiter()
             self._log_transition("CAPTCHA_FAILED")
             return False
 
@@ -1113,11 +1112,9 @@ class AuthenticationStateMachine:
         moved_forward = self._wait_for_state(expected, timeout_ms=30000)
 
         if not moved_forward:
-            self._cancel_otp_waiter()
             self._log_transition("CAPTCHA_FAILED:NO_STATE_TRANSITION")
             return False
 
-        log.info("CAPTCHA handling completed in %.1fs", time.monotonic() - captcha_started)
         self._log_transition("CAPTCHA_COMPLETED")
         return True
 
@@ -1128,7 +1125,6 @@ class AuthenticationStateMachine:
 
         self.page.locator(SEND_CODE_BUTTON).first.click()
         self.otp_requested_at = time.time()
-        self._start_otp_waiter()
         self._log_transition("OTP_REQUESTED")
 
         deadline = time.time() + 60
@@ -1146,29 +1142,15 @@ class AuthenticationStateMachine:
             time.sleep(0.5)
 
         log.warning("No OTP entry or CAPTCHA appeared within 60 seconds")
-        self._cancel_otp_waiter()
         return False
 
     def _submit_otp(self) -> bool:
         if not self.otp_requested_at:
             return False
-        wait_started = time.monotonic()
-        waiter = getattr(self, "otp_waiter", None)
-        if waiter is not None:
-            remaining = max(0.0, 150.0 - (time.time() - self.otp_requested_at))
-            code = waiter.result(timeout_s=remaining)
-        else:
-            # Compatibility fallback for callers that enter OTP state without
-            # passing through Send verification code in this process.
-            code = otp_mail.fetch_code(self.otp_requested_at)
+        code = otp_mail.fetch_code(self.otp_requested_at)
         if not code:
-            self._cancel_otp_waiter()
             self._log_transition("OTP_TIMEOUT")
             return False
-        log.info(
-            "OTP became available to the auth state in %.0fms",
-            (time.monotonic() - wait_started) * 1000,
-        )
         self._log_transition("OTP_RECEIVED")
         try:
             import login_flow
@@ -1221,9 +1203,6 @@ class AuthenticationStateMachine:
                         if hasattr(action, "is_enabled") and not action.is_enabled():
                             continue
                         self._log_transition("OTP_ACCEPTED")
-                        before_continue = getattr(self, "before_otp_continue", None)
-                        if callable(before_continue):
-                            before_continue()
                         action.click(timeout=5000)
                         self._log_transition("OTP_CONTINUE_SUBMITTED")
                         return self._wait_for_state(

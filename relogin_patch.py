@@ -206,7 +206,6 @@ def apply_patch(module) -> None:
 
         self.page.locator(SEND_CODE_BUTTON).first.click()
         self.otp_requested_at = time.time()
-        self._start_otp_waiter()
         self._log_transition("OTP_REQUESTED")
 
         deadline = time.time() + 60
@@ -229,7 +228,6 @@ def apply_patch(module) -> None:
             time.sleep(0.5)
 
         module.log.warning("No OTP entry or CAPTCHA appeared within 60 seconds")
-        self._cancel_otp_waiter()
         return False
 
     def _run(self, base_url: str):
