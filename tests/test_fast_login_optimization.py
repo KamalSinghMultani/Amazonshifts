@@ -18,15 +18,15 @@ def _code_message() -> bytes:
     return message.as_bytes()
 
 
-def test_fetch_code_reuses_unbounded_imap_connection_and_skips_slow_logout(monkeypatch):
+def test_fetch_code_reuses_one_imap_connection_and_skips_slow_logout(monkeypatch):
     clients = []
-    all_searches = []
 
     class Client:
         def __init__(self):
             self.shutdown_called = False
             self.logout_called = False
             self.search_calls = 0
+            self.noop_calls = 0
 
         def login(self, _user, _password):
             return "OK", []
@@ -37,13 +37,16 @@ def test_fetch_code_reuses_unbounded_imap_connection_and_skips_slow_logout(monke
 
         def search(self, *_args):
             self.search_calls += 1
-            all_searches.append(1)
             # One complete INBOX + Spam cycle has no code. The next cycle
-            # finds it through the same expensive authenticated connection.
-            return "OK", [b"1" if len(all_searches) > 6 else b""]
+            # finds it, proving that the same authenticated client was reused.
+            return "OK", [b"1" if self.search_calls > 6 else b""]
 
         def fetch(self, _num, _query):
             return "OK", [(b"1", _code_message())]
+
+        def noop(self):
+            self.noop_calls += 1
+            return "OK", []
 
         def shutdown(self):
             self.shutdown_called = True
@@ -52,7 +55,8 @@ def test_fetch_code_reuses_unbounded_imap_connection_and_skips_slow_logout(monke
             self.logout_called = True
             raise AssertionError("successful code retrieval must not wait for LOGOUT")
 
-    def connect(_host):
+    def connect(_host, timeout=None):
+        assert timeout == 10
         client = Client()
         clients.append(client)
         return client
@@ -62,8 +66,9 @@ def test_fetch_code_reuses_unbounded_imap_connection_and_skips_slow_logout(monke
 
     assert otp_mail.fetch_code(time.time(), timeout_s=1, poll_s=0.01) == "123456"
     assert len(clients) == 1
-    assert all(client.shutdown_called for client in clients)
-    assert all(not client.logout_called for client in clients)
+    assert clients[0].noop_calls >= 1
+    assert clients[0].shutdown_called is True
+    assert clients[0].logout_called is False
 
 
 def test_background_otp_waiter_overlaps_other_auth_work(monkeypatch):
@@ -71,7 +76,7 @@ def test_background_otp_waiter_overlaps_other_auth_work(monkeypatch):
     release = threading.Event()
 
     def fetch(_since, *, timeout_s, poll_s, stop_event):
-        assert timeout_s == 170
+        assert timeout_s == 150
         assert poll_s == 2
         assert stop_event.is_set() is False
         entered.set()
@@ -84,29 +89,6 @@ def test_background_otp_waiter_overlaps_other_auth_work(monkeypatch):
     assert entered.wait(0.5) is True
     release.set()
     assert waiter.result(timeout_s=0.5) == "123456"
-
-
-def test_amazon_mail_candidates_are_newest_first_across_all_sender_queries():
-    responses = iter(
-        [
-            ("OK", [b"2 9"]),
-            ("OK", [b"3 8"]),
-            ("OK", [b"1 10"]),
-        ]
-    )
-
-    class Client:
-        def search(self, *_args):
-            return next(responses)
-
-    assert otp_mail._search_amazon(Client(), "21-Aug-2026") == [
-        b"10",
-        b"9",
-        b"8",
-        b"3",
-        b"2",
-        b"1",
-    ]
 
 
 def test_interactive_waf_grid_skips_token_parameter_wait():

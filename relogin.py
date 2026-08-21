@@ -935,7 +935,7 @@ class AuthenticationStateMachine:
             return
         self.otp_waiter = otp_mail.OtpCodeWaiter(
             self.otp_requested_at,
-            timeout_s=170,
+            timeout_s=150,
             poll_s=2,
         ).start()
 
@@ -972,8 +972,6 @@ class AuthenticationStateMachine:
                 return self.state
 
             if not self._transition_to_next():
-                if self.state == AuthState.OTP_TIMEOUT:
-                    return self.state
                 return AuthState.SESSION_ERROR
 
         return AuthState.SESSION_ERROR
@@ -1157,10 +1155,7 @@ class AuthenticationStateMachine:
         wait_started = time.monotonic()
         waiter = getattr(self, "otp_waiter", None)
         if waiter is not None:
-            # Gmail took 147.5s in a measured production scan. Wait five
-            # seconds beyond the worker's 170s scan deadline so a command that
-            # began just before that deadline can finish and publish its result.
-            remaining = max(0.0, 175.0 - (time.time() - self.otp_requested_at))
+            remaining = max(0.0, 150.0 - (time.time() - self.otp_requested_at))
             code = waiter.result(timeout_s=remaining)
         else:
             # Compatibility fallback for callers that enter OTP state without
@@ -1168,7 +1163,6 @@ class AuthenticationStateMachine:
             code = otp_mail.fetch_code(self.otp_requested_at)
         if not code:
             self._cancel_otp_waiter()
-            self.state = AuthState.OTP_TIMEOUT
             self._log_transition("OTP_TIMEOUT")
             return False
         log.info(
