@@ -1101,10 +1101,35 @@ class Watcher:
         # Failed or uncertain both need a human, and quickly — an uncertain
         # hold may be a real reservation ticking down its three hours.
         log.error("hold %s: %s", result.status, result.message)
+        if result.status == site_selectors.IDENTITY_VERIFICATION_REQUIRED:
+            raw = shift.raw or {}
+            job_id = raw.get("jobId") or raw.get("parentJobId")
+            schedule_id = raw.get("scheduleId")
+            manual_url = ""
+            if job_id and schedule_id:
+                manual_url = schedules_mod.identity_verification_url(
+                    self.cfg["site"]["base_url"],
+                    str(job_id),
+                    str(schedule_id),
+                )
+            # Dispatch immediately.  Telegram network time stays off the hold
+            # thread, and the canonical link cannot carry Amazon's trackingId.
+            self.notify_async(
+                self.notifier.notify_identity_verification,
+                shift,
+                manual_url,
+                detail=result.message,
+            )
+            if shot.exists():
+                self.notify_async(
+                    self.notifier.send_photo,
+                    shot,
+                    caption="Identity verification required — use the clickable alert link.",
+                )
+            return
+
         if result.status == site_selectors.UNCERTAIN:
             urgency = "⚠️ <b>CHECK THIS NOW</b>"
-        elif result.status == site_selectors.IDENTITY_VERIFICATION_REQUIRED:
-            urgency = "⚠️ <b>IDENTITY VERIFICATION REQUIRED</b>"
         else:
             urgency = "❌ <b>Hold failed</b>"
         link = f"\n{result.url}" if result.url else ""

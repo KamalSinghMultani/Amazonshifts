@@ -164,6 +164,22 @@ def application_url(base_url: str, job_id: str, schedule_id: str) -> str:
         f"?jobId={quote(job_id)}&page=pre-consent&scheduleId={quote(schedule_id)}"
     )
 
+
+def identity_verification_url(base_url: str, job_id: str, schedule_id: str) -> str:
+    """Safe manual Canada liveness route without KYC tracking parameters.
+
+    Amazon may append a private trackingId while routing into remoteKYC.  The
+    Telegram alert must never copy that URL.  The public job/schedule pair is
+    sufficient for Amazon to resume the signed-in candidate's own flow.
+    """
+    job = quote(str(job_id), safe="")
+    schedule = quote(str(schedule_id), safe="")
+    return (
+        f"{base_url.rstrip('/')}/application/ca/"
+        f"?jobId={job}&scheduleId={schedule}"
+        f"#/liveness-check?jobId={job}&scheduleId={schedule}"
+    )
+
 # ── choosing WHICH schedule, from the flyout ────────────────────────────────
 # The flyout renders one card per schedule and the hold used to click the
 # first. Confirmed live 2026-08-18, a single job offered:

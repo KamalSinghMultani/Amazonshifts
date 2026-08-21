@@ -187,5 +187,24 @@ class TelegramNotifier:
             lines.append(f"\n<pre>{html.escape(detail[:500])}</pre>")
         return self.send_text("\n".join(lines))
 
+    def notify_identity_verification(self, shift, manual_url: str, detail: str = "") -> bool:
+        """Urgent manual handoff with a clickable, non-tracking Amazon URL."""
+        lines = [
+            "🚨 <b>IDENTITY VERIFICATION REQUIRED</b>",
+            self.describe(shift),
+            "Amazon stopped at the identity check. Open it now and complete it manually.",
+        ]
+        if manual_url:
+            lines.append(
+                f'\n<a href="{html.escape(manual_url, quote=True)}">'
+                "Open Amazon identity verification</a>"
+            )
+        if detail:
+            lines.append(f"\n<i>{html.escape(detail[:500])}</i>")
+        lines.append(
+            "\nThe watcher will not accept consent, capture a selfie, upload ID, or submit KYC."
+        )
+        return self.send_text("\n".join(lines))
+
     def notify_error(self, message: str) -> bool:
         return self.send_text(f"⚠️ <b>Watcher error</b>\n<pre>{html.escape(message[:600])}</pre>")

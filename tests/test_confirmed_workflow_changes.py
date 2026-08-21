@@ -4,9 +4,12 @@ import inspect
 
 import fast_hold
 import hold_verify
+from notifier import TelegramNotifier
+import schedules
 import site_selectors
 import watcher
 import watcher_v3
+from shift_matcher import Shift
 
 
 class PassiveObserver:
@@ -347,4 +350,72 @@ def test_identity_state_notifies_and_stops_retrying_the_same_attempt():
     loop = inspect.getsource(watcher_v3.OptimizedWatcher.poll_once)
     report = inspect.getsource(watcher.Watcher._report_hold)
     assert "site_selectors.IDENTITY_VERIFICATION_REQUIRED" in loop
-    assert "IDENTITY VERIFICATION REQUIRED" in report
+    assert "notify_identity_verification" in report
+
+
+def test_manual_identity_url_has_only_public_job_and_schedule_ids():
+    url = schedules.identity_verification_url(
+        "https://hiring.amazon.ca",
+        "JOB-CA-1",
+        "SCH-CA-2",
+    )
+    assert url == (
+        "https://hiring.amazon.ca/application/ca/"
+        "?jobId=JOB-CA-1&scheduleId=SCH-CA-2"
+        "#/liveness-check?jobId=JOB-CA-1&scheduleId=SCH-CA-2"
+    )
+    assert "tracking" not in url.lower()
+
+
+def test_identity_alert_has_clickable_safe_manual_link():
+    notifier = TelegramNotifier(enabled=False)
+    sent = []
+    notifier.send_text = lambda text: sent.append(text) or True
+    manual = schedules.identity_verification_url(
+        "https://hiring.amazon.ca", "JOB-1", "SCH-2"
+    )
+    notifier.notify_identity_verification(
+        Shift(title="Warehouse", location="Barrhaven, ON"),
+        manual,
+        detail="Complete manually.",
+    )
+
+    assert '<a href="https://hiring.amazon.ca/application/ca/' in sent[0]
+    assert "Open Amazon identity verification</a>" in sent[0]
+    assert "JOB-1" in sent[0] and "SCH-2" in sent[0]
+    assert "trackingId" not in sent[0]
+
+
+def test_identity_result_dispatches_dedicated_clickable_alert_immediately(tmp_path):
+    class Notifier:
+        def notify_identity_verification(self, *_args, **_kwargs):
+            return True
+
+        def send_photo(self, *_args, **_kwargs):
+            return True
+
+    dispatched = []
+    instance = watcher.Watcher.__new__(watcher.Watcher)
+    instance.cfg = {"site": {"base_url": "https://hiring.amazon.ca"}}
+    instance.notifier = Notifier()
+    instance.last_hold = None
+    instance.notify_async = lambda fn, *args, **kwargs: dispatched.append(
+        (fn.__name__, args, kwargs)
+    )
+    shift = Shift(
+        title="Warehouse",
+        raw={"jobId": "JOB-CA-1", "scheduleId": "SCH-CA-2"},
+    )
+    result = site_selectors.HoldResult(
+        site_selectors.IDENTITY_VERIFICATION_REQUIRED,
+        "Complete identity verification manually.",
+        url="https://hiring.amazon.ca/#/liveness-check?trackingId=private",
+    )
+
+    instance._report_hold(shift, result, tmp_path / "missing.png")
+
+    assert dispatched[0][0] == "notify_identity_verification"
+    assert dispatched[0][1][1] == schedules.identity_verification_url(
+        "https://hiring.amazon.ca", "JOB-CA-1", "SCH-CA-2"
+    )
+    assert "tracking" not in dispatched[0][1][1].lower()
