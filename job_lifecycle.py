@@ -36,6 +36,15 @@ JOB_FIELDS = """
 """
 
 
+class JobDetailGraphQLError(RuntimeError):
+    """Amazon rejected the public job-detail document.
+
+    The response text is deliberately not retained because GraphQL diagnostics
+    can echo request values. The exception type alone is safe and sufficient
+    for the watcher log and backoff classifier.
+    """
+
+
 @dataclass(frozen=True)
 class KnownJob:
     job_id: str
@@ -78,12 +87,15 @@ def build_request(job_ids: Iterable[str], *, locale: str = "en-CA") -> tuple[dic
 {JOB_FIELDS}
     }}"""
         )
-    query = "query batchJobDetail"
+    # Keep Amazon's exact frontend operation name. The endpoint accepts normal
+    # GraphQL aliases, but its gateway rejects an invented operation name even
+    # when the document itself is otherwise valid.
+    query = "query getJobDetail"
     if declarations:
         query += "(" + ", ".join(declarations) + ")"
     query += " {\n  " + "\n  ".join(selections) + "\n}"
     return {
-        "operationName": "batchJobDetail",
+        "operationName": "getJobDetail",
         "variables": variables,
         "query": query,
     }, ids
@@ -112,7 +124,7 @@ def fetch(client, known_jobs: Iterable[KnownJob], *, chunk_size: int = 20) -> di
         if isinstance(response, dict) and response.get("errors"):
             # Keep GraphQL diagnostics out of logs; backend messages can echo
             # request details. The watcher reports only this sanitized type.
-            raise RuntimeError("job detail GraphQL response contained errors")
+            raise JobDetailGraphQLError("job detail GraphQL response contained errors")
         out.update(parse(response, ordered))
     return out
 
@@ -151,6 +163,7 @@ class LifecycleMonitor:
         self.events_path = Path(events_path)
         self.now_fn = now_fn
         self.state = self._load_state()
+        self.last_observed_jobs = 0
 
     def _load_state(self) -> dict:
         try:
@@ -187,6 +200,7 @@ class LifecycleMonitor:
         details = fetch(client, self.known_jobs)
         posted_ids: list[str] = []
         transition_events: list[dict] = []
+        observed_jobs = 0
 
         for job in self.known_jobs:
             detail = details.get(job.job_id)
@@ -196,6 +210,7 @@ class LifecycleMonitor:
             status = str(detail.get("postingStatus") or "").upper()
             if status not in {"POSTED", "UNPOSTED"}:
                 continue
+            observed_jobs += 1
 
             record = self.state["jobs"].setdefault(job.job_id, {})
             previous = record.get("status")
@@ -235,6 +250,10 @@ class LifecycleMonitor:
                 transition_events.append({**event, "job": job, "detail": detail})
             if status == "POSTED":
                 posted_ids.append(job.job_id)
+
+        if self.known_jobs and observed_jobs == 0:
+            raise JobDetailGraphQLError("job detail response contained no usable lifecycle nodes")
+        self.last_observed_jobs = observed_jobs
 
         schedule_map = schedule_batch.fetch(client, posted_ids, chunk_size=20) if posted_ids else {}
         candidates: list[Shift] = []

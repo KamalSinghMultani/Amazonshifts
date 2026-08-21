@@ -27,6 +27,7 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
         self.lifecycle_candidates = []
         self.lifecycle_failures = 0
         self.lifecycle_backoff_until = 0.0
+        self.lifecycle_ever_succeeded = False
         self.lifecycle_notify_unposted = bool(lifecycle.get("notify_unposted", True))
         self.lifecycle_notify_unconfirmed_posted = bool(
             lifecycle.get("notify_posted_without_capacity", True)
@@ -60,6 +61,13 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
                 )
             self.lifecycle_candidates = candidates
             self.lifecycle_failures = 0
+            if not self.lifecycle_ever_succeeded:
+                self.lifecycle_ever_succeeded = True
+                log.info(
+                    "known-job lifecycle poll succeeded: %d/%d job id(s) observed",
+                    self.lifecycle_monitor.last_observed_jobs,
+                    len(self.lifecycle_monitor.known_jobs),
+                )
             capacity_jobs = {
                 event["job"].job_id
                 for event in events

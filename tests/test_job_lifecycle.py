@@ -47,6 +47,9 @@ def test_job_detail_request_uses_public_ids_and_frontend_shape():
     payload, ids = job_lifecycle.build_request(["JOB-1", "JOB-2", "JOB-1"])
     assert ids == ["JOB-1", "JOB-2"]
     assert payload["variables"]["r0"] == {"jobId": "JOB-1", "locale": "en-CA"}
+    assert payload["operationName"] == "getJobDetail"
+    assert payload["query"].startswith("query getJobDetail(")
+    assert "batchJobDetail" not in payload["query"]
     assert "GetJobDetailRequest!" in payload["query"]
     assert "j0: getJobDetail(getJobDetailRequest: $r0)" in payload["query"]
     assert "postingStatus" in payload["query"]
@@ -77,6 +80,7 @@ def test_only_posted_plus_strict_positive_capacity_emits_candidate(monkeypatch, 
     )
 
     candidates, events = monitor.poll(object())
+    assert monitor.last_observed_jobs == 2
     assert [candidate.id for candidate in candidates] == ["OPEN"]
     assert candidates[0].raw["postingStatus"] == "POSTED"
     assert candidates[0].raw["laborDemandAvailableCount"] == 2
