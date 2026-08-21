@@ -108,6 +108,17 @@ def test_lifecycle_round_robin_samples_each_known_id_without_a_burst(monkeypatch
     assert monitor.last_observed_jobs == 1
 
 
+def test_config_checks_all_seven_known_ids_in_each_lifecycle_pass():
+    import yaml
+
+    cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
+    lifecycle = cfg["lifecycle_monitor"]
+
+    assert len(lifecycle["known_jobs"]) == 7
+    assert lifecycle["jobs_per_poll"] == 7
+    assert lifecycle["interval_seconds"] == 2.0
+
+
 def test_only_posted_plus_strict_positive_capacity_emits_candidate(monkeypatch, tmp_path):
     monitor = job_lifecycle.LifecycleMonitor(
         _known(), state_path=tmp_path / "state.json", events_path=tmp_path / "events.jsonl"
