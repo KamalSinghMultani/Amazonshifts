@@ -28,6 +28,7 @@ from pathlib import Path
 import yaml
 
 import hold_metrics
+import safe_research_trace
 import session_refresh
 import site_selectors
 import watcher_v6
@@ -40,11 +41,28 @@ log = logging.getLogger("watcher")
 class RealHoldTestWatcher(watcher_v6.HoldReadyWatcher):
     def __init__(self, cfg: dict, live_override: bool = False) -> None:
         super().__init__(cfg, live_override=live_override)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.research_trace_path = Path(f"logs/real_hold_research-{stamp}.jsonl")
+        self.research_trace: safe_research_trace.SafeResearchTrace | None = None
         # main() only constructs this watcher after _preflight() strongly proved
         # the exact storage state assigned to cfg.browser.storage_state. The
         # normal watcher begins unverified and proves itself in the background;
         # this isolated <=60-minute test can safely start armed immediately.
         self._mark_session_verified("real-test preflight strongly proved this exact state", notify=False)
+
+    def _start_api_mode(self, browser_cfg: dict) -> None:
+        # Attach before the job-search and application pages are created.  The
+        # trace is passive and sanitized; it never reads auth headers, cookies,
+        # storage, application/auth/KYC bodies, or sensitive login/KYC data.
+        # Only known-public job catalog response JSON is retained for research.
+        self.research_trace = safe_research_trace.SafeResearchTrace(
+            self.context, self.research_trace_path
+        ).start()
+        try:
+            return super()._start_api_mode(browser_cfg)
+        except Exception:
+            self.research_trace.stop()
+            raise
 
     def _hold(self, shift, poll_started=None):
         result = super()._hold(shift, poll_started=poll_started)
@@ -78,6 +96,13 @@ class RealHoldTestWatcher(watcher_v6.HoldReadyWatcher):
             # immediately to the next ranked candidate within the attempt budget.
             log.info("schedule explicitly unavailable after I Agree; trying next ranked schedule if available")
         return result
+
+    def run(self, once: bool = False) -> int:
+        try:
+            return super().run(once=once)
+        finally:
+            if self.research_trace is not None:
+                self.research_trace.stop()
 
 
 def _preflight(config_path: str) -> tuple[bool, Path, str]:
@@ -225,6 +250,9 @@ def main(argv: list[str] | None = None) -> int:
     print("Timing records: logs/hold_timings.jsonl")
 
     watcher = RealHoldTestWatcher(cfg, live_override=True)
+    research_trace_path = getattr(watcher, "research_trace_path", None)
+    if research_trace_path:
+        print(f"Sanitized local browser/network research trace: {research_trace_path}")
     watcher.config_path = str(runtime_config)
     timer = threading.Timer(args.minutes * 60, watcher.stop_event.set)
     timer.daemon = True

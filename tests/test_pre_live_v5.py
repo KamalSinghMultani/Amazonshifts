@@ -61,9 +61,57 @@ def test_v5_prewarms_a_dedicated_application_page_without_job_or_schedule_ids():
     assert kwargs["wait_until"] == "commit"
 
 
+def test_v5_cold_prewarm_waits_for_and_clears_late_overlays(monkeypatch):
+    class Page:
+        def __init__(self):
+            self.waits = []
+
+        def is_closed(self):
+            return False
+
+        def goto(self, _url, **_kwargs):
+            return None
+
+        def wait_for_timeout(self, milliseconds):
+            self.waits.append(milliseconds)
+
+    class Context:
+        def __init__(self):
+            self.page = Page()
+
+        def new_page(self):
+            return self.page
+
+    dismissed = []
+
+    def clear(page, **kwargs):
+        dismissed.append((page, kwargs))
+        return ["cookie consent", "banner"]
+
+    monkeypatch.setattr(watcher_v5.site_selectors, "dismiss_overlays", clear)
+    watcher = watcher_v5.PreLiveWatcher.__new__(watcher_v5.PreLiveWatcher)
+    watcher.cfg = {
+        "site": {"base_url": "https://hiring.amazon.ca"},
+        "browser": {"nav_timeout_ms": 30000, "action_timeout_ms": 10000},
+        "hold": {
+            "prewarm_application": True,
+            "prewarm_overlay_settle_ms": 4321,
+        },
+    }
+    watcher.context = Context()
+    watcher.hold_page = None
+
+    assert watcher._prewarm_application_page() is True
+    assert watcher.hold_page.waits == [4321]
+    assert dismissed == [
+        (watcher.hold_page, {"timeout_ms": 750, "rounds": 4})
+    ]
+
+
 def test_latency_first_defaults_prewarm_and_disable_compatibility_fallback():
     cfg = config_mod.load_config(config_mod.Path(__file__).resolve().parent.parent / "config.yaml")
     assert cfg["hold"]["prewarm_application"] is True
+    assert cfg["hold"]["prewarm_overlay_settle_ms"] == 4500
     assert cfg["hold"]["compatibility_fallback"] is False
 
 
@@ -223,6 +271,15 @@ def test_real_test_background_workers_are_repointed_to_runtime_config():
     assert "real_hold_test_runtime.yaml" in writer
     assert "hot_windows_parsed" in writer
     assert "yaml.safe_dump" in writer
+
+
+def test_real_test_attaches_sanitized_research_trace_before_page_startup():
+    source = inspect.getsource(real_hold_test.RealHoldTestWatcher._start_api_mode)
+    assert "SafeResearchTrace" in source
+    assert source.index(".start()") < source.index("super()._start_api_mode")
+    assert "research_trace.stop()" in inspect.getsource(
+        real_hold_test.RealHoldTestWatcher.run
+    )
 
 
 def test_real_test_explains_auto_reservation_and_retry_boundary():

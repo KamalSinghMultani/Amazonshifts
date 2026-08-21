@@ -375,6 +375,10 @@ hold:
   # Load Amazon's application frontend before a shift appears. The exact
   # jobId/scheduleId direct route is still used only after detection.
   prewarm_application: true
+  # The live test showed cookie/banner overlays delaying I Agree by ~1.8s.
+  # This wait happens only while creating the cold prewarm page, before a
+  # schedule race, and lets those late React overlays be dismissed up front.
+  prewarm_overlay_settle_ms: 4500
   # Do not spend another 40-50 seconds on the old job-detail click path after
   # the direct route fails. A failed schedule stays retryable on the next poll.
   compatibility_fallback: false

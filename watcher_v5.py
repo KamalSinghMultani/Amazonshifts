@@ -376,10 +376,12 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
             closed = page is None or page.is_closed()
         except Exception:  # noqa: BLE001
             closed = True
+        created = False
         if closed:
             try:
                 page = self.context.new_page()
                 self.hold_page = page
+                created = True
             except Exception as exc:  # noqa: BLE001
                 log.warning("could not create application prewarm page: %s", type(exc).__name__)
                 return False
@@ -398,6 +400,38 @@ class PreLiveWatcher(watcher_v4.AutoSessionWatcher):
                 "application frontend prewarm started in %.0fms",
                 (time.perf_counter() - began) * 1000,
             )
+            if created:
+                # Cookie consent and the message banner mounted ~3.5s after
+                # navigation in the live reservation test, then delayed the
+                # Integrity click by another ~1.8s.  Cold prewarm is outside
+                # the race, so absorb that late mount here and persist the
+                # ordinary dismiss actions before a schedule exists.
+                settle_ms = max(
+                    0,
+                    min(
+                        10000,
+                        int(
+                            self.cfg.get("hold", {}).get(
+                                "prewarm_overlay_settle_ms", 4500
+                            )
+                        ),
+                    ),
+                )
+                if settle_ms:
+                    try:
+                        page.wait_for_timeout(settle_ms)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("application overlay prewarm wait failed: %s", type(exc).__name__)
+                dismissed = site_selectors.dismiss_overlays(
+                    page,
+                    timeout_ms=min(
+                        750,
+                        int(self.cfg["browser"].get("action_timeout_ms", 10000)),
+                    ),
+                    rounds=4,
+                )
+                if dismissed:
+                    log.info("application prewarm cleared overlays before hold dispatch")
             return True
         except Exception as exc:  # noqa: BLE001
             # Prewarm is an optimization, never session proof and never a reason

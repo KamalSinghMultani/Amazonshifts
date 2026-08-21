@@ -114,6 +114,10 @@ DEFAULTS: dict[str, Any] = {
         # Keep the application frontend loaded on a dedicated page so a match
         # does not pay the full cold-start cost of its React bundles.
         "prewarm_application": True,
+        # Cold prewarm is outside the reservation race. Give Amazon's React
+        # shell time to mount late cookie/banner overlays, then dismiss them
+        # with ordinary browser actions so the first hold does not pay for it.
+        "prewarm_overlay_settle_ms": 4500,
         # The original job-detail click path can add tens of seconds after a
         # direct attempt has already failed. Keep it available for diagnostics,
         # but never use it on the latency-first production path by default.
