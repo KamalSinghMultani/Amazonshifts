@@ -30,6 +30,7 @@ import imaplib
 import logging
 import os
 import re
+import threading
 import time
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -205,50 +206,145 @@ def _code_from(client, num: bytes, since_epoch: float) -> str | None:
     return extract_code(subject + chr(10) + body_text(message))
 
 
-def fetch_code(since_epoch: float, *, timeout_s: float = 100, poll_s: float = 5) -> str | None:
+def _disconnect_fast(client: Any) -> None:
+    """Close an IMAP socket without waiting for Gmail's slow LOGOUT reply."""
+    if client is None:
+        return
+    try:
+        client.shutdown()
+    except Exception:  # noqa: BLE001 - the socket may already be gone
+        pass
+
+
+def fetch_code(
+    since_epoch: float,
+    *,
+    timeout_s: float = 150,
+    poll_s: float = 2,
+    stop_event: threading.Event | None = None,
+) -> str | None:
     """Wait for Amazon's verification code to arrive, and return it.
 
     Returns None rather than raising: a failed re-login must leave the watcher
     detecting and alerting exactly as it was.
 
-    The timings are set by Amazon, not chosen: the code expires after THREE
-    MINUTES and resend is blocked for 55 seconds, so this polls every 5s and
-    gives up at 100s — early enough to leave the code usable, late enough to
-    outlast normal mail delay.
+    The code expires after three minutes. Polling every two seconds on one
+    authenticated connection and stopping at 150 seconds leaves time to submit
+    a late code without repeating Gmail's TLS/login/logout overhead.
     """
     creds = configured()
     if creds is None:
         return None
     host, user, password = creds
 
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
+    began = time.monotonic()
+    deadline = time.monotonic() + timeout_s
+    client = None
+    while time.monotonic() < deadline and not (stop_event and stop_event.is_set()):
         try:
-            with imaplib.IMAP4_SSL(host) as client:
+            if client is None:
+                client = imaplib.IMAP4_SSL(host, timeout=10)
                 client.login(user, password)
-                since = time.strftime("%d-%b-%Y", time.localtime(since_epoch - 86400))
+            since = time.strftime("%d-%b-%Y", time.localtime(since_epoch - 86400))
 
-                for folder in MAILBOX_FOLDERS:
-                    try:
-                        status, _ = client.select(folder, readonly=True)
-                    except Exception as exc:  # noqa: BLE001 - folder may not exist
-                        log.debug("could not open %s: %s", folder, exc)
-                        continue
-                    if status != "OK":
-                        continue
+            for folder in MAILBOX_FOLDERS:
+                try:
+                    status, _ = client.select(folder, readonly=True)
+                except Exception as exc:  # noqa: BLE001 - folder may not exist
+                    log.debug("could not open %s: %s", folder, exc)
+                    continue
+                if status != "OK":
+                    continue
 
-                    for num in _search_amazon(client, since):
-                        code = _code_from(client, num, since_epoch)
-                        if code:
-                            log.info("verification code found in %s", folder)
-                            return code
+                for num in _search_amazon(client, since):
+                    code = _code_from(client, num, since_epoch)
+                    if code:
+                        _disconnect_fast(client)
+                        client = None
+                        log.info(
+                            "verification code ready from %s after %.1fs",
+                            folder,
+                            time.monotonic() - began,
+                        )
+                        return code
+
+            # Detect a server-side disconnect before the next cycle. Keeping
+            # this same authenticated TLS connection avoids a login handshake
+            # on every two-second poll.
+            client.noop()
         except Exception as exc:  # noqa: BLE001 - mail is best effort
             log.warning("could not read the verification code: %s", exc)
+            _disconnect_fast(client)
+            client = None
 
-        time.sleep(poll_s)
+        remaining = max(0.0, deadline - time.monotonic())
+        wait_for = min(max(0.05, poll_s), remaining)
+        if stop_event:
+            stop_event.wait(wait_for)
+        else:
+            time.sleep(wait_for)
 
+    _disconnect_fast(client)
+    if stop_event and stop_event.is_set():
+        log.info("verification code wait cancelled")
+        return None
     log.warning("no verification code arrived within %.0fs", timeout_s)
     return None
+
+
+class OtpCodeWaiter:
+    """Fetch one code in the background while the CAPTCHA is being solved."""
+
+    def __init__(
+        self,
+        since_epoch: float,
+        *,
+        timeout_s: float = 150,
+        poll_s: float = 2,
+    ) -> None:
+        self.since_epoch = since_epoch
+        self.timeout_s = timeout_s
+        self.poll_s = poll_s
+        self._done = threading.Event()
+        self._stop = threading.Event()
+        self._code: str | None = None
+        self._thread: threading.Thread | None = None
+        self.started_monotonic = 0.0
+
+    def start(self) -> "OtpCodeWaiter":
+        if self._thread is not None:
+            return self
+        self.started_monotonic = time.monotonic()
+
+        def work() -> None:
+            try:
+                self._code = fetch_code(
+                    self.since_epoch,
+                    timeout_s=self.timeout_s,
+                    poll_s=self.poll_s,
+                    stop_event=self._stop,
+                )
+            finally:
+                self._done.set()
+
+        self._thread = threading.Thread(
+            target=work,
+            daemon=True,
+            name="amazon-otp-mail",
+        )
+        self._thread.start()
+        log.info("verification code mailbox wait started in background")
+        return self
+
+    def result(self, timeout_s: float | None = None) -> str | None:
+        if self._thread is None:
+            self.start()
+        if not self._done.wait(timeout_s):
+            return None
+        return self._code
+
+    def cancel(self) -> None:
+        self._stop.set()
 
 
 def check(lookback_days: int = 3) -> tuple[bool, list[str]]:

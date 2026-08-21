@@ -61,6 +61,7 @@ class _ProtectedBackendProbe:
         self.authenticated = False
         self.unauthorized = False
         self.seen = False
+        self.attached = False
 
     def observe(self, response) -> None:
         try:
@@ -94,8 +95,11 @@ class _ProtectedBackendProbe:
             return
 
     def attach(self, page) -> None:
+        if self.attached:
+            return
         try:
             page.on("response", self.observe)
+            self.attached = True
         except Exception:
             # A page that cannot expose response events cannot produce the
             # required protected-backend proof.
@@ -336,7 +340,13 @@ def _probe_application(
     )
 
 
-def prove_fresh_session(page, base_url: str, *, settle_ms: int = 1500) -> SessionProof:
+def prove_fresh_session(
+    page,
+    base_url: str,
+    *,
+    settle_ms: int = 1500,
+    backend_probe: _ProtectedBackendProbe | None = None,
+) -> SessionProof:
     """Verify a just-authenticated session without creating an application.
 
     A fresh login's UI state is checked first, then the same protected page is
@@ -369,6 +379,43 @@ def prove_fresh_session(page, base_url: str, *, settle_ms: int = 1500) -> Sessio
             authenticated_state=state_name,
             reason="fresh login did not have positive authenticated UI evidence",
         )
+
+    # The observer can be attached immediately before OTP Continue, allowing
+    # it to see the protected candidate GET emitted by Amazon's natural
+    # auth-return. This is the exact same strict 2xx proof used below; it only
+    # avoids reloading the application when the required evidence is already
+    # present. A 401 remains definitive failure. Missing/403 remains
+    # inconclusive and falls through to the existing forced reprobe.
+    if backend_probe is not None:
+        current = _prove_current_application_page(
+            page,
+            base_url,
+            reason="fresh country-specific authentication observed during auth return",
+        )
+        if backend_probe.unauthorized:
+            return _failed(
+                expected_host=expected_host,
+                authenticated_host=authenticated_host,
+                authenticated_state=state_name,
+                application_host=current.application_host,
+                backend_unauthorized=True,
+                reason="protected candidate read returned 401 during fresh auth return",
+            )
+        if current.passed and backend_probe.authenticated:
+            return SessionProof(
+                passed=True,
+                expected_host=expected_host,
+                authenticated_host=authenticated_host,
+                authenticated_state=state_name,
+                application_host=current.application_host,
+                application_redirected_to_login=False,
+                application_backend_authenticated=True,
+                application_backend_unauthorized=False,
+                reason=(
+                    "fresh country-specific authentication and application backend "
+                    "access verified; protected candidate read returned 2xx during auth return"
+                ),
+            )
 
     current_url = str(getattr(page, "url", "") or "")
     target_url = current_url if "/application/" in current_url.lower() else _application_probe_url(base_url)

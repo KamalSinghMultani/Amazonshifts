@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -27,6 +28,8 @@ from config import load_config, load_dotenv
 
 # Keep the standalone helper on the same strict auth semantics as the watcher.
 relogin_patch.apply_patch(login_flow)
+
+log = logging.getLogger("session_refresh")
 
 
 def _write(path: Path, **payload) -> None:
@@ -112,7 +115,12 @@ def _late_auth_recheck(page, manager, state, base_url: str, *, timeout_seconds: 
             time.sleep(0.25)
 
 
-def _forced_login(page, base_url: str) -> tuple[str, str, dict]:
+def _forced_login(
+    page,
+    base_url: str,
+    *,
+    backend_probe: session_proof._ProtectedBackendProbe | None = None,
+) -> tuple[str, str, dict]:
     """Run the existing auth state machine even if an old page looks healthy."""
     if login_flow.credentials() is None:
         return (
@@ -122,6 +130,10 @@ def _forced_login(page, base_url: str) -> tuple[str, str, dict]:
         )
 
     manager = login_flow.create_auth_system(page, use_mock_solver=False)
+    if backend_probe is not None:
+        # Attach at the last safe instant before OTP Continue. This captures
+        # only the natural fresh-auth return, never an older saved session.
+        manager.auth_machine.before_otp_continue = lambda: backend_probe.attach(page)
     try:
         state = manager.auth_machine.run(base_url)
     except Exception as exc:  # noqa: BLE001
@@ -229,10 +241,32 @@ def run(config_path: str, output_state: Path, result_path: Path, force_login: bo
                     browser_launch.close_context(browser, context)
                     return rc
 
-            status, detail, diagnostics = _forced_login(page, base_url)
+            early_backend_probe = session_proof._ProtectedBackendProbe(_host(base_url))
+            auth_started = time.monotonic()
+            status, detail, diagnostics = _forced_login(
+                page,
+                base_url,
+                backend_probe=early_backend_probe,
+            )
+            log.info(
+                "fresh login state machine completed in %.1fs (%s)",
+                time.monotonic() - auth_started,
+                status,
+            )
 
             if status == login_flow.OK:
-                proof = session_proof.prove_fresh_session(page, base_url, settle_ms=1500)
+                proof_started = time.monotonic()
+                proof = session_proof.prove_fresh_session(
+                    page,
+                    base_url,
+                    settle_ms=1500,
+                    backend_probe=early_backend_probe,
+                )
+                log.info(
+                    "strict protected-session proof completed in %.1fs (passed=%s)",
+                    time.monotonic() - proof_started,
+                    proof.passed,
+                )
                 if proof.passed:
                     rc = _persist_success(
                         context,
