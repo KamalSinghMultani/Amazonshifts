@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -117,9 +118,64 @@ def test_config_checks_only_brampton_ids_each_pass():
     assert len(lifecycle["known_jobs"]) == 3
     assert lifecycle["jobs_per_poll"] == 3
     assert lifecycle["interval_seconds"] == 2.0
+    assert lifecycle["health_log_interval_seconds"] == 60
     assert {
         item["location"] for item in lifecycle["known_jobs"]
     } == {"Brampton, ON"}
+
+
+def _health_watcher():
+    instance = object.__new__(watcher_v7.LifecycleWatcher)
+    instance.lifecycle_monitor = SimpleNamespace(
+        last_observed_jobs=3,
+        last_attempted_jobs=3,
+        known_jobs=[object(), object(), object()],
+    )
+    instance.lifecycle_health_log_interval = 60.0
+    instance.lifecycle_next_health_log = 0.0
+    instance.lifecycle_failures = 0
+    instance.lifecycle_backoff_until = 0.0
+    instance.lifecycle_ever_succeeded = False
+    instance.lifecycle_recovery_pending = False
+    instance.lifecycle_last_success_at = None
+    instance.lifecycle_last_poll_ms = None
+    return instance
+
+
+def test_lifecycle_health_summary_is_periodic_not_per_poll(caplog):
+    instance = _health_watcher()
+    with caplog.at_level(logging.INFO, logger="watcher"):
+        instance._record_lifecycle_success(10.0, 120.0)
+        instance._record_lifecycle_success(11.0, 110.0)
+        instance._record_lifecycle_success(69.9, 105.0)
+        instance._record_lifecycle_success(70.0, 100.0)
+        instance._record_lifecycle_success(71.0, 95.0)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("poll succeeded" in message for message in messages) == 1
+    assert messages.count(
+        "LIFECYCLE HEALTHY: 3/3 known job IDs checked; latest pass completed in 100ms"
+    ) == 1
+
+
+def test_lifecycle_success_after_failure_logs_restored_once(caplog):
+    instance = _health_watcher()
+    instance.lifecycle_ever_succeeded = True
+    instance.lifecycle_recovery_pending = True
+    instance.lifecycle_failures = 2
+    instance.lifecycle_backoff_until = 50.0
+
+    with caplog.at_level(logging.INFO, logger="watcher"):
+        instance._record_lifecycle_success(100.0, 125.0)
+        instance._record_lifecycle_success(101.0, 115.0)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages.count(
+        "LIFECYCLE RESTORED: 3/3 known job IDs responding; latest pass completed in 125ms"
+    ) == 1
+    assert instance.lifecycle_recovery_pending is False
+    assert instance.lifecycle_failures == 0
+    assert instance.lifecycle_backoff_until == 0.0
 
 
 def test_only_posted_plus_strict_positive_capacity_emits_candidate(monkeypatch, tmp_path):

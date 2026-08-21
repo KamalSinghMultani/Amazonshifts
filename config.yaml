@@ -382,6 +382,9 @@ lifecycle_monitor:
   # near the lifecycle interval instead of roughly 8.75 seconds.
   interval_seconds: 2.0
   jobs_per_poll: 3
+  # Successful passes stay quiet between these health summaries. Failures and
+  # recovery are always logged immediately. Set to 0 to disable the summary.
+  health_log_interval_seconds: 60
   notify_unposted: true
   notify_posted_without_capacity: true
   state_path: state/job_lifecycle.json

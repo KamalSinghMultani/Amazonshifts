@@ -24,11 +24,18 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
         )
         self.lifecycle_interval = float(lifecycle.get("interval_seconds", 2.0))
         self.lifecycle_jobs_per_poll = max(1, int(lifecycle.get("jobs_per_poll", 1)))
+        self.lifecycle_health_log_interval = max(
+            0.0, float(lifecycle.get("health_log_interval_seconds", 60.0))
+        )
         self.lifecycle_next_poll = 0.0
+        self.lifecycle_next_health_log = 0.0
         self.lifecycle_candidates = []
         self.lifecycle_failures = 0
         self.lifecycle_backoff_until = 0.0
         self.lifecycle_ever_succeeded = False
+        self.lifecycle_recovery_pending = False
+        self.lifecycle_last_success_at = None
+        self.lifecycle_last_poll_ms = None
         self.lifecycle_notify_unposted = bool(lifecycle.get("notify_unposted", True))
         self.lifecycle_notify_unconfirmed_posted = bool(
             lifecycle.get("notify_posted_without_capacity", True)
@@ -43,6 +50,45 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
                 "known-job lifecycle detector armed for %d job id(s) at %.2fs cadence",
                 len(self.lifecycle_monitor.known_jobs), self.lifecycle_interval,
             )
+
+    def _record_lifecycle_success(self, completed_at: float, duration_ms: float) -> None:
+        """Publish sparse proof that the otherwise-silent detector is alive."""
+        recovered = self.lifecycle_recovery_pending
+        self.lifecycle_failures = 0
+        self.lifecycle_backoff_until = 0.0
+        self.lifecycle_recovery_pending = False
+        self.lifecycle_last_success_at = completed_at
+        self.lifecycle_last_poll_ms = duration_ms
+
+        observed = self.lifecycle_monitor.last_observed_jobs
+        attempted = self.lifecycle_monitor.last_attempted_jobs
+        configured = len(self.lifecycle_monitor.known_jobs)
+        if not self.lifecycle_ever_succeeded:
+            self.lifecycle_ever_succeeded = True
+            log.info(
+                "known-job lifecycle poll succeeded: %d/%d sampled job id(s) observed (%d configured)",
+                observed, attempted, configured,
+            )
+            self.lifecycle_next_health_log = completed_at + self.lifecycle_health_log_interval
+            return
+
+        if recovered:
+            log.info(
+                "LIFECYCLE RESTORED: %d/%d known job IDs responding; latest pass completed in %.0fms",
+                observed, attempted, duration_ms,
+            )
+            self.lifecycle_next_health_log = completed_at + self.lifecycle_health_log_interval
+            return
+
+        if (
+            self.lifecycle_health_log_interval > 0
+            and completed_at >= self.lifecycle_next_health_log
+        ):
+            log.info(
+                "LIFECYCLE HEALTHY: %d/%d known job IDs checked; latest pass completed in %.0fms",
+                observed, attempted, duration_ms,
+            )
+            self.lifecycle_next_health_log = completed_at + self.lifecycle_health_log_interval
 
     def _lifecycle_tick(self) -> None:
         if not self.lifecycle_enabled or self.lifecycle_monitor is None or self.api_client is None:
@@ -64,15 +110,8 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
                     str(raw.get("scheduleId")),
                 )
             self.lifecycle_candidates = candidates
-            self.lifecycle_failures = 0
-            if not self.lifecycle_ever_succeeded:
-                self.lifecycle_ever_succeeded = True
-                log.info(
-                    "known-job lifecycle poll succeeded: %d/%d sampled job id(s) observed (%d configured)",
-                    self.lifecycle_monitor.last_observed_jobs,
-                    self.lifecycle_monitor.last_attempted_jobs,
-                    len(self.lifecycle_monitor.known_jobs),
-                )
+            completed_at = time.monotonic()
+            self._record_lifecycle_success(completed_at, (completed_at - now) * 1000)
             capacity_jobs = {
                 event["job"].job_id
                 for event in events
@@ -114,6 +153,7 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
             # Never include the request exception text: a transport's call log
             # can contain headers.  Public search and holding keep running.
             self.lifecycle_failures += 1
+            self.lifecycle_recovery_pending = True
             log.warning(
                 "known-job lifecycle poll failed (%s, %d consecutive); public search continues",
                 type(exc).__name__, self.lifecycle_failures,
