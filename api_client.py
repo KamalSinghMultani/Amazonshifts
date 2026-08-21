@@ -25,6 +25,12 @@ class Unauthorized(RuntimeError):
     """The endpoint rejected our token. Recoverable: mint a new one and retry."""
 
 
+class WafForbidden(RuntimeError):
+    """Amazon's WAF blocked the request; token refresh cannot repair this."""
+
+    safe_for_log = True
+
+
 class ApiTransportError(RuntimeError):
     """Sanitized network/Playwright request failure safe to write to logs.
 
@@ -191,8 +197,10 @@ class ApiClient:
                     body = response.text()[:300]
                 except Exception:  # noqa: BLE001
                     pass
-                if response.status in (401, 403):
-                    raise Unauthorized(f"API returned {response.status}: {body}")
+                if response.status == 401:
+                    raise Unauthorized(f"API returned 401: {body}")
+                if response.status == 403:
+                    raise WafForbidden("API returned 403 (WAF/forbidden)")
                 raise RuntimeError(f"API returned {response.status}: {body}")
             try:
                 return response.json()
@@ -255,8 +263,10 @@ class ApiClient:
                 body = response.text()[:300]
             except Exception:  # noqa: BLE001 - body is diagnostics only
                 pass
-            if response.status in (401, 403):
-                raise Unauthorized(f"API returned {response.status}: {body}")
+            if response.status == 401:
+                raise Unauthorized(f"API returned 401: {body}")
+            if response.status == 403:
+                raise WafForbidden("API returned 403 (WAF/forbidden)")
             raise RuntimeError(f"API returned {response.status}: {body}")
 
         try:

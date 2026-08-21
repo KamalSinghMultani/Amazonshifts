@@ -1078,6 +1078,40 @@ def test_a_second_401_gives_up_instead_of_looping():
     assert len(ctx.calls) == 2  # one retry, not a retry storm
 
 
+def test_a_403_is_waf_not_auth_and_never_refreshes_or_retries():
+    ctx = FakeRequestContext([FakeResponse(403)])
+    refreshed = []
+    client = api_client.ApiClient(
+        ctx,
+        API_CFG,
+        token_provider=lambda: "t",
+        on_unauthorized=lambda: refreshed.append(True),
+    )
+
+    with pytest.raises(api_client.WafForbidden):
+        client.fetch_shifts()
+
+    assert refreshed == []
+    assert len(ctx.calls) == 1
+
+
+def test_graphql_helper_does_not_refresh_or_retry_a_403():
+    ctx = FakeRequestContext([FakeResponse(403)])
+    refreshed = []
+    client = api_client.ApiClient(
+        ctx,
+        API_CFG,
+        token_provider=lambda: "t",
+        on_unauthorized=lambda: refreshed.append(True),
+    )
+
+    with pytest.raises(api_client.WafForbidden):
+        client._post_json({"query": "query SafeProbe { __typename }"})
+
+    assert refreshed == []
+    assert len(ctx.calls) == 1
+
+
 def test_a_500_is_not_treated_as_an_auth_problem():
     ctx = FakeRequestContext([FakeResponse(500)])
     refreshed = []
