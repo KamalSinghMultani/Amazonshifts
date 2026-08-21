@@ -382,6 +382,12 @@ hold:
   # Do not spend another 40-50 seconds on the old job-detail click path after
   # the direct route fails. A failed schedule stays retryable on the next poll.
   compatibility_fallback: false
+  # Complete the confirmed reservation prerequisites with ordinary browser
+  # actions. Start identification is clicked once only so Amazon can recognize
+  # this account's already-completed eKYC. Actual remoteKYC/selfie/document
+  # screens remain manual and trigger the Telegram link.
+  auto_integrity_agree: true
+  auto_start_identity_verification: true
   # Click through to hold the slot once a match is found.
   # Ignored entirely when dry_run is true.
   enabled: true

@@ -113,6 +113,8 @@ def test_latency_first_defaults_prewarm_and_disable_compatibility_fallback():
     assert cfg["hold"]["prewarm_application"] is True
     assert cfg["hold"]["prewarm_overlay_settle_ms"] == 4500
     assert cfg["hold"]["compatibility_fallback"] is False
+    assert cfg["hold"]["auto_integrity_agree"] is True
+    assert cfg["hold"]["auto_start_identity_verification"] is True
 
 
 def test_fast_hold_is_browser_driven_and_passively_observes_backend():
@@ -168,6 +170,7 @@ def test_fast_hold_can_finish_from_backend_confirmation_without_ui_banner(monkey
 def test_fast_hold_integrity_agree_is_explicit_opt_in_and_reservation_only():
     signature = inspect.signature(fast_hold.hold)
     assert signature.parameters["auto_integrity_agree"].default is False
+    assert signature.parameters["auto_start_identity_verification"].default is False
 
     source = inspect.getsource(fast_hold.hold)
     assert "integrity-notice-agree-button" in inspect.getsource(fast_hold)
@@ -204,6 +207,7 @@ def test_v5_passes_integrity_settings_and_skips_fallback_after_agree():
     assert "manual_integrity_wait" in source
     assert "manual_integrity_timeout_ms" in source
     assert "auto_integrity_agree" in source
+    assert "auto_start_identity_verification" in source
     assert "integrity agree clicked" in source
     assert "skipping compatibility fallback" in source
     assert "compatibility fallback disabled for latency" in source
@@ -254,6 +258,7 @@ def test_real_test_config_is_live_but_time_bounded_and_isolated(monkeypatch):
     assert out["hold"]["manual_integrity_wait"] is False
     assert out["hold"]["manual_integrity_timeout_ms"] == 120000
     assert out["hold"]["auto_integrity_agree"] is True
+    assert out["hold"]["auto_start_identity_verification"] is True
     assert out["browser"]["storage_state"] == "verified.json"
     assert out["browser"]["user_data_dir"] is None
     assert out["browser"]["headless"] is False

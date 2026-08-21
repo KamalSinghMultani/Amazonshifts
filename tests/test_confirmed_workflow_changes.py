@@ -33,9 +33,10 @@ class PassiveObserver:
 class HoldFlowPage:
     context = None
 
-    def __init__(self, *, after_agree="liveness"):
+    def __init__(self, *, after_agree="liveness", after_identity="unavailable"):
         self.phase = "blank"
         self.after_agree = after_agree
+        self.after_identity = after_identity
         self.url = "about:blank"
         self.clicked = []
 
@@ -50,6 +51,10 @@ class HoldFlowPage:
             return "Application Integrity Notice I Agree"
         if self.phase == "liveness":
             return "Let's confirm it's you Start identity verification"
+        if self.phase == "unavailable":
+            return "Sorry, this shift is no longer available."
+        if self.phase == "remote_kyc":
+            return "Take a selfie Upload your identity document"
         return "Personal information"
 
     def wait_for_timeout(self, _ms):
@@ -68,6 +73,8 @@ class HoldFlowPage:
                     return page.phase == "create"
                 if "integrity-notice-agree-button" in selector:
                     return page.phase == "integrity"
+                if "Start identity" in selector or "Start identification" in selector:
+                    return page.phase == "liveness"
                 return False
 
             def count(self):
@@ -94,6 +101,15 @@ class HoldFlowPage:
                             "https://hiring.amazon.ca/application/ca/#/liveness-check"
                             "?trackingId=secret-kyc-id"
                         )
+                    else:
+                        page.url = "https://hiring.amazon.ca/application/ca/#/personal-information"
+                elif "Start identity" in selector or "Start identification" in selector:
+                    page.clicked.append("Start identity verification")
+                    page.phase = page.after_identity
+                    if page.phase == "unavailable":
+                        page.url = "https://hiring.amazon.ca/application/ca/#/schedule-unavailable"
+                    elif page.phase == "remote_kyc":
+                        page.url = "https://www.amazon.in/remoteKYC?trackingId=secret-kyc-id"
                     else:
                         page.url = "https://hiring.amazon.ca/application/ca/#/personal-information"
 
@@ -270,6 +286,110 @@ def test_create_and_agree_click_as_soon_as_actionable_then_stop_at_ekyc(monkeypa
     assert names.index("integrity agree enabled") < names.index("integrity agree clicked")
     assert names.index("integrity agree actionable") < names.index("integrity agree clicked")
     assert names.index("integrity agree clicked") < names.index("identity verification required")
+
+
+def test_completed_identity_launcher_is_clicked_once_then_hold_flow_continues(monkeypatch):
+    monkeypatch.setattr(fast_hold.hold_verify, "SoftReserveObserver", PassiveObserver)
+    monkeypatch.setattr(fast_hold.site_selectors, "dismiss_overlays", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        fast_hold.failure_capture,
+        "capture",
+        lambda *_a, **_k: {"screenshot": "safe.png"},
+    )
+    page = HoldFlowPage(after_agree="liveness", after_identity="unavailable")
+
+    result, _detail = fast_hold.hold(
+        page,
+        "https://hiring.amazon.ca/application/ca/?jobId=JOB-1&scheduleId=SCH-1",
+        "SCH-1",
+        base_url="https://hiring.amazon.ca",
+        stop_before_submit=False,
+        timeout_ms=1000,
+        auto_integrity_agree=True,
+        auto_start_identity_verification=True,
+    )
+
+    assert result.status == site_selectors.FAILED
+    assert "no longer available" in result.message.lower()
+    assert page.clicked == [
+        "Create Application",
+        "I Agree",
+        "Start identity verification",
+    ]
+    names = [name for name, _ms in result.timings]
+    assert names.index("start identification visible") < names.index("start identification clicked")
+    assert names.index("start identification enabled") < names.index("start identification clicked")
+    assert names.index("start identification actionable") < names.index("start identification clicked")
+    assert names.index("start identification clicked") < names.index("identity verification launcher skipped")
+    assert names.index("identity verification launcher skipped") < names.index("schedule unavailable after integrity")
+
+
+def test_actual_remote_kyc_stops_immediately_after_launcher_click(monkeypatch):
+    monkeypatch.setattr(fast_hold.hold_verify, "SoftReserveObserver", PassiveObserver)
+    monkeypatch.setattr(fast_hold.site_selectors, "dismiss_overlays", lambda *_a, **_k: [])
+    page = HoldFlowPage(after_agree="liveness", after_identity="remote_kyc")
+
+    result, _detail = fast_hold.hold(
+        page,
+        "https://hiring.amazon.ca/application/ca/?jobId=JOB-1&scheduleId=SCH-1",
+        "SCH-1",
+        base_url="https://hiring.amazon.ca",
+        stop_before_submit=False,
+        timeout_ms=1000,
+        auto_integrity_agree=True,
+        auto_start_identity_verification=True,
+    )
+
+    assert result.status == site_selectors.IDENTITY_VERIFICATION_REQUIRED
+    assert page.clicked == [
+        "Create Application",
+        "I Agree",
+        "Start identity verification",
+    ]
+    assert "tracking" not in result.url.lower()
+    assert "tracking" not in result.message.lower()
+    names = [name for name, _ms in result.timings]
+    assert names.index("start identification clicked") < names.index("actual identity verification required")
+
+
+def test_completed_identity_skip_can_finish_from_reserve_proof(monkeypatch):
+    class ConfirmAfterIdentity(PassiveObserver):
+        def __init__(self, page, schedule):
+            self.page = page
+            self.schedule = schedule
+            self.relevant_update_seen = False
+
+        @property
+        def confirmed(self):
+            return self.page.phase == "confirmed"
+
+        def detail(self):
+            return "backend soft reserve confirmed"
+
+    monkeypatch.setattr(fast_hold.hold_verify, "SoftReserveObserver", ConfirmAfterIdentity)
+    monkeypatch.setattr(fast_hold.site_selectors, "dismiss_overlays", lambda *_a, **_k: [])
+    page = HoldFlowPage(after_agree="liveness", after_identity="confirmed")
+
+    result, detail = fast_hold.hold(
+        page,
+        "https://hiring.amazon.ca/application/ca/?jobId=JOB-1&scheduleId=SCH-1",
+        "SCH-1",
+        base_url="https://hiring.amazon.ca",
+        stop_before_submit=False,
+        timeout_ms=1000,
+        auto_integrity_agree=True,
+        auto_start_identity_verification=True,
+    )
+
+    assert result.status == site_selectors.CONFIRMED
+    assert detail == "backend soft reserve confirmed"
+    assert page.clicked == [
+        "Create Application",
+        "I Agree",
+        "Start identity verification",
+    ]
+    names = [name for name, _ms in result.timings]
+    assert names.index("start identification clicked") < names.index("backend reserve confirmed")
 
 
 def test_relevant_post_agree_update_can_end_as_uncertain_without_full_timeout(monkeypatch):

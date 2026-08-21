@@ -24,6 +24,12 @@ NEXT = "[data-test-id='layout'] button:has-text('Next')"
 CREATE = "[data-test-id='layout'] button:has-text('Create Application')"
 INTEGRITY_AGREE = "[data-test-id='integrity-notice-agree-button']"
 INTEGRITY_ROUTE = "application-integrity-notice"
+IDENTITY_START = (
+    "button:has-text('Start identity verification'), "
+    "button:has-text('Start identification'), "
+    "[role='button']:has-text('Start identity verification'), "
+    "[role='button']:has-text('Start identification')"
+)
 HOLD_TEXT = "holding a spot"
 UNAVAILABLE_TEXT_PATTERNS = (
     "shift is no longer available",
@@ -40,6 +46,13 @@ IDENTITY_TEXT_PATTERNS = (
     "let's confirm it's you",
     "let’s confirm it’s you",
     "start identity verification",
+    "start identification",
+)
+ACTUAL_IDENTITY_TEXT_PATTERNS = (
+    "take a selfie",
+    "upload your identity document",
+    "scan your identity document",
+    "take a photo of your identity document",
 )
 
 
@@ -127,6 +140,31 @@ def _identity_verification_required(page: Any) -> bool:
     return any(pattern in text for pattern in IDENTITY_TEXT_PATTERNS)
 
 
+def _actual_identity_verification_active(
+    page: Any, *, after_launcher_click: bool = False
+) -> bool:
+    """Detect the real KYC experience after the safe launcher was pressed.
+
+    The hiring.amazon.ca launcher is allowed to perform Amazon's already-
+    verified-account check.  remoteKYC, camera/selfie, and document screens
+    remain strictly manual.
+    """
+    try:
+        url = (getattr(page, "url", "") or "").lower()
+        if "remotekyc" in url:
+            return True
+    except Exception:
+        pass
+    if not after_launcher_click:
+        return False
+    # The launcher page can describe the later steps. Only treat that text as
+    # the real KYC UI once its Start control has disappeared.
+    if _visible(page, IDENTITY_START):
+        return False
+    text = _body_text(page).lower()
+    return any(pattern in text for pattern in ACTUAL_IDENTITY_TEXT_PATTERNS)
+
+
 def _safe_result_url(page: Any, fallback: str = "") -> str:
     """Strip KYC query/fragment values before a result can be logged/notified."""
     raw = str(getattr(page, "url", "") or fallback or "")
@@ -152,6 +190,7 @@ def hold(
     manual_integrity_wait: bool = False,
     manual_integrity_timeout_ms: int = 120000,
     auto_integrity_agree: bool = False,
+    auto_start_identity_verification: bool = False,
 ) -> tuple[site_selectors.HoldResult, str]:
     """Return (HoldResult, backend_detail) with minimal local waiting.
 
@@ -164,6 +203,12 @@ def hold(
       * manual_integrity_wait: keep the observer alive while the user clicks;
       * auto_integrity_agree: click only the integrity notice's I Agree button,
         then observe reserve/unavailable state and stop before later forms.
+
+    ``auto_start_identity_verification`` permits exactly one normal click on
+    Amazon Hiring's Start identification launcher. This supports accounts for
+    which Amazon immediately recognizes a previously completed identity check.
+    It never selects consent checkboxes or operates remoteKYC, selfie, camera,
+    document-upload, or submission controls.
 
     The auto mode is deliberately opt-in. It does not fill personal details,
     documents, assessments, identity checks, or any later application fields.
@@ -215,6 +260,24 @@ def hold(
         integrity_overlay_checked = False
         integrity_click_error = ""
         create_click_error = ""
+        identity_seen = False
+        identity_left = False
+        identity_start_clicked = False
+        identity_start_visible_seen = False
+        identity_start_enabled_seen = False
+        identity_start_actionable_seen = False
+        identity_start_click_error = ""
+
+        def identity_result(message: str) -> tuple[site_selectors.HoldResult, str]:
+            return (
+                site_selectors.HoldResult(
+                    site_selectors.IDENTITY_VERIFICATION_REQUIRED,
+                    message,
+                    url=_safe_result_url(page, application_url),
+                    timings=timings,
+                ),
+                observer.detail(),
+            )
 
         while time.perf_counter() < deadline:
             if observer.confirmed:
@@ -234,19 +297,84 @@ def hold(
                     observer.detail(),
                 )
 
-            if _identity_verification_required(page):
-                mark("identity verification required")
-                return (
-                    site_selectors.HoldResult(
-                        site_selectors.IDENTITY_VERIFICATION_REQUIRED,
+            actual_identity = _actual_identity_verification_active(
+                page,
+                after_launcher_click=identity_start_clicked,
+            )
+            if actual_identity:
+                mark("actual identity verification required")
+                return identity_result(
+                    "Amazon opened the actual identity-verification experience. "
+                    "Application automation stopped before consent, selfie, ID upload, or submission; "
+                    "complete it manually on Amazon if you choose."
+                )
+
+            identity_required = _identity_verification_required(page)
+            if identity_start_clicked and not identity_required and not identity_left:
+                identity_left = True
+                mark("identity verification launcher skipped")
+                log.info(
+                    "identity launcher left after one normal Start identification click; continuing reserve observation"
+                )
+
+            if identity_required:
+                if not identity_seen:
+                    identity_seen = True
+                    mark("identity verification launcher reached")
+
+                if not auto_start_identity_verification:
+                    mark("identity verification required")
+                    return identity_result(
                         "Amazon requires identity verification for this candidate account. "
                         "Application automation stopped before consent, selfie, ID upload, or submission; "
-                        "complete the verification manually on Amazon if you choose.",
-                        url=_safe_result_url(page, application_url),
-                        timings=timings,
-                    ),
-                    observer.detail(),
-                )
+                        "complete the verification manually on Amazon if you choose."
+                    )
+
+                start_visible = _visible(page, IDENTITY_START)
+                if start_visible and not identity_start_visible_seen:
+                    identity_start_visible_seen = True
+                    mark("start identification visible")
+                start_enabled = _enabled(page, IDENTITY_START)
+                if start_enabled and not identity_start_enabled_seen:
+                    identity_start_enabled_seen = True
+                    mark("start identification enabled")
+
+                if start_enabled and not identity_start_clicked:
+                    start_actionable = _pointer_actionable(
+                        page,
+                        IDENTITY_START,
+                        timeout_ms=min(timeout_ms, 200),
+                    )
+                    if start_actionable:
+                        if not identity_start_actionable_seen:
+                            identity_start_actionable_seen = True
+                            mark("start identification actionable")
+                        try:
+                            page.locator(IDENTITY_START).first.click(
+                                timeout=min(timeout_ms, 1000)
+                            )
+                            identity_start_clicked = True
+                            mark("start identification clicked")
+                            deadline = max(
+                                deadline,
+                                time.perf_counter() + max(timeout_ms, 20000) / 1000.0,
+                            )
+                            log.info(
+                                "Start identification clicked once; waiting only for Amazon's already-verified skip or a terminal state"
+                            )
+                            page.wait_for_timeout(10)
+                            continue
+                        except Exception as exc:  # noqa: BLE001
+                            identity_start_click_error = type(exc).__name__
+
+                # Wait for the launcher button/automatic redirect within the
+                # existing bounded post-I-Agree window. Do not touch consent,
+                # camera, document, or remoteKYC controls.
+                try:
+                    page.wait_for_timeout(50)
+                except Exception:
+                    break
+                continue
 
             if site_selectors.is_login_page(page):
                 captured = failure_capture.capture(
@@ -543,6 +671,25 @@ def hold(
                 page.wait_for_timeout(50)
             except Exception:
                 break
+
+    if identity_seen and not identity_left:
+        mark("identity verification launcher timeout")
+        if not identity_start_clicked:
+            detail = (
+                "Amazon's Start identification control did not become actionable"
+                + (
+                    f" (last click error: {identity_start_click_error})"
+                    if identity_start_click_error
+                    else ""
+                )
+                + ". Application automation stopped without operating consent, selfie, ID, or remoteKYC controls."
+            )
+        else:
+            detail = (
+                "Amazon did not skip the identity launcher after Start identification was clicked once. "
+                "Application automation stopped without operating consent, selfie, ID, or remoteKYC controls."
+            )
+        return identity_result(detail)
 
     if integrity_seen and (manual_integrity_wait or auto_integrity_agree):
         if auto_integrity_agree:

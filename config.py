@@ -131,6 +131,9 @@ DEFAULTS: dict[str, Any] = {
         # ...but not forever: a posting lasts about a minute, and time spent
         # retrying a dead job is time not spent on the next one.
         "attempt_budget_seconds": 45,
+        # Opt-in safe launcher transition for accounts that already completed
+        # identity verification. Real remoteKYC controls are never automated.
+        "auto_start_identity_verification": False,
     },
     # Empty means "any schedule will do". Populate to constrain which one gets
     # taken: available_days, min_hours_per_week, avoid_overnight.
