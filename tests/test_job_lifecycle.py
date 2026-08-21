@@ -109,19 +109,20 @@ def test_lifecycle_round_robin_samples_each_known_id_without_a_burst(monkeypatch
     assert monitor.last_observed_jobs == 1
 
 
-def test_config_checks_only_brampton_ids_each_pass():
+def test_config_checks_only_yyz4_each_pass():
     import yaml
 
     cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
     lifecycle = cfg["lifecycle_monitor"]
 
-    assert len(lifecycle["known_jobs"]) == 3
-    assert lifecycle["jobs_per_poll"] == 3
+    assert lifecycle["known_jobs"] == [{
+        "site_code": "YYZ4",
+        "location": "Brampton, ON",
+        "job_id": "JOB-CA-0000000557",
+    }]
+    assert lifecycle["jobs_per_poll"] == 1
     assert lifecycle["interval_seconds"] == 2.0
     assert lifecycle["health_log_interval_seconds"] == 60
-    assert {
-        item["location"] for item in lifecycle["known_jobs"]
-    } == {"Brampton, ON"}
 
 
 def _health_watcher():

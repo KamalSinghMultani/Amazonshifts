@@ -376,12 +376,12 @@ notifications:
 lifecycle_monitor:
   enabled: true
   # Amazon's live frontend sends one getJobDetail operation per job and its
-  # resolver rejected aliases. Check the three Brampton documents
-  # back-to-back on each lifecycle pass. This is intentionally more aggressive
-  # than round-robin and increases WAF risk, but keeps known-id revisit latency
-  # near the lifecycle interval instead of roughly 8.75 seconds.
+  # resolver rejected aliases. The earlier three-ID burst plus public polling
+  # produced simultaneous HTTP 403s on both paths after about 40 seconds, so
+  # only YYZ4 is monitored here. Public discovery remains active for all
+  # configured locations.
   interval_seconds: 2.0
-  jobs_per_poll: 3
+  jobs_per_poll: 1
   # Successful passes stay quiet between these health summaries. Failures and
   # recovery are always logged immediately. Set to 0 to disable the summary.
   health_log_interval_seconds: 60
@@ -391,8 +391,6 @@ lifecycle_monitor:
   events_path: state/job_lifecycle_events.jsonl
   known_jobs:
     - {site_code: YYZ4, location: "Brampton, ON", job_id: JOB-CA-0000000557}
-    - {site_code: YYZ3, location: "Brampton, ON", job_id: JOB-CA-0000000509}
-    - {site_code: DDJ3, location: "Brampton, ON", job_id: JOB-CA-0000000560}
 
 hold:
   direct_apply: true
