@@ -44,14 +44,18 @@ def _schedule(capacity=1, schedule_id="SCH-1"):
 
 
 def test_job_detail_request_uses_public_ids_and_frontend_shape():
-    payload, ids = job_lifecycle.build_request(["JOB-1", "JOB-2", "JOB-1"])
-    assert ids == ["JOB-1", "JOB-2"]
-    assert payload["variables"]["r0"] == {"jobId": "JOB-1", "locale": "en-CA"}
+    payload = job_lifecycle.build_request("JOB-1")
+    assert payload["variables"]["getJobDetailRequest"] == {
+        "jobId": "JOB-1", "locale": "en-CA"
+    }
     assert payload["operationName"] == "getJobDetail"
-    assert payload["query"].startswith("query getJobDetail(")
+    assert payload["query"].startswith(
+        "query getJobDetail($getJobDetailRequest: GetJobDetailRequest!)"
+    )
     assert "batchJobDetail" not in payload["query"]
     assert "GetJobDetailRequest!" in payload["query"]
-    assert "j0: getJobDetail(getJobDetailRequest: $r0)" in payload["query"]
+    assert "getJobDetail(getJobDetailRequest: $getJobDetailRequest)" in payload["query"]
+    assert "j0:" not in payload["query"]
     assert "postingStatus" in payload["query"]
     serialized = json.dumps(payload).lower()
     for secret_name in ("authorization", "cookie", "token", "otp", "pin", "trackingid"):
@@ -59,9 +63,49 @@ def test_job_detail_request_uses_public_ids_and_frontend_shape():
 
 
 def test_parse_preserves_missing_as_inconclusive():
-    result = job_lifecycle.parse({"data": {"j0": _detail("JOB-1")}}, ["JOB-1", "JOB-2"])
-    assert result["JOB-1"]["postingStatus"] == "POSTED"
-    assert result["JOB-2"] is None
+    result = job_lifecycle.parse({"data": {"getJobDetail": _detail("JOB-1")}})
+    assert result["postingStatus"] == "POSTED"
+    assert job_lifecycle.parse({"data": {"getJobDetail": None}}) is None
+
+
+def test_one_job_graphql_error_does_not_discard_other_valid_jobs():
+    class Client:
+        locale = "en-CA"
+
+        def _post_json(self, request):
+            job_id = request["variables"]["getJobDetailRequest"]["jobId"]
+            if job_id == "JOB-1":
+                return {"data": {"getJobDetail": None}, "errors": [{"message": "hidden"}]}
+            return {"data": {"getJobDetail": _detail(job_id, "UNPOSTED")}}
+
+    result = job_lifecycle.fetch(Client(), [
+        job_lifecycle.KnownJob("JOB-1"),
+        job_lifecycle.KnownJob("JOB-2"),
+    ])
+
+    assert result["JOB-1"] is None
+    assert result["JOB-2"]["postingStatus"] == "UNPOSTED"
+
+
+def test_lifecycle_round_robin_samples_each_known_id_without_a_burst(monkeypatch, tmp_path):
+    monitor = job_lifecycle.LifecycleMonitor(
+        _known(), state_path=tmp_path / "state.json", events_path=tmp_path / "events.jsonl"
+    )
+    sampled = []
+
+    def fetch_sample(_client, jobs):
+        sampled.append([job.job_id for job in jobs])
+        return {job.job_id: _detail(job.job_id, "UNPOSTED") for job in jobs}
+
+    monkeypatch.setattr(job_lifecycle, "fetch", fetch_sample)
+
+    monitor.poll(object(), max_jobs=1)
+    monitor.poll(object(), max_jobs=1)
+    monitor.poll(object(), max_jobs=1)
+
+    assert sampled == [["JOB-1"], ["JOB-2"], ["JOB-1"]]
+    assert monitor.last_attempted_jobs == 1
+    assert monitor.last_observed_jobs == 1
 
 
 def test_only_posted_plus_strict_positive_capacity_emits_candidate(monkeypatch, tmp_path):

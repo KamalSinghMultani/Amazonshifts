@@ -375,18 +375,22 @@ notifications:
 # a strictly positive laborDemandAvailableCount. Public search remains active.
 lifecycle_monitor:
   enabled: true
-  interval_seconds: 2.0
+  # Amazon's live frontend sends one getJobDetail operation per job. Poll one
+  # known id on each normal watcher cycle instead of bursting seven requests.
+  # With the 1.25s public cadence, all seven are revisited in about 8.75s.
+  interval_seconds: 1.0
+  jobs_per_poll: 1
   notify_unposted: true
   notify_posted_without_capacity: true
   state_path: state/job_lifecycle.json
   events_path: state/job_lifecycle_events.jsonl
   known_jobs:
-    - {site_code: YYZ4, location: "Brampton, ON", job_id: JOB-CA-0000005578}
-    - {site_code: YYZ3, location: "Brampton, ON", job_id: JOB-CA-0000005098}
-    - {site_code: DDJ3, location: "Brampton, ON", job_id: JOB-CA-0000005608}
-    - {site_code: DTY4, location: "Mississauga, ON", job_id: JOB-CA-0000005118}
-    - {site_code: YYZ1, location: "Mississauga, ON", job_id: JOB-CA-0000005918}
-    - {site_code: DON9, location: "Etobicoke, ON", job_id: JOB-CA-0000005598}
+    - {site_code: YYZ4, location: "Brampton, ON", job_id: JOB-CA-0000000557}
+    - {site_code: YYZ3, location: "Brampton, ON", job_id: JOB-CA-0000000509}
+    - {site_code: DDJ3, location: "Brampton, ON", job_id: JOB-CA-0000000560}
+    - {site_code: DTY4, location: "Mississauga, ON", job_id: JOB-CA-0000000511}
+    - {site_code: YYZ1, location: "Mississauga, ON", job_id: JOB-CA-0000000591}
+    - {site_code: DON9, location: "Etobicoke, ON", job_id: JOB-CA-0000000559}
     - {site_code: DTO3, location: "Etobicoke, ON", job_id: JOB-CA-0000000476}
 
 hold:

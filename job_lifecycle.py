@@ -72,60 +72,46 @@ def normalize_known_jobs(values: Iterable[dict | KnownJob]) -> list[KnownJob]:
     return out
 
 
-def build_request(job_ids: Iterable[str], *, locale: str = "en-CA") -> tuple[dict, list[str]]:
-    ids = list(dict.fromkeys(str(job_id) for job_id in job_ids if job_id))
-    variables: dict[str, dict] = {}
-    declarations: list[str] = []
-    selections: list[str] = []
-    for index, job_id in enumerate(ids):
-        var = f"r{index}"
-        alias = f"j{index}"
-        variables[var] = {"jobId": job_id, "locale": locale}
-        declarations.append(f"${var}: GetJobDetailRequest!")
-        selections.append(
-            f"""{alias}: getJobDetail(getJobDetailRequest: ${var}) {{
-{JOB_FIELDS}
-    }}"""
-        )
-    # Keep Amazon's exact frontend operation name. The endpoint accepts normal
-    # GraphQL aliases, but its gateway rejects an invented operation name even
-    # when the document itself is otherwise valid.
-    query = "query getJobDetail"
-    if declarations:
-        query += "(" + ", ".join(declarations) + ")"
-    query += " {\n  " + "\n  ".join(selections) + "\n}"
+def build_request(job_id: str, *, locale: str = "en-CA") -> dict:
+    """Build the exact one-job document shipped by Amazon's current frontend."""
     return {
         "operationName": "getJobDetail",
-        "variables": variables,
-        "query": query,
-    }, ids
+        "variables": {
+            "getJobDetailRequest": {"jobId": str(job_id), "locale": locale}
+        },
+        "query": (
+            "query getJobDetail($getJobDetailRequest: GetJobDetailRequest!) {\n"
+            "  getJobDetail(getJobDetailRequest: $getJobDetailRequest) {\n"
+            + JOB_FIELDS
+            + "  }\n}"
+        ),
+    }
 
 
-def parse(payload: dict, job_ids: list[str]) -> dict[str, dict | None]:
+def parse(payload: dict) -> dict | None:
     data = payload.get("data") if isinstance(payload, dict) else None
     data = data if isinstance(data, dict) else {}
-    out: dict[str, dict | None] = {}
-    for index, job_id in enumerate(job_ids):
-        node = data.get(f"j{index}")
-        out[job_id] = dict(node) if isinstance(node, dict) else None
-    return out
+    node = data.get("getJobDetail")
+    return dict(node) if isinstance(node, dict) else None
 
 
-def fetch(client, known_jobs: Iterable[KnownJob], *, chunk_size: int = 20) -> dict[str, dict | None]:
-    ids = [job.job_id for job in known_jobs]
+def fetch(client, known_jobs: Iterable[KnownJob]) -> dict[str, dict | None]:
+    """Fetch jobs independently so one missing job cannot poison every node.
+
+    Live evidence on 2026-08-21 showed that aliases returned partial data plus
+    GraphQL errors even though every corrected id succeeded with the frontend's
+    one-job document. Keep transport/HTTP failures authoritative, but treat a
+    resolver error for one public job id as inconclusive for that id only.
+    """
     out: dict[str, dict | None] = {}
-    chunk_size = max(1, int(chunk_size))
-    for start in range(0, len(ids), chunk_size):
-        chunk = ids[start:start + chunk_size]
-        request, ordered = build_request(
-            chunk, locale=getattr(client, "locale", None) or "en-CA"
-        )
+    locale = getattr(client, "locale", None) or "en-CA"
+    for job in known_jobs:
+        request = build_request(job.job_id, locale=locale)
         response = client._post_json(request)
         if isinstance(response, dict) and response.get("errors"):
-            # Keep GraphQL diagnostics out of logs; backend messages can echo
-            # request details. The watcher reports only this sanitized type.
-            raise JobDetailGraphQLError("job detail GraphQL response contained errors")
-        out.update(parse(response, ordered))
+            out[job.job_id] = None
+            continue
+        out[job.job_id] = parse(response)
     return out
 
 
@@ -164,6 +150,8 @@ class LifecycleMonitor:
         self.now_fn = now_fn
         self.state = self._load_state()
         self.last_observed_jobs = 0
+        self.last_attempted_jobs = 0
+        self._cursor = 0
 
     def _load_state(self) -> dict:
         try:
@@ -194,15 +182,33 @@ class LifecycleMonitor:
         with self.events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
 
-    def poll(self, client) -> tuple[list[Shift], list[dict]]:
+    def _jobs_for_poll(self, max_jobs: int | None) -> list[KnownJob]:
+        if not self.known_jobs or max_jobs is None or int(max_jobs) <= 0:
+            return list(self.known_jobs)
+        count = min(len(self.known_jobs), max(1, int(max_jobs)))
+        selected = [
+            self.known_jobs[(self._cursor + offset) % len(self.known_jobs)]
+            for offset in range(count)
+        ]
+        self._cursor = (self._cursor + count) % len(self.known_jobs)
+        return selected
+
+    def poll(
+        self,
+        client,
+        *,
+        max_jobs: int | None = None,
+    ) -> tuple[list[Shift], list[dict]]:
         now = self.now_fn()
         at = _stamp(now)
-        details = fetch(client, self.known_jobs)
+        jobs = self._jobs_for_poll(max_jobs)
+        self.last_attempted_jobs = len(jobs)
+        details = fetch(client, jobs)
         posted_ids: list[str] = []
         transition_events: list[dict] = []
         observed_jobs = 0
 
-        for job in self.known_jobs:
+        for job in jobs:
             detail = details.get(job.job_id)
             if not isinstance(detail, dict):
                 # Missing/inconclusive data never overwrites the last truth.
@@ -251,7 +257,7 @@ class LifecycleMonitor:
             if status == "POSTED":
                 posted_ids.append(job.job_id)
 
-        if self.known_jobs and observed_jobs == 0:
+        if jobs and observed_jobs == 0:
             raise JobDetailGraphQLError("job detail response contained no usable lifecycle nodes")
         self.last_observed_jobs = observed_jobs
 

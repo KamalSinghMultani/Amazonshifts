@@ -23,6 +23,7 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
             and self.mode == "api"
         )
         self.lifecycle_interval = float(lifecycle.get("interval_seconds", 2.0))
+        self.lifecycle_jobs_per_poll = max(1, int(lifecycle.get("jobs_per_poll", 1)))
         self.lifecycle_next_poll = 0.0
         self.lifecycle_candidates = []
         self.lifecycle_failures = 0
@@ -51,7 +52,10 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
             return
         self.lifecycle_next_poll = now + self.lifecycle_interval
         try:
-            candidates, events = self.lifecycle_monitor.poll(self.api_client)
+            candidates, events = self.lifecycle_monitor.poll(
+                self.api_client,
+                max_jobs=self.lifecycle_jobs_per_poll,
+            )
             for candidate in candidates:
                 raw = candidate.raw or {}
                 candidate.url = schedules_mod.application_url(
@@ -64,8 +68,9 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
             if not self.lifecycle_ever_succeeded:
                 self.lifecycle_ever_succeeded = True
                 log.info(
-                    "known-job lifecycle poll succeeded: %d/%d job id(s) observed",
+                    "known-job lifecycle poll succeeded: %d/%d sampled job id(s) observed (%d configured)",
                     self.lifecycle_monitor.last_observed_jobs,
+                    self.lifecycle_monitor.last_attempted_jobs,
                     len(self.lifecycle_monitor.known_jobs),
                 )
             capacity_jobs = {
