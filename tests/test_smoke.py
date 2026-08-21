@@ -25,8 +25,8 @@ def test_polling_defaults_are_conservative_enough_for_the_waf():
     """The shipped API cadence is deliberate but still bounded and observable.
 
     DOM polling remains conservative because it is a full page load. API mode
-    may use the explicitly experimental sub-2s cadence, but it must stay above
-    the hard floor and hot mode must remain the faster cadence.
+    stays at the measured-clean two-second cadence for both normal and hot
+    operation so a batch signal cannot silently raise request pressure.
     """
     cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
     polling = cfg["polling"]
@@ -35,8 +35,8 @@ def test_polling_defaults_are_conservative_enough_for_the_waf():
         assert polling["interval_seconds"] >= 30
         assert polling["hot_interval_seconds"] >= 20
     else:
-        assert polling["interval_seconds"] == pytest.approx(1.25)
-        assert polling["hot_interval_seconds"] == pytest.approx(0.65)
+        assert polling["interval_seconds"] == pytest.approx(2.0)
+        assert polling["hot_interval_seconds"] == pytest.approx(2.0)
         assert polling["interval_seconds"] >= 0.5
         assert polling["hot_interval_seconds"] >= 0.5
         assert polling["hot_interval_seconds"] <= polling["interval_seconds"]
@@ -60,12 +60,12 @@ def test_hot_interval_floor_is_enforced():
         config_mod.validate_config(cfg)
 
 
-def test_experimental_api_cadence_warns_instead_of_silently_claiming_safe(caplog):
-    """Sub-2s API polling is allowed, but startup must say it is experimental."""
+def test_measured_api_cadence_does_not_emit_sub_two_second_warning(caplog):
+    """The shipped two-second cadence should not describe itself as sub-2s."""
     with caplog.at_level(logging.WARNING):
         cfg = config_mod.load_config(Path(__file__).resolve().parent.parent / "config.yaml")
 
     assert cfg["polling"]["mode"] == "api"
     messages = "\n".join(record.getMessage() for record in caplog.records)
-    assert "experimental" in messages.lower()
-    assert "previously measured-clean 2s" in messages
+    assert "polling.interval_seconds" not in messages
+    assert "polling.hot_interval_seconds" not in messages

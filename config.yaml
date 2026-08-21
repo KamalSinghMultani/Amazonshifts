@@ -51,9 +51,10 @@ polling:
   #
   # ⚠️ IF YOU SWITCH BACK TO dom MODE, raise this to 45 first — a dom poll is
   # a full page load, and 14s between those already earned a 403.
-  # 1.25s normal polling is intentionally more aggressive than the previously
-  # measured 2s floor; watch 403/429/circuit-breaker logs closely.
-  interval_seconds: 1.25
+  # Keep public discovery at the previously measured-clean 2s cadence. YYZ4
+  # lifecycle polling uses the same interval, avoiding the earlier combined
+  # 1.25s public + 2s lifecycle pattern that produced HTTP 403s.
+  interval_seconds: 2.0
   # Random 0..jitter_seconds added to each interval so the traffic pattern
   # is not a metronome.
   jitter_seconds: 0
@@ -68,9 +69,9 @@ polling:
   # Two triggers, either is enough:
   #   * a match just happened     -> hot for hot_duration_seconds
   #   * the clock is in a window  -> hot for as long as the window lasts
-  # 0.65s is intentionally experimental and has not been live-tested for WAF
-  # tolerance. The existing circuit breaker remains the backstop.
-  hot_interval_seconds: 0.65
+  # Hot mode uses the same measured-clean cadence. A match still extends the
+  # hot window for ranking/state purposes, but it does not increase traffic.
+  hot_interval_seconds: 2.0
   hot_duration_seconds: 120
 
   # Times of day that are ALWAYS hot, in your local time. May wrap midnight
