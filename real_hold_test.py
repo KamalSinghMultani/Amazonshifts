@@ -31,14 +31,14 @@ import hold_metrics
 import safe_research_trace
 import session_refresh
 import site_selectors
-import watcher_v6
+import watcher_v7
 from config import load_config, load_dotenv, setup_logging
 
 
 log = logging.getLogger("watcher")
 
 
-class RealHoldTestWatcher(watcher_v6.HoldReadyWatcher):
+class RealHoldTestWatcher(watcher_v7.LifecycleWatcher):
     def __init__(self, cfg: dict, live_override: bool = False) -> None:
         super().__init__(cfg, live_override=live_override)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

@@ -1206,6 +1206,10 @@ class RecordingNotifier:
         self.texts.append(message)
         return True
 
+    def notify_hold_attention(self, shift, heading, message, manual_url=""):
+        self.texts.append(f"{heading}\n{shift.summary()}\n{message}\n{manual_url}")
+        return True
+
     def describe(self, shift):
         # Same shape as the real one, so a message built from it can be
         # asserted on without pulling in HTML escaping.

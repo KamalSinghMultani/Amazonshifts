@@ -191,6 +191,28 @@ def test_fast_hold_detects_unavailable_after_integrity():
     assert "shift is no longer available" in detail.lower()
 
 
+def test_fast_hold_detects_no_available_shift_route_immediately():
+    class Page:
+        url = "https://hiring.amazon.ca/application/ca/#/no-available-shift?jobId=redacted"
+
+        def inner_text(self, _selector):
+            return ""
+
+    detail = fast_hold._availability_failure(Page())
+    assert "/no-available-shift" in detail
+
+
+def test_fast_hold_detects_all_shifts_filled_copy():
+    class Page:
+        url = "https://hiring.amazon.ca/application/ca/#/application"
+
+        def inner_text(self, _selector):
+            return "At present, all shifts have been filled for this job."
+
+    detail = fast_hold._availability_failure(Page())
+    assert "all shifts have been filled" in detail.lower()
+
+
 def test_fast_hold_does_not_capture_before_create_click():
     source = inspect.getsource(fast_hold.hold)
     start = source.index("if create_actionable and not create_clicked:")

@@ -169,6 +169,15 @@ DEFAULTS: dict[str, Any] = {
         # Append-only log of every detection, read back by --drop-report.
         "detections_path": "state/detections.jsonl",
     },
+    "lifecycle_monitor": {
+        "enabled": False,
+        "interval_seconds": 2.0,
+        "notify_unposted": True,
+        "notify_posted_without_capacity": True,
+        "state_path": "state/job_lifecycle.json",
+        "events_path": "state/job_lifecycle_events.jsonl",
+        "known_jobs": [],
+    },
     "logging": {
         "level": "INFO",
         "path": "logs/watcher.log",
@@ -390,6 +399,23 @@ def validate_config(cfg: dict) -> None:
             raise ValueError("polling.mode is 'api' but api.field_map is empty")
         if str(api.get("method", "POST")).upper() not in ("GET", "POST"):
             raise ValueError("api.method must be GET or POST")
+
+    lifecycle = cfg.get("lifecycle_monitor") or {}
+    if lifecycle.get("enabled"):
+        if mode != "api":
+            raise ValueError("lifecycle_monitor requires polling.mode: api")
+        if float(lifecycle.get("interval_seconds", 2.0)) < 1.0:
+            raise ValueError("lifecycle_monitor.interval_seconds below 1.0 is too aggressive")
+        known = lifecycle.get("known_jobs") or []
+        if not isinstance(known, list) or not known:
+            raise ValueError("enabled lifecycle_monitor requires known_jobs")
+        ids = []
+        for item in known:
+            if not isinstance(item, dict) or not str(item.get("job_id") or "").strip():
+                raise ValueError("each lifecycle_monitor known job requires job_id")
+            ids.append(str(item["job_id"]).strip())
+        if len(ids) != len(set(ids)):
+            raise ValueError("lifecycle_monitor known job ids must be unique")
 
     if not cfg["dry_run"] and cfg["hold"]["enabled"] and not cfg["hold"]["stop_before_submit"]:
         # Precise, because the difference matters: it creates an application

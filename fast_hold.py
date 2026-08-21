@@ -33,6 +33,8 @@ IDENTITY_START = (
 IDENTITY_CONSENT_CHECKBOXES = "input[type='checkbox']"
 HOLD_TEXT = "holding a spot"
 UNAVAILABLE_TEXT_PATTERNS = (
+    "at present, all shifts have been filled for this job",
+    "all shifts have been filled for this job",
     "shift is no longer available",
     "shift is not available",
     "shift not available anymore",
@@ -42,6 +44,10 @@ UNAVAILABLE_TEXT_PATTERNS = (
     "this schedule is no longer available",
     "selected shift is no longer available",
     "selected schedule is no longer available",
+)
+UNAVAILABLE_ROUTE_PATTERNS = (
+    "/no-available-shift",
+    "/schedule-unavailable",
 )
 IDENTITY_TEXT_PATTERNS = (
     "let's confirm it's you",
@@ -112,6 +118,16 @@ def _banner(page: Any) -> str:
 
 def _availability_failure(page: Any) -> str:
     """Return a narrow visible unavailable message, or an empty string."""
+    try:
+        url = (getattr(page, "url", "") or "").lower()
+        matched_route = next(
+            (pattern for pattern in UNAVAILABLE_ROUTE_PATTERNS if pattern in url),
+            "",
+        )
+        if matched_route:
+            return f"Amazon routed the application to {matched_route}."
+    except Exception:
+        pass
     text = _body_text(page)
     low = text.lower()
     for pattern in UNAVAILABLE_TEXT_PATTERNS:
@@ -291,8 +307,24 @@ def hold(
         identity_consent_actionable_seen = [False, False]
         identity_consent_checked_seen = [False, False]
         identity_consent_click_errors = ["", ""]
+        identity_handoff_captured = False
+
+        def capture_identity_handoff() -> None:
+            nonlocal identity_handoff_captured
+            if identity_handoff_captured or not screenshot_path:
+                return
+            try:
+                page.screenshot(path=screenshot_path, full_page=False)
+                identity_handoff_captured = True
+                mark("identity handoff screenshot captured")
+            except Exception:  # noqa: BLE001
+                pass
 
         def identity_result(message: str) -> tuple[site_selectors.HoldResult, str]:
+            # Capture the page Amazon produced after the already-authorized
+            # launcher click.  This is a diagnostic/manual handoff only; no
+            # remoteKYC control is inspected or operated.
+            capture_identity_handoff()
             return (
                 site_selectors.HoldResult(
                     site_selectors.IDENTITY_VERIFICATION_REQUIRED,
@@ -305,6 +337,8 @@ def hold(
 
         while time.perf_counter() < deadline:
             if observer.confirmed:
+                if identity_start_clicked:
+                    capture_identity_handoff()
                 mark("backend reserve confirmed")
                 if screenshot_path:
                     try:
@@ -688,6 +722,8 @@ def hold(
                         mark("post integrity update response observed")
                     unavailable = _availability_failure(page)
                     if unavailable:
+                        if identity_start_clicked:
+                            capture_identity_handoff()
                         mark("schedule unavailable after integrity")
                         captured = failure_capture.capture(
                             page,
@@ -734,6 +770,8 @@ def hold(
 
                 banner = _banner(page)
                 if banner:
+                    if identity_start_clicked:
+                        capture_identity_handoff()
                     mark("holding banner seen")
                     return (
                         site_selectors.HoldResult(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 
 import fast_hold
+import site_selectors
 import hold_verify
 from notifier import TelegramNotifier
 import schedules
@@ -299,6 +300,69 @@ def test_identity_consent_page_requires_both_exact_consent_statements():
     assert fast_hold._identity_consent_page(UnrelatedCheckboxPage()) is False
 
 
+class _VisibleTextLocator:
+    def __init__(self, *, visible=False, text=""):
+        self.first = self
+        self.visible = visible
+        self.text = text
+
+    def count(self):
+        return 1 if self.visible else 0
+
+    def is_visible(self):
+        return self.visible
+
+    def inner_text(self):
+        return self.text
+
+
+class _UnavailableDetailPage:
+    url = "https://hiring.amazon.ca/app#/jobDetail?jobId=JOB-CA-test"
+
+    def __init__(self, *, warning=False, body="", flyout=""):
+        self.warning = warning
+        self.body = body
+        self.flyout = flyout
+
+    def locator(self, selector):
+        if selector == site_selectors.UNPOSTED_JOB_WARNING:
+            return _VisibleTextLocator(visible=self.warning)
+        if selector == site_selectors.SCHEDULE_FLYOUT:
+            return _VisibleTextLocator(visible=bool(self.flyout), text=self.flyout)
+        return _VisibleTextLocator()
+
+    def inner_text(self, selector):
+        assert selector == "body"
+        return self.body
+
+
+def test_unposted_job_warning_is_terminal_even_with_schedule_button_rendered():
+    page = _UnavailableDetailPage(warning=True)
+    assert site_selectors.job_detail_unavailable(page) is True
+
+
+def test_unavailable_job_text_is_terminal_when_test_id_is_absent():
+    page = _UnavailableDetailPage(
+        body="Warning — This job is not available for application now. Click here to go back."
+    )
+    assert site_selectors.job_detail_unavailable(page) is True
+
+
+def test_zero_schedule_panel_is_classified_without_waiting_for_apply():
+    page = _UnavailableDetailPage(
+        flyout="Select your schedule\nSchedule Hours\n0 schedules found\n"
+        "Sorry, there are no schedules that match your filter choices."
+    )
+    assert site_selectors.schedule_flyout_empty(page) is True
+
+
+def test_nonempty_schedule_panel_is_not_a_ghost_classification():
+    page = _UnavailableDetailPage(
+        flyout="Select your schedule\nSun, Mon, Tue, Wed 3:00 PM - 8:30 PM\nApply"
+    )
+    assert site_selectors.schedule_flyout_empty(page) is False
+
+
 def test_create_and_agree_click_as_soon_as_actionable_then_stop_at_ekyc(monkeypatch):
     monkeypatch.setattr(fast_hold.hold_verify, "SoftReserveObserver", PassiveObserver)
     monkeypatch.setattr(fast_hold.site_selectors, "dismiss_overlays", lambda *_a, **_k: [])
@@ -396,6 +460,37 @@ def test_actual_remote_kyc_stops_immediately_after_launcher_click(monkeypatch):
     assert "tracking" not in result.message.lower()
     names = [name for name, _ms in result.timings]
     assert names.index("start identification clicked") < names.index("actual identity verification required")
+
+
+def test_actual_remote_kyc_handoff_is_screenshotted_after_start(monkeypatch, tmp_path):
+    monkeypatch.setattr(fast_hold.hold_verify, "SoftReserveObserver", PassiveObserver)
+    monkeypatch.setattr(fast_hold.site_selectors, "dismiss_overlays", lambda *_a, **_k: [])
+
+    class ScreenshotPage(HoldFlowPage):
+        def screenshot(self, *, path, **_kwargs):
+            from pathlib import Path
+            Path(path).write_bytes(b"safe-test-image")
+
+    page = ScreenshotPage(after_agree="liveness", after_identity="remote_kyc")
+    shot = tmp_path / "identity-handoff.png"
+    result, _detail = fast_hold.hold(
+        page,
+        "https://hiring.amazon.ca/application/ca/?jobId=JOB-1&scheduleId=SCH-1",
+        "SCH-1",
+        base_url="https://hiring.amazon.ca",
+        stop_before_submit=False,
+        timeout_ms=1000,
+        screenshot_path=str(shot),
+        auto_integrity_agree=True,
+        auto_accept_identity_consent_and_start=True,
+    )
+
+    assert result.status == site_selectors.IDENTITY_VERIFICATION_REQUIRED
+    assert shot.exists()
+    names = [name for name, _ms in result.timings]
+    assert names.index("start identification clicked") < names.index(
+        "identity handoff screenshot captured"
+    )
 
 
 def test_completed_identity_skip_can_finish_from_reserve_proof(monkeypatch):
@@ -586,4 +681,39 @@ def test_identity_result_dispatches_dedicated_clickable_alert_immediately(tmp_pa
     assert dispatched[0][1][1] == schedules.identity_verification_url(
         "https://hiring.amazon.ca", "JOB-CA-1", "SCH-CA-2"
     )
+
+
+def test_failed_hold_telegram_url_is_rebuilt_from_public_ids_not_result_url(tmp_path):
+    class Recording:
+        def notify_hold_attention(self, *_args, **_kwargs):
+            return True
+
+        def send_photo(self, *_args, **_kwargs):
+            return True
+
+    instance = object.__new__(watcher.Watcher)
+    instance.cfg = {"site": {"base_url": "https://hiring.amazon.ca"}}
+    instance.notifier = Recording()
+    instance.last_hold = None
+    dispatched = []
+    instance.notify_async = lambda fn, *args, **kwargs: dispatched.append(
+        (fn.__name__, args, kwargs)
+    )
+    shift = Shift(
+        id="SCH-1",
+        title="Warehouse",
+        raw={"jobId": "JOB-1", "scheduleId": "SCH-1"},
+    )
+    result = site_selectors.HoldResult(
+        site_selectors.FAILED,
+        "not available",
+        url="https://www.amazon.in/remoteKYC?trackingId=secret",
+    )
+    instance._report_hold(shift, result, tmp_path / "missing.png")
+    assert dispatched[0][0] == "notify_hold_attention"
+    manual_url = dispatched[0][1][3]
+    assert manual_url == schedules.application_url(
+        "https://hiring.amazon.ca", "JOB-1", "SCH-1"
+    )
+    assert "tracking" not in manual_url.lower()
     assert "tracking" not in dispatched[0][1][1].lower()

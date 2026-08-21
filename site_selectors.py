@@ -138,6 +138,19 @@ HOLD_STEPS: list[HoldStep] = [
 # matching a stray Apply button elsewhere on the page.
 SCHEDULE_FLYOUT = "[data-test-id='scheduleSelectorPanelFlyout']"
 
+# CONFIRMED live on the Canada site, 2026-08-21: Amazon can leave the primary
+# Select schedule button rendered and clickable while this warning is visible:
+# "This job is not available for application now." Clicking the apparently
+# usable button then opens a real flyout containing "0 schedules found". Those
+# are authoritative terminal states, not actionability failures, and must be
+# classified before a generic 10-second click/apply timeout obscures the cause.
+UNPOSTED_JOB_WARNING = "[data-test-id='UnPostedJobWarningBanner']"
+UNPOSTED_JOB_TEXT = "this job is not available for application now"
+EMPTY_SCHEDULE_TEXTS = (
+    "0 schedules found",
+    "no schedules that match your filter choices",
+)
+
 # Marks a job detail page. Used to tell "we are on the results list" from
 # "we already navigated straight to the job", which matters because api mode
 # jumps directly to the detail URL and there are no cards there to click.
@@ -874,6 +887,33 @@ def schedule_card_texts(page: Any) -> list[str]:
         return []
 
 
+def job_detail_unavailable(page: Any) -> bool:
+    """Whether the detail page explicitly says the posting cannot be applied to."""
+    try:
+        warning = page.locator(UNPOSTED_JOB_WARNING).first
+        if warning.count() > 0 and warning.is_visible():
+            return True
+    except Exception:
+        pass
+    try:
+        text = " ".join((page.inner_text("body") or "").lower().split())
+        return UNPOSTED_JOB_TEXT in text
+    except Exception:
+        return False
+
+
+def schedule_flyout_empty(page: Any) -> bool:
+    """Whether Amazon rendered its schedule panel with an explicit zero result."""
+    try:
+        flyout = page.locator(SCHEDULE_FLYOUT).first
+        if flyout.count() == 0 or not flyout.is_visible():
+            return False
+        text = " ".join((flyout.inner_text() or "").lower().split())
+        return any(marker in text for marker in EMPTY_SCHEDULE_TEXTS)
+    except Exception:
+        return False
+
+
 def hold_shift(
     page: Any,
     shift: Shift,
@@ -939,12 +979,39 @@ def hold_shift(
     context = getattr(page, "context", None)
 
     for step_number, step in enumerate(steps):
+        if step.label == "select schedule" and job_detail_unavailable(page):
+            mark("job explicitly unavailable")
+            return HoldResult(
+                FAILED,
+                "job is explicitly unavailable before schedule selection; "
+                "Amazon left the Select schedule control rendered, but no application can be started",
+                url=getattr(page, "url", "") or "",
+                timings=timings,
+            )
+
         # Snapshot before the click, never after: the tab can exist before
         # control comes back to us, and a listener armed afterwards misses it.
         known_pages = set(context.pages) if (context and step.opens_popup) else set()
         step_started = time.perf_counter()
         try:
             if step.label == "pick a shift":
+                # Wait only for the panel that the preceding normal click is
+                # expected to mount, then classify Amazon's explicit empty
+                # state before waiting for a nonexistent Apply button.
+                try:
+                    page.locator(SCHEDULE_FLYOUT).first.wait_for(
+                        state="visible", timeout=min(timeout_ms, 1000)
+                    )
+                except Exception:
+                    pass
+                if schedule_flyout_empty(page):
+                    mark("schedule flyout explicitly empty")
+                    return HoldResult(
+                        FAILED,
+                        "job detail opened an explicit 0-schedules panel; no shift is selectable",
+                        url=getattr(page, "url", "") or "",
+                        timings=timings,
+                    )
                 # Which Apply button, not just the first one. A job can offer
                 # several schedules and the render order is an accident — see
                 # schedules.rank_cards. schedule_index selects among them, so a

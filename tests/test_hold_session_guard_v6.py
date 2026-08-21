@@ -8,15 +8,18 @@ import real_hold_test
 import session_guard_worker
 import watcher_v5
 import watcher_v6
+import watcher_v7
 
 
 def test_v6_is_final_layer_over_v5():
     assert issubclass(watcher_v6.HoldReadyWatcher, watcher_v5.PreLiveWatcher)
 
 
-def test_bat_launches_v6():
+def test_bat_launches_v7_over_the_v6_session_guard():
     text = Path("run_watcher.bat").read_text("utf-8")
-    assert "watcher_v6.py" in text
+    assert "watcher_v7.py" in text
+    assert issubclass(watcher_v7.LifecycleWatcher, watcher_v6.HoldReadyWatcher)
+    assert "watcher_v6.py --config" not in text
     assert "watcher_v5.py --config" not in text
 
 
@@ -105,8 +108,8 @@ def test_v5_refresh_failure_preserves_current_live_session_truth():
     assert "self.session_ok = False" not in forced.split("# A prove-only failure", 1)[0]
 
 
-def test_real_hold_validation_uses_v6_and_preflight_marks_session_ready():
-    assert issubclass(real_hold_test.RealHoldTestWatcher, watcher_v6.HoldReadyWatcher)
+def test_real_hold_validation_uses_v7_and_preflight_marks_session_ready():
+    assert issubclass(real_hold_test.RealHoldTestWatcher, watcher_v7.LifecycleWatcher)
     source = inspect.getsource(real_hold_test.RealHoldTestWatcher.__init__)
     assert "_mark_session_verified" in source
     assert "real-test preflight" in source

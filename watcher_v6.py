@@ -101,23 +101,26 @@ class HoldReadyWatcher(watcher_v5.PreLiveWatcher):
             if not self._session_block_alerted and self.alert_on_expiry:
                 manual_url = self._manual_job_url(shift)
                 if status_before is False:
+                    heading = "🚨 <b>Amazon hold session is dead / signed out</b>"
                     text = (
-                        "🚨 <b>Amazon hold session is dead / signed out</b>\n"
                         "A shift was found, but no hold was attempted because the protected "
                         "application session needs a login. Detection continues and the "
-                        "schedule remains retryable while recovery runs.\n"
-                        f"Try manually: {manual_url}\n"
-                        "If automatic recovery cannot restore the session, run: "
-                        "<code>python save_session.py</code>"
+                        "schedule remains retryable while recovery runs. If automatic recovery "
+                        "cannot restore it, run python save_session.py."
                     )
                 else:
+                    heading = "⚠️ <b>Shift found, but holding is temporarily gated</b>"
                     text = (
-                        "⚠️ <b>Shift found, but holding is temporarily gated</b>\n"
                         "The protected application session is awaiting a strong verification. "
-                        "Detection continues and the schedule remains retryable.\n"
-                        f"Manual link: {manual_url}"
+                        "Detection continues and the schedule remains retryable."
                     )
-                self.notify_async(self.notifier.notify_error, text)
+                self.notify_async(
+                    self.notifier.notify_hold_attention,
+                    shift,
+                    heading,
+                    text,
+                    manual_url,
+                )
                 self._session_block_alerted = True
 
             if status_before is False and self.auto_relogin and not self.relogin_blocked:

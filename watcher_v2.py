@@ -60,6 +60,14 @@ class ScheduleAwareWatcher(base.Watcher):
         raw.setdefault("scheduleId", schedule.id)
         raw["parentJobId"] = job.id
         raw["laborDemandAvailableCount"] = schedule.available
+        if schedule.id and (schedule.job_id or job.id):
+            # Notification-only URL. Hold routing continues to use the exact
+            # jobId/scheduleId fields above and is otherwise unchanged.
+            raw["manualUrl"] = schedules_mod.application_url(
+                (self.cfg.get("site") or {}).get("base_url", "https://hiring.amazon.ca"),
+                schedule.job_id or job.id,
+                schedule.id,
+            )
 
         return Shift(
             # scheduleId is the identity now. The parent job id stays in raw.

@@ -1,0 +1,369 @@
+{
+  "schema_version": 1,
+  "privacy": "Public job and schedule metadata only. No credentials, tokens, cookies, OTP/PIN, auth headers, email addresses, or KYC tracking identifiers.",
+  "source": "User-provided Telegram screenshots",
+  "monitoring_scope": {
+    "primary_cities": ["Brampton, ON", "Mississauga, ON", "Etobicoke, ON"],
+    "primary_site_codes_observed": ["YYZ4", "YYZ3", "DDJ3", "DTY4", "YYZ1", "DON9", "DTO3"],
+    "other_locations_purpose": "Session, availability-classification, and transition tests unless the user promotes a location to primary."
+  },
+  "observations": [
+    {
+      "location": "Barrhaven, ON",
+      "site_code": "YOW3",
+      "job_id": "JOB-CA-0000000566",
+      "schedule_id": "SCH-CA-0000006610",
+      "posting_status_displayed": "UNPOSTED",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Part Time",
+      "schedule_text": "Sun, Mon, Tue, Wed 3:00 PM - 8:30 PM (22h)",
+      "telegram_time_displayed": "2:23 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-780e7616-fdca-4c8a-b6ef-40e724eafd97.png"
+    },
+    {
+      "location": "Barrhaven, ON",
+      "site_code": "YOW3",
+      "job_id": "JOB-CA-0000000566",
+      "schedule_id": "SCH-CA-0000006610",
+      "posting_status_displayed": "UNPOSTED",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Part Time",
+      "schedule_text": "Sun, Mon, Tue, Wed 3:00 PM - 8:30 PM (22h)",
+      "telegram_time_displayed": "3:53 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-5c3ffa29-99bc-4cc9-8041-79721bbece28.png"
+    },
+    {
+      "location": "St. Thomas, ON",
+      "site_code": "YXU1",
+      "job_id": "JOB-CA-0000005928",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_texts": [
+        "Wed, Thu, Fri, Sat 6:30 PM - 5:00 AM (40h)"
+      ],
+      "telegram_time_displayed": "10:24 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-e7a77b11-d547-49d2-b889-3a22813162e3.png"
+    },
+    {
+      "location": "St. Thomas, ON",
+      "site_code": "YXU1",
+      "job_id": "JOB-CA-0000005928",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_texts": [
+        "Mon, Tue, Thu, Fri 7:00 AM - 5:30 PM (40h)",
+        "Thu, Fri, Sat, Sun 7:00 AM - 5:30 PM (40h)",
+        "Mon, Tue, Thu, Fri 7:30 AM - 6:00 PM (40h)",
+        "Wed, Thu, Fri, Sat 6:30 PM - 5:00 AM (40h)",
+        "Thu, Fri, Sat, Sun 7:30 AM - 6:00 PM (40h)"
+      ],
+      "telegram_time_displayed": "12:21 PM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-0d792375-9b76-4f7d-912b-ab57675b2fc4.png"
+    },
+    {
+      "location": "Ottawa, ON",
+      "site_code": "YOW1",
+      "job_id": "JOB-CA-0000005838",
+      "schedule_id": "SCH-CA-0000006544",
+      "posting_status_displayed": "UNPOSTED",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_text": "Mon, Tue, Wed, Thu 7:00 PM - 5:30 AM (40h)",
+      "telegram_time_displayed": "12:51 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-42b410e6-4514-4698-bb00-b0987dfc8b25.png"
+    },
+    {
+      "location": "Ottawa, ON",
+      "site_code": "YOW1",
+      "job_id": "JOB-CA-0000005838",
+      "schedule_id": "SCH-CA-0000006544",
+      "posting_status_displayed": "UNPOSTED",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_text": "Mon, Tue, Wed, Thu 7:00 PM - 5:30 AM (40h)",
+      "telegram_time_displayed": "3:55 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-e354a2bc-fce8-4daf-a8c8-0187ca70e4bf.png"
+    },
+    {
+      "location": "Barrhaven, ON",
+      "site_code": "YOW3",
+      "job_id": "JOB-CA-0000000566",
+      "schedule_id": "SCH-CA-0000006610",
+      "posting_status_displayed": "UNPOSTED",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Part Time",
+      "schedule_text": "Sun, Mon, Tue, Wed 3:00 PM - 8:30 PM (22h)",
+      "telegram_time_displayed": "7:45 PM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-e355c252-3d71-48fc-ae89-dd6433c90bc3.jpg"
+    },
+    {
+      "location": "Barrhaven, ON",
+      "site_code": "YOW3",
+      "job_id": "JOB-CA-0000000566",
+      "schedule_id": "SCH-CA-0000006610",
+      "posting_status_displayed": "POSTED",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Part Time",
+      "schedule_text": "Sun, Mon, Tue, Wed 3:00 PM - 8:30 PM (22h)",
+      "telegram_time_displayed": "9:02 PM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-0ca2d3cf-76c1-4a51-8c17-2415e8e2ae99.jpg"
+    },
+    {
+      "location": "Barrhaven, ON",
+      "site_code": "YOW3",
+      "job_id": "JOB-CA-0000000566",
+      "schedule_id": "SCH-CA-0000006610",
+      "posting_status_displayed": "UNPOSTED",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Part Time",
+      "schedule_text": "Sun, Mon, Tue, Wed 3:00 PM - 8:30 PM (22h)",
+      "telegram_time_displayed": null,
+      "telegram_date_known": false,
+      "sequence_constraint": "Displayed below the 9:02 PM POSTED message and visible before the 9:13 device clock.",
+      "id_evidence": "The bottom message URL is cropped; the same IDs are attributed from the adjacent sequence and the user's live-transition report.",
+      "source_image": "codex-clipboard-0ca2d3cf-76c1-4a51-8c17-2415e8e2ae99.jpg"
+    },
+    {
+      "location": "Hamilton, ON",
+      "site_code": "YHM1",
+      "job_id": "JOB-CA-0000005708",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_texts": [
+        "Mon, Tue, Thu, Fri 6:30 PM - 5:00 AM (40h)",
+        "Thu, Fri, Sat, Sun 7:00 AM - 5:30 PM (40h)",
+        "Wed, Thu, Fri, Sat 6:30 PM - 5:00 AM (40h)"
+      ],
+      "telegram_time_displayed": "6:29 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-6d0e5af7-6fd7-41b5-8cb8-a29c05374fa1.png"
+    },
+    {
+      "location": "Hamilton, ON",
+      "site_code": "YHM1",
+      "job_id": "JOB-CA-0000005708",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_texts": [
+        "Wed, Thu, Fri, Sat 7:30 AM - 6:00 PM (40h)",
+        "Mon, Tue, Thu, Fri 6:30 PM - 5:00 AM (40h)"
+      ],
+      "telegram_time_displayed": "6:30 PM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-6f491d7e-c410-406c-9dd0-5dd33d73eeb8.png"
+    },
+    {
+      "location": "Brampton, ON",
+      "site_code": "YYZ4",
+      "job_id": "JOB-CA-0000005578",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_texts": [
+        "Thu, Fri, Sat, Sun 6:00 PM - 4:30 AM (40h)"
+      ],
+      "telegram_time_displayed": "9:32 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-125a4d0e-1168-43c8-be6e-2d5fbbd8c00a.png"
+    },
+    {
+      "location": "Brampton, ON",
+      "site_code": "YYZ4",
+      "job_id": "JOB-CA-0000005578",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_texts": [
+        "Thu, Fri, Sat, Sun 7:30 AM - 6:00 PM (40h)",
+        "Thu, Fri, Sat, Sun 6:00 PM - 4:30 AM (40h)"
+      ],
+      "telegram_time_displayed": "6:29 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-df3ee3b5-321d-4809-a4b2-cd4b5a20ae91.png"
+    },
+    {
+      "location": "Brampton, ON",
+      "site_code": "YYZ3",
+      "job_id": "JOB-CA-0000005098",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_texts": [
+        "Wed, Thu, Fri, Sat 7:00 PM - 5:30 AM (40h)"
+      ],
+      "telegram_time_displayed": "11:56 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-40badacc-82e8-4a29-9644-6b34e8950808.png"
+    },
+    {
+      "location": "Brampton, ON",
+      "site_code": "DDJ3",
+      "job_id": "JOB-CA-0000005608",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Flexible",
+      "schedule_texts": [
+        "Flexible shifts (19h)"
+      ],
+      "telegram_time_displayed": "10:37 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-2750a7d8-7e13-43bd-8a09-1f3ae2ca178e.png"
+    },
+    {
+      "location": "Mississauga, ON",
+      "site_code": "DTY4",
+      "job_id": "JOB-CA-0000005118",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Flexible",
+      "schedule_texts": [
+        "Flexible shifts (19h)"
+      ],
+      "telegram_time_displayed": "6:30 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-41639460-efe6-488a-8ce6-6fa162002250.png"
+    },
+    {
+      "location": "Mississauga, ON",
+      "site_code": "YYZ1",
+      "job_id": "JOB-CA-0000005918",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_texts": [
+        "Thu, Fri, Sat, Sun 6:00 PM - 4:30 AM (40h)"
+      ],
+      "telegram_time_displayed": "12:08 PM",
+      "telegram_date_known": false,
+      "source_images": [
+        "codex-clipboard-c36d64a2-d6cd-4ff5-9cca-22ef77583fbd.png",
+        "codex-clipboard-2f5991fa-1702-4065-a9ac-81714e53f7c7.png"
+      ]
+    },
+    {
+      "location": "Etobicoke, ON",
+      "site_code": "DON9",
+      "job_id": "JOB-CA-0000005598",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "monitoring_priority": "primary",
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "job_title_displayed": "Delivery Station Warehouse Associate",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Flexible",
+      "schedule_texts": ["Flexible shifts (19h)"],
+      "telegram_time_displayed": "6:29 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-122aff03-8d35-4ce7-a8f2-8ccac4e061f8.png"
+    },
+    {
+      "location": "Etobicoke, ON",
+      "site_code": "DON9",
+      "job_id": "JOB-CA-0000005598",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "monitoring_priority": "primary",
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "job_title_displayed": "Delivery Station Warehouse Associate",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Flexible",
+      "schedule_texts": ["Flexible shifts (19h)"],
+      "telegram_time_displayed": "9:31 AM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-edac8012-0272-4e81-a504-a1028efa2079.png"
+    },
+    {
+      "location": "Etobicoke, ON",
+      "site_code": "DTO3",
+      "job_id": "JOB-CA-0000000476",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "monitoring_priority": "primary",
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "job_title_displayed": "Delivery Station Warehouse Associate",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Full Time",
+      "schedule_texts": ["Sun, Mon, Tue, Wed 1:20 AM - 11:50 AM (40h)"],
+      "telegram_time_displayed": "5:30 PM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-777e20d7-d526-409d-a096-0b85e045c7c5.png"
+    },
+    {
+      "location": "Oakville, ON",
+      "site_code": "HYZ1",
+      "job_id": "JOB-CA-0000004468",
+      "schedule_id": null,
+      "posting_status_displayed": null,
+      "monitoring_priority": "test",
+      "historical_status_caveat": "The user reports that the competitor edits older messages to remove POSTED/UNPOSTED transition labels.",
+      "job_title_displayed": "XL Warehouse Associate",
+      "pay_displayed": "$25.60/hr",
+      "employment_displayed": "Seasonal | Flexible",
+      "schedule_texts": ["Flexible shifts (19h)"],
+      "telegram_time_displayed": "6:19 PM",
+      "telegram_date_known": false,
+      "source_image": "codex-clipboard-0d9be53d-a371-462c-8e66-d131bb384f31.png"
+    }
+  ],
+  "transition_sequences": [
+    {
+      "location": "Barrhaven, ON",
+      "site_code": "YOW3",
+      "job_id": "JOB-CA-0000000566",
+      "schedule_id": "SCH-CA-0000006610",
+      "date_known": false,
+      "estimated_posted_window_seconds": 10,
+      "window_duration_source": "User observed the live POSTED-to-UNPOSTED transition; approximate duration.",
+      "events": [
+        {"status": "UNPOSTED", "time_displayed": "7:45 PM"},
+        {"status": "POSTED", "time_displayed": "9:02 PM"},
+        {"status": "UNPOSTED", "time_displayed": null, "observed_before": "9:13 PM"}
+      ],
+      "confidence": "High for the UNPOSTED-to-POSTED transition; medium-high for the final UNPOSTED attribution because its URL is cropped. The approximately 10-second window is a user-observed estimate."
+    }
+  ],
+  "provisional_findings": [
+    "Barrhaven and Ottawa show repeated UNPOSTED observations with the same job ID and same schedule ID.",
+    "St. Thomas shows the same job ID with one visible schedule in one observation and five visible schedules in another.",
+    "Barrhaven provides an ordered same-pair lifecycle: UNPOSTED at 7:45 PM, POSTED at 9:02 PM, then UNPOSTED again before 9:13 PM.",
+    "The user observed that the live POSTED state lasted approximately 10 seconds before returning to UNPOSTED.",
+    "Older competitor messages can have their POSTED/UNPOSTED labels removed by later edits, so a missing historical label is unknown rather than a negative status observation.",
+    "Hamilton YHM1 and Brampton YYZ4 each show one stable job ID associated with different schedule sets at different observations.",
+    "Brampton and Mississauga each contain multiple site codes with distinct stable job IDs; city alone is not a sufficient monitoring key.",
+    "Etobicoke also contains multiple site codes and distinct job IDs: DON9 with flexible delivery-station shifts and DTO3 with a full-time schedule.",
+    "Primary monitoring scope is Brampton, Mississauga, and Etobicoke; other sites remain valuable for session and state-transition tests.",
+    "The same job ID and schedule ID can survive a publication-status cycle; a status transition is more informative than a newly discovered identifier.",
+    "Telegram edited/display times have no visible date and cannot be ordered safely across screenshots.",
+    "A repeated or edited Telegram message is not proof that Amazon's postingStatus or capacity changed."
+  ]
+}
