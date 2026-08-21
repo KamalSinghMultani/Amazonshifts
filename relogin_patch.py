@@ -270,6 +270,8 @@ def apply_patch(module) -> None:
                 return self.state
 
             if not self._transition_to_next():
+                if self.state == AuthState.OTP_TIMEOUT:
+                    return self.state
                 return AuthState.SESSION_ERROR
 
         return AuthState.SESSION_ERROR

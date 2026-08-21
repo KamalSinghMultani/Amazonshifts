@@ -186,7 +186,14 @@ def _search_amazon(client, since: str) -> list[bytes]:
             continue
         if status == "OK":
             numbers.extend((data[0] or b"").split())
-    return list(dict.fromkeys(reversed(numbers)))[:MAX_MESSAGES]
+    # Each sender query returns its own ascending sequence-number list. Simply
+    # reversing the concatenated lists puts the final sender first, not the
+    # newest message globally, and can spend many slow full-body fetches on old
+    # mail before reaching the code that just arrived. Message sequence numbers
+    # are mailbox-wide, so numeric descending order is the true newest-first
+    # order across all sender queries.
+    unique = set(numbers)
+    return sorted(unique, key=lambda number: int(number), reverse=True)[:MAX_MESSAGES]
 
 
 def _code_from(client, num: bytes, since_epoch: float) -> str | None:
@@ -219,7 +226,7 @@ def _disconnect_fast(client: Any) -> None:
 def fetch_code(
     since_epoch: float,
     *,
-    timeout_s: float = 150,
+    timeout_s: float = 170,
     poll_s: float = 2,
     stop_event: threading.Event | None = None,
 ) -> str | None:
@@ -228,9 +235,10 @@ def fetch_code(
     Returns None rather than raising: a failed re-login must leave the watcher
     detecting and alerting exactly as it was.
 
-    The code expires after three minutes. Polling every two seconds on one
-    authenticated connection and stopping at 150 seconds leaves time to submit
-    a late code without repeating Gmail's TLS/login/logout overhead.
+    The code expires after three minutes. Polling every two seconds and
+    stopping mailbox work at 170 seconds leaves time to submit a late code.
+    The expensive authenticated connection is reused, then its socket closes
+    directly after success instead of waiting for Gmail's slow LOGOUT reply.
     """
     creds = configured()
     if creds is None:
@@ -243,7 +251,12 @@ def fetch_code(
     while time.monotonic() < deadline and not (stop_event and stop_event.is_set()):
         try:
             if client is None:
-                client = imaplib.IMAP4_SSL(host, timeout=10)
+                # Measured live on this mailbox: connect 0.2s, login 34s,
+                # select 18s, sender search 38s. Any 10-30s socket timeout kills
+                # every valid scan before it can reach an already-delivered
+                # code. The worker thread may block here, but the auth thread
+                # remains bounded by its 150-second OTP deadline.
+                client = imaplib.IMAP4_SSL(host)
                 client.login(user, password)
             since = time.strftime("%d-%b-%Y", time.localtime(since_epoch - 86400))
 
@@ -268,10 +281,9 @@ def fetch_code(
                         )
                         return code
 
-            # Detect a server-side disconnect before the next cycle. Keeping
-            # this same authenticated TLS connection avoids a login handshake
-            # on every two-second poll.
-            client.noop()
+            # Keep this expensive authenticated connection for the next scan.
+            # The next SELECT/SEARCH naturally detects a broken connection and
+            # the exception path below recreates it when necessary.
         except Exception as exc:  # noqa: BLE001 - mail is best effort
             log.warning("could not read the verification code: %s", exc)
             _disconnect_fast(client)
@@ -299,7 +311,7 @@ class OtpCodeWaiter:
         self,
         since_epoch: float,
         *,
-        timeout_s: float = 150,
+        timeout_s: float = 170,
         poll_s: float = 2,
     ) -> None:
         self.since_epoch = since_epoch

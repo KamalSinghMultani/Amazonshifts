@@ -635,3 +635,16 @@ def test_send_code_starts_mailbox_wait_before_captcha_solving():
 
     source = inspect.getsource(relogin.AuthenticationStateMachine._request_otp)
     assert source.index("_start_otp_waiter") < source.index("OTP_REQUESTED")
+
+
+def test_mailbox_timeout_is_preserved_as_otp_timeout_state():
+    machine = relogin.AuthenticationStateMachine(FakePage(), relogin.MockCaptchaSolver())
+    machine.otp_requested_at = relogin.time.time()
+    machine.otp_waiter = type(
+        "Waiter",
+        (),
+        {"result": lambda _self, timeout_s=None: None, "cancel": lambda _self: None},
+    )()
+
+    assert machine._submit_otp() is False
+    assert machine.state is AuthState.OTP_TIMEOUT
