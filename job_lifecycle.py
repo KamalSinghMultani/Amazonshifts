@@ -1,11 +1,14 @@
 """Persistent known-job lifecycle monitoring.
 
-The public job search is still the discovery/fallback path.  This module watches
+The public job search is still the discovery/fallback path. This module watches
 already-known public job ids with Amazon's own getJobDetail query, then asks for
-their schedules only while the job is POSTED.  A schedule is emitted as a live
-candidate only when Amazon reports a strictly positive capacity.
+their schedules only while the job is POSTED. A schedule is emitted as a live
+candidate only when Amazon reports laborDemandHardMatchCount > 0.
 
-State and events intentionally contain public job/schedule facts only.  Request
+laborDemandAvailableCount is retained as metadata only; it is not the validity
+gate for lifecycle candidates.
+
+State and events intentionally contain public job/schedule facts only. Request
 headers, cookies, tokens and identity/KYC parameters never enter this module.
 """
 
@@ -123,8 +126,8 @@ def _stamp(value: datetime) -> str:
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _positive_capacity(value) -> int | float | None:
-    # bool is an int in Python but is not credible capacity evidence.
+def _positive_count(value) -> int | float | None:
+    # bool is an int in Python but is not credible count evidence.
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)) and value > 0:
@@ -133,7 +136,7 @@ def _positive_capacity(value) -> int | float | None:
 
 
 class LifecycleMonitor:
-    """Track transitions and return every currently capacity-confirmed candidate."""
+    """Track transitions and return every currently hard-match-valid candidate."""
 
     def __init__(
         self,
@@ -272,25 +275,40 @@ class LifecycleMonitor:
                 if not schedule.id:
                     continue
                 seen_this_poll.add(schedule.id)
-                capacity = _positive_capacity(schedule.available)
-                previous_capacity = prior_schedules.get(schedule.id, {}).get("capacity")
+
+                # The validity gate requested for CA schedules is strictly the
+                # hard-match count. Availability is recorded, but it does not
+                # decide whether the schedule becomes a hold candidate.
+                hard_match = _positive_count(schedule.hard_match)
+                previous_hard_match = prior_schedules.get(schedule.id, {}).get("hardMatchCount")
                 prior_schedules[schedule.id] = {
-                    "capacity": capacity if capacity is not None else schedule.available,
+                    "hardMatchCount": (
+                        hard_match if hard_match is not None else schedule.hard_match
+                    ),
+                    "availableCount": schedule.available,
                     "lastObservedAt": at,
                 }
-                if capacity is None:
+                if hard_match is None:
                     continue
-                if _positive_capacity(previous_capacity) is None:
+
+                # Keep the historical event name for compatibility with v7's
+                # notification flow, but the numeric signal is now hard-match
+                # count rather than laborDemandAvailableCount.
+                if _positive_count(previous_hard_match) is None:
                     self._event(
                         "SCHEDULE_CAPACITY_AVAILABLE", at=at, job=job,
-                        scheduleId=schedule.id, capacity=capacity,
+                        scheduleId=schedule.id, capacity=hard_match,
+                        hardMatchCount=hard_match,
+                        availableCount=schedule.available,
                         epoch=record.get("epoch"),
                     )
                     transition_events.append({
                         "event": "SCHEDULE_CAPACITY_AVAILABLE",
                         "job": job,
                         "schedule": schedule,
-                        "capacity": capacity,
+                        "capacity": hard_match,
+                        "hardMatchCount": hard_match,
+                        "availableCount": schedule.available,
                     })
 
                 raw = dict(schedule.raw or {})
@@ -298,7 +316,8 @@ class LifecycleMonitor:
                     "jobId": job_id,
                     "parentJobId": job_id,
                     "scheduleId": schedule.id,
-                    "laborDemandAvailableCount": capacity,
+                    "laborDemandAvailableCount": schedule.available,
+                    "laborDemandHardMatchCount": hard_match,
                     "lifecycleSource": "known_job",
                     "lifecycleEpoch": record.get("epoch") or at,
                     "postingStatus": "POSTED",
@@ -313,10 +332,14 @@ class LifecycleMonitor:
                     raw=raw,
                 ))
 
-            # Absence is explicit loss of schedule-level availability for our
-            # next rising-edge decision; it is never interpreted as capacity.
+            # Absence is explicit loss of schedule-level validity for our next
+            # rising-edge decision; it is never interpreted as a hard match.
             for schedule_id in set(prior_schedules) - seen_this_poll:
-                prior_schedules[schedule_id] = {"capacity": None, "lastObservedAt": at}
+                prior_schedules[schedule_id] = {
+                    "hardMatchCount": None,
+                    "availableCount": None,
+                    "lastObservedAt": at,
+                }
 
         self._save()
         return candidates, transition_events
