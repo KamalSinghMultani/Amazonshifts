@@ -330,7 +330,12 @@ def test_hard_match_rising_edge_inside_one_posted_window_is_recorded(monkeypatch
 
 def test_v7_merges_lifecycle_candidate_first_without_changing_hold_class(monkeypatch):
     instance = object.__new__(watcher_v7.LifecycleWatcher)
-    known = SimpleNamespace(id="SCH-KNOWN", raw={"scheduleId": "SCH-KNOWN", "jobId": "JOB-1"})
+    known = SimpleNamespace(id="SCH-KNOWN", raw={
+        "scheduleId": "SCH-KNOWN",
+        "jobId": "JOB-1",
+        "laborDemandHardMatchCount": 1,
+        "laborDemandAvailableCount": 0,
+    })
     public = SimpleNamespace(id="SCH-PUBLIC", raw={"scheduleId": "SCH-PUBLIC", "jobId": "JOB-2"})
     instance.lifecycle_candidates = [known]
     instance.matcher = SimpleNamespace(matches=lambda _shift: (True, "ok"))
