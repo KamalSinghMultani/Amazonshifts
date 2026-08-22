@@ -29,7 +29,9 @@ def _detail(job_id, status="POSTED"):
     }
 
 
-def _schedule(capacity=1, schedule_id="SCH-1"):
+def _schedule(capacity=1, schedule_id="SCH-1", *, available=None):
+    if available is None:
+        available = capacity
     return schedules.Schedule({
         "jobId": "JOB-1",
         "scheduleId": schedule_id,
@@ -40,7 +42,8 @@ def _schedule(capacity=1, schedule_id="SCH-1"):
         "scheduleText": "Sun, Mon, Tue, Wed 3:00 PM - 8:30 PM",
         "hoursPerWeek": 22,
         "totalPayRate": 25.60,
-        "laborDemandAvailableCount": capacity,
+        "laborDemandAvailableCount": available,
+        "laborDemandHardMatchCount": capacity,
     })
 
 
@@ -241,7 +244,7 @@ def test_lifecycle_success_after_failure_logs_restored_once(caplog):
     assert instance.lifecycle_backoff_until == 0.0
 
 
-def test_only_posted_plus_strict_positive_capacity_emits_candidate(monkeypatch, tmp_path):
+def test_only_posted_plus_strict_positive_hard_match_emits_candidate(monkeypatch, tmp_path):
     monitor = job_lifecycle.LifecycleMonitor(
         _known(), state_path=tmp_path / "state.json", events_path=tmp_path / "events.jsonl"
     )
@@ -253,14 +256,21 @@ def test_only_posted_plus_strict_positive_capacity_emits_candidate(monkeypatch, 
     )
     monkeypatch.setattr(
         job_lifecycle.schedule_batch, "fetch",
-        lambda *_a, **_k: {"JOB-1": [_schedule(0, "ZERO"), _schedule(None, "UNKNOWN"), _schedule(2, "OPEN")]},
+        lambda *_a, **_k: {
+            "JOB-1": [
+                _schedule(0, "ZERO", available=9),
+                _schedule(None, "UNKNOWN", available=10),
+                _schedule(2, "OPEN", available=0),
+            ]
+        },
     )
 
     candidates, events = monitor.poll(object())
     assert monitor.last_observed_jobs == 2
     assert [candidate.id for candidate in candidates] == ["OPEN"]
     assert candidates[0].raw["postingStatus"] == "POSTED"
-    assert candidates[0].raw["laborDemandAvailableCount"] == 2
+    assert candidates[0].raw["laborDemandAvailableCount"] == 0
+    assert candidates[0].raw["laborDemandHardMatchCount"] == 2
     assert {event["event"] for event in events} == {"JOB_POSTED", "SCHEDULE_CAPACITY_AVAILABLE"}
 
 
@@ -298,19 +308,21 @@ def test_same_pair_rearms_after_posted_unposted_posted_transition(monkeypatch, t
     assert "tracking" not in (tmp_path / "events.jsonl").read_text("utf-8").lower()
 
 
-def test_capacity_rising_edge_inside_one_posted_window_is_recorded(monkeypatch, tmp_path):
+def test_hard_match_rising_edge_inside_one_posted_window_is_recorded(monkeypatch, tmp_path):
     monitor = job_lifecycle.LifecycleMonitor(
         [_known()[0]], state_path=tmp_path / "state.json", events_path=tmp_path / "events.jsonl"
     )
-    capacities = iter([0, 3, 3])
+    hard_matches = iter([0, 3, 3])
     monkeypatch.setattr(job_lifecycle, "fetch", lambda *_a, **_k: {"JOB-1": _detail("JOB-1")})
     monkeypatch.setattr(
         job_lifecycle.schedule_batch, "fetch",
-        lambda *_a, **_k: {"JOB-1": [_schedule(next(capacities))]},
+        lambda *_a, **_k: {"JOB-1": [_schedule(next(hard_matches), available=0)]},
     )
     assert monitor.poll(object())[0] == []
     candidates, events = monitor.poll(object())
     assert candidates[0].id == "SCH-1"
+    assert candidates[0].raw["laborDemandAvailableCount"] == 0
+    assert candidates[0].raw["laborDemandHardMatchCount"] == 3
     assert [event["event"] for event in events] == ["SCHEDULE_CAPACITY_AVAILABLE"]
     _, events = monitor.poll(object())
     assert events == []
