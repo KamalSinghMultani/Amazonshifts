@@ -138,6 +138,19 @@ HOLD_STEPS: list[HoldStep] = [
 # matching a stray Apply button elsewhere on the page.
 SCHEDULE_FLYOUT = "[data-test-id='scheduleSelectorPanelFlyout']"
 
+# CONFIRMED live on the Canada site, 2026-08-21: Amazon can leave the primary
+# Select schedule button rendered and clickable while this warning is visible:
+# "This job is not available for application now." Clicking the apparently
+# usable button then opens a real flyout containing "0 schedules found". Those
+# are authoritative terminal states, not actionability failures, and must be
+# classified before a generic 10-second click/apply timeout obscures the cause.
+UNPOSTED_JOB_WARNING = "[data-test-id='UnPostedJobWarningBanner']"
+UNPOSTED_JOB_TEXT = "this job is not available for application now"
+EMPTY_SCHEDULE_TEXTS = (
+    "0 schedules found",
+    "no schedules that match your filter choices",
+)
+
 # Marks a job detail page. Used to tell "we are on the results list" from
 # "we already navigated straight to the job", which matters because api mode
 # jumps directly to the detail URL and there are no cards there to click.
@@ -515,20 +528,69 @@ def find_matching_card(page: Any, shift: Shift):
 #
 # Order matters: consent first, since its backdrop covers everything else.
 MODAL_BACKDROP = "[data-test-component='StencilModalBackdrop']"
+CONSENT_MODAL = "[data-test-id='consentModal']"
+CONSENT_BUTTON = "[data-test-id='consentBtn']"
 
 OVERLAY_DISMISSERS: list[tuple[str, str]] = [
-    ("cookie consent", "[data-test-id='consentBtn']"),
+    ("cookie consent", CONSENT_BUTTON),
     ("banner", "[data-test-component='MessageBannerDismissButton']"),
     ("guided search", "[aria-label='Close guided search']"),
 ]
 
 
-def _backdrop_visible(page: Any) -> bool:
+def _selector_visible(page: Any, selector: str) -> bool:
     try:
-        backdrop = page.locator(MODAL_BACKDROP)
-        return backdrop.count() > 0 and backdrop.first.is_visible()
+        item = page.locator(selector).first
+        return item.count() > 0 and item.is_visible()
     except Exception:  # noqa: BLE001
         return False
+
+
+def blocking_overlay_visible(page: Any) -> bool:
+    """Whether a modal is currently able to block application controls.
+
+    Amazon can mount the consent modal and its backdrop in separate React
+    turns. Checking both matters: in the live failure the page looked clear in
+    the screenshot while the transparent Stencil backdrop still intercepted
+    pointer events.
+    """
+    return _selector_visible(page, MODAL_BACKDROP) or _selector_visible(page, CONSENT_MODAL)
+
+
+def _backdrop_visible(page: Any) -> bool:
+    """Backward-compatible private name used by older callers/tests."""
+    return blocking_overlay_visible(page)
+
+
+def _overlay_control_enabled(item: Any) -> bool:
+    try:
+        return bool(item.is_enabled())
+    except AttributeError:
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _press_overlay_control(item: Any, *, timeout_ms: int) -> str:
+    """Activate a visible overlay control with ordinary browser input.
+
+    Pointer click remains first choice. A keyboard Enter fallback handles the
+    observed Amazon layering race where the modal's own transparent backdrop
+    temporarily sits above its consent button. This is a normal user input,
+    not a forced/JavaScript click.
+    """
+    try:
+        item.click(timeout=timeout_ms)
+        return "pointer"
+    except Exception as pointer_error:  # noqa: BLE001
+        if not item.is_visible() or not _overlay_control_enabled(item):
+            raise pointer_error
+        try:
+            item.press("Enter", timeout=timeout_ms)
+            return "keyboard"
+        except TypeError:
+            item.press("Enter")
+            return "keyboard"
 
 
 def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list[str]:
@@ -553,7 +615,7 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
     # was accepted once in save_session.py and persists in the profile — and
     # the hold is the one place where a wasted half-second is a lost shift.
     try:
-        if not _backdrop_visible(page):
+        if not blocking_overlay_visible(page):
             if not any(
                 page.locator(selector).first.count()
                 and page.locator(selector).first.is_visible()
@@ -563,6 +625,7 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
     except Exception as exc:  # noqa: BLE001 - fall through to the full sweep
         log.debug("overlay fast path failed: %s", exc)
 
+    escape_attempted = False
     for _ in range(rounds):
         acted = False
         for label, selector in OVERLAY_DISMISSERS:
@@ -570,27 +633,46 @@ def dismiss_overlays(page: Any, timeout_ms: int = 3000, rounds: int = 4) -> list
                 item = page.locator(selector).first
                 if item.count() == 0 or not item.is_visible():
                     continue
-                item.click(timeout=timeout_ms)
-                dismissed.append(label)
+                method = _press_overlay_control(item, timeout_ms=timeout_ms)
+                dismissed.append(label if method == "pointer" else f"{label} (keyboard)")
                 acted = True
-                page.wait_for_timeout(250)
+                page.wait_for_timeout(50)
             except Exception as exc:  # noqa: BLE001 - absence is the normal case
                 log.debug("could not dismiss %s: %s", label, exc)
 
-        if not _backdrop_visible(page):
+        if not blocking_overlay_visible(page):
             break
 
         if not acted:
-            # Something is covering the page that we have no button for.
+            # The consent modal and button can arrive in separate React turns.
+            # Do not give up (or press Escape) while that known control is still
+            # mounting; the caller will also retry if it outlives this sweep.
+            try:
+                consent_present = (
+                    page.locator(CONSENT_MODAL).first.count() > 0
+                    or page.locator(CONSENT_BUTTON).first.count() > 0
+                )
+            except Exception:  # noqa: BLE001
+                consent_present = False
+            if consent_present:
+                page.wait_for_timeout(50)
+                continue
+
+            # Something unknown is covering the page. Escape is ordinary
+            # browser input and remains a bounded fallback for dismissible UI.
+            if escape_attempted:
+                page.wait_for_timeout(50)
+                continue
             try:
                 page.keyboard.press("Escape")
                 dismissed.append("escape")
-                page.wait_for_timeout(250)
+                escape_attempted = True
+                page.wait_for_timeout(50)
             except Exception as exc:  # noqa: BLE001
                 log.debug("escape failed: %s", exc)
-            if _backdrop_visible(page):
-                log.warning("a modal is still covering the page after Escape")
-                break
+
+    if blocking_overlay_visible(page):
+        log.warning("a modal is still covering the page after bounded dismissal attempts")
 
     if dismissed:
         log.info("dismissed overlays: %s", ", ".join(dismissed))
@@ -636,10 +718,11 @@ def _hold_confirmation(page: Any, timeout_ms: int = 10000) -> str:
 CONFIRMED = "confirmed"
 FAILED = "failed"
 UNCERTAIN = "uncertain"
+IDENTITY_VERIFICATION_REQUIRED = "identity_verification_required"
 
 
 class HoldResult:
-    """What happened, in three states rather than two.
+    """What happened, including uncertainty and required identity verification.
 
     The middle state is the point. "Pressed Create Application but never saw
     the holding banner" is neither success nor failure: the application may
@@ -682,7 +765,7 @@ class HoldResult:
     @property
     def needs_you(self):
         """Should this interrupt the human right now?"""
-        return self.status in (FAILED, UNCERTAIN)
+        return self.status in (FAILED, UNCERTAIN, IDENTITY_VERIFICATION_REQUIRED)
 
     def timing_summary(self):
         return ", ".join("{} {:.0f}ms".format(label, ms) for label, ms in self.timings)
@@ -710,19 +793,6 @@ def hold_at_application(
     project (the flyout, and following the popup) stop being on the critical
     path at all.
     """
-    # TEMP DIAGNOSTIC: log every POST request during this hold.
-    # Remove after capturing the Create Application mutation.
-    def _log_hold_request(request):
-        if request.method == "POST":
-            log.info(
-                "HOLD POST: url=%s\nheaders=%s\nbody=%s",
-                request.url,
-                dict(request.headers),
-                request.post_data,
-            )
-
-    page.on("request", _log_hold_request)
-
     began = time.perf_counter()
     timings: list[tuple[str, float]] = []
 
@@ -817,6 +887,33 @@ def schedule_card_texts(page: Any) -> list[str]:
         return []
 
 
+def job_detail_unavailable(page: Any) -> bool:
+    """Whether the detail page explicitly says the posting cannot be applied to."""
+    try:
+        warning = page.locator(UNPOSTED_JOB_WARNING).first
+        if warning.count() > 0 and warning.is_visible():
+            return True
+    except Exception:
+        pass
+    try:
+        text = " ".join((page.inner_text("body") or "").lower().split())
+        return UNPOSTED_JOB_TEXT in text
+    except Exception:
+        return False
+
+
+def schedule_flyout_empty(page: Any) -> bool:
+    """Whether Amazon rendered its schedule panel with an explicit zero result."""
+    try:
+        flyout = page.locator(SCHEDULE_FLYOUT).first
+        if flyout.count() == 0 or not flyout.is_visible():
+            return False
+        text = " ".join((flyout.inner_text() or "").lower().split())
+        return any(marker in text for marker in EMPTY_SCHEDULE_TEXTS)
+    except Exception:
+        return False
+
+
 def hold_shift(
     page: Any,
     shift: Shift,
@@ -882,12 +979,39 @@ def hold_shift(
     context = getattr(page, "context", None)
 
     for step_number, step in enumerate(steps):
+        if step.label == "select schedule" and job_detail_unavailable(page):
+            mark("job explicitly unavailable")
+            return HoldResult(
+                FAILED,
+                "job is explicitly unavailable before schedule selection; "
+                "Amazon left the Select schedule control rendered, but no application can be started",
+                url=getattr(page, "url", "") or "",
+                timings=timings,
+            )
+
         # Snapshot before the click, never after: the tab can exist before
         # control comes back to us, and a listener armed afterwards misses it.
         known_pages = set(context.pages) if (context and step.opens_popup) else set()
         step_started = time.perf_counter()
         try:
             if step.label == "pick a shift":
+                # Wait only for the panel that the preceding normal click is
+                # expected to mount, then classify Amazon's explicit empty
+                # state before waiting for a nonexistent Apply button.
+                try:
+                    page.locator(SCHEDULE_FLYOUT).first.wait_for(
+                        state="visible", timeout=min(timeout_ms, 1000)
+                    )
+                except Exception:
+                    pass
+                if schedule_flyout_empty(page):
+                    mark("schedule flyout explicitly empty")
+                    return HoldResult(
+                        FAILED,
+                        "job detail opened an explicit 0-schedules panel; no shift is selectable",
+                        url=getattr(page, "url", "") or "",
+                        timings=timings,
+                    )
                 # Which Apply button, not just the first one. A job can offer
                 # several schedules and the render order is an accident — see
                 # schedules.rank_cards. schedule_index selects among them, so a

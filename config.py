@@ -111,16 +111,29 @@ DEFAULTS: dict[str, Any] = {
         "stop_before_submit": True,
         "max_per_poll": 1,
         "direct_apply": False,
+        # Keep the application frontend loaded on a dedicated page so a match
+        # does not pay the full cold-start cost of its React bundles.
+        "prewarm_application": True,
+        # Cold prewarm is outside the reservation race. Give Amazon's React
+        # shell time to mount late cookie/banner overlays, then dismiss them
+        # with ordinary browser actions so the first hold does not pay for it.
+        "prewarm_overlay_settle_ms": 4500,
+        # The original job-detail click path can add tens of seconds after a
+        # direct attempt has already failed. Keep it available for diagnostics,
+        # but never use it on the latency-first production path by default.
+        "compatibility_fallback": False,
         # A slot is often gone between the flyout rendering and Apply landing.
         # Try the next schedule on the same job rather than abandoning the job.
         "schedule_attempts": 3,
         # ...and if every schedule on that job is gone, try the next-ranked
-        # job. Losing Brampton to a faster service should cost you Brampton,
-        # not the whole batch.
+        # job. Losing Brampton to a faster service should cost that job, not the whole batch.
         "job_attempts": 3,
         # ...but not forever: a posting lasts about a minute, and time spent
         # retrying a dead job is time not spent on the next one.
         "attempt_budget_seconds": 45,
+        # Explicit opt-in for the two identity-consent boxes and launcher on
+        # already-verified accounts. Real remoteKYC controls stay manual.
+        "auto_accept_identity_consent_and_start": False,
     },
     # Empty means "any schedule will do". Populate to constrain which one gets
     # taken: available_days, min_hours_per_week, avoid_overnight.
@@ -155,6 +168,15 @@ DEFAULTS: dict[str, Any] = {
         "ttl_hours": 72,
         # Append-only log of every detection, read back by --drop-report.
         "detections_path": "state/detections.jsonl",
+    },
+    "lifecycle_monitor": {
+        "enabled": False,
+        "interval_seconds": 2.0,
+        "notify_unposted": True,
+        "notify_posted_without_capacity": True,
+        "state_path": "state/job_lifecycle.json",
+        "events_path": "state/job_lifecycle_events.jsonl",
+        "known_jobs": [],
     },
     "logging": {
         "level": "INFO",
@@ -274,49 +296,62 @@ def validate_config(cfg: dict) -> None:
         raise ValueError(f"polling.mode must be 'dom' or 'api', got {mode!r}")
 
     polling = cfg["polling"]
-    # Mode-aware, because a poll means two completely different things. In api
-    # mode it is one small JSON request — measured clean at 2s intervals. In
-    # dom mode it is a full page load with every asset, and 14s between those
-    # already earned a CloudFront 403.
-    floor = 2 if mode == "api" else 20
-    if polling["interval_seconds"] < floor:
-        raise ValueError(
-            f"polling.interval_seconds below {floor} in {mode} mode risks a "
-            "block, and a blocked watcher finds nothing at all"
-        )
+    interval = float(polling["interval_seconds"])
+    hot = float(polling["hot_interval_seconds"])
 
-    if mode == "dom" and polling["interval_seconds"] < 30:
+    # A DOM poll is a full page load; keep the existing hard protection there.
+    # API mode is a much smaller request. The shipped 1.25s/0.65s cadence is an
+    # explicit experimental choice, so permit it but keep an absolute floor and
+    # warn below the previously measured-clean 2s cadence. The normal circuit
+    # breaker still handles 403/429/network failures by backing off.
+    if mode == "dom":
+        if interval < 20:
+            raise ValueError(
+                "polling.interval_seconds below 20 in dom mode risks a block, "
+                "and a blocked watcher finds nothing at all"
+            )
+        if hot < 20:
+            raise ValueError(
+                "polling.hot_interval_seconds below 20 in dom mode risks repeated "
+                "full-page loads and a block"
+            )
+    else:
+        if interval < 0.5:
+            raise ValueError(
+                "polling.interval_seconds below 0.5 in api mode is too aggressive"
+            )
+        if hot < 0.5:
+            raise ValueError(
+                "polling.hot_interval_seconds below 0.5 in api mode is too aggressive"
+            )
+        if interval < 2:
+            log.warning(
+                "polling.interval_seconds=%s is below the previously measured-clean "
+                "2s API cadence; this is experimental. Watch for 403/429/circuit-"
+                "breaker events and back off if they appear.",
+                interval,
+            )
+        if hot < 2:
+            log.warning(
+                "polling.hot_interval_seconds=%s is below the previously measured-clean "
+                "2s API cadence; this is experimental. Watch for 403/429/circuit-"
+                "breaker events and back off if they appear.",
+                hot,
+            )
+
+    if mode == "dom" and interval < 30:
         # dom polls are full page loads. Measured: a 403 at ~14s apart.
         log.warning(
             "polling.interval_seconds=%s is risky in dom mode — a CloudFront "
             "403 was observed at ~14s between page loads. 45 is the tested "
             "value; the faster settings are for api mode.",
-            polling["interval_seconds"],
+            interval,
         )
 
-    hot = polling["hot_interval_seconds"]
-    if hot < 2:
-        # 2s was measured clean against the live CA endpoint (20 consecutive
-        # polls, no 429, no 403). Below that is guesswork, and a block finds
-        # nothing at all.
-        raise ValueError(
-            "polling.hot_interval_seconds below 2 is past what has been "
-            "measured safe and risks a block, which finds nothing at all"
-        )
-    if hot > polling["interval_seconds"]:
+    if hot > interval:
         raise ValueError(
             "polling.hot_interval_seconds must be <= interval_seconds — "
             "hot mode is the fast cadence, not the slow one"
-        )
-    if mode == "dom" and hot < 20:
-        # Measured, not guessed: three full page loads ~14s apart earned a
-        # CloudFront 403. A blocked watcher finds nothing at all, which loses
-        # more shifts than a slower poll ever will.
-        log.warning(
-            "polling.hot_interval_seconds=%s in dom mode risks a CloudFront "
-            "block (a 403 was observed at ~14s between page loads). Configure "
-            "api mode before polling this fast.",
-            hot,
         )
     if hot * 1000 < polling.get("render_wait_ms", 0) and mode == "dom":
         log.warning(
@@ -364,6 +399,23 @@ def validate_config(cfg: dict) -> None:
             raise ValueError("polling.mode is 'api' but api.field_map is empty")
         if str(api.get("method", "POST")).upper() not in ("GET", "POST"):
             raise ValueError("api.method must be GET or POST")
+
+    lifecycle = cfg.get("lifecycle_monitor") or {}
+    if lifecycle.get("enabled"):
+        if mode != "api":
+            raise ValueError("lifecycle_monitor requires polling.mode: api")
+        if float(lifecycle.get("interval_seconds", 2.0)) < 1.0:
+            raise ValueError("lifecycle_monitor.interval_seconds below 1.0 is too aggressive")
+        known = lifecycle.get("known_jobs") or []
+        if not isinstance(known, list) or not known:
+            raise ValueError("enabled lifecycle_monitor requires known_jobs")
+        ids = []
+        for item in known:
+            if not isinstance(item, dict) or not str(item.get("job_id") or "").strip():
+                raise ValueError("each lifecycle_monitor known job requires job_id")
+            ids.append(str(item["job_id"]).strip())
+        if len(ids) != len(set(ids)):
+            raise ValueError("lifecycle_monitor known job ids must be unique")
 
     if not cfg["dry_run"] and cfg["hold"]["enabled"] and not cfg["hold"]["stop_before_submit"]:
         # Precise, because the difference matters: it creates an application

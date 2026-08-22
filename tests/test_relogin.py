@@ -473,3 +473,144 @@ def test_a_captcha_state_routes_to_the_solver():
 
     source = inspect.getsource(module.AuthenticationStateMachine._transition_to_next)
     assert "CAPTCHA_REQUIRED" in source and "_solve_captcha" in source
+
+
+def test_missing_country_selector_is_immediate_and_non_blocking(caplog):
+    page = FakePage()
+    machine = relogin.AuthenticationStateMachine(page, relogin.MockCaptchaSolver())
+
+    with caplog.at_level("WARNING"):
+        assert machine._select_country("Canada") is True
+
+    assert page.clicked == []
+    assert "country selector" not in caplog.text.lower()
+
+
+def test_full_auth_sequence_is_state_driven_while_url_stays_on_login(monkeypatch):
+    page = FakePage(url="https://auth.hiring.amazon.com/#/login")
+    page.goto = lambda url, **_kw: setattr(page, "url", url)
+    page.wait_for_timeout = lambda _ms: None
+    machine = relogin.AuthenticationStateMachine(page, relogin.MockCaptchaSolver())
+    machine._wait_for_state = lambda *_args, **_kwargs: True
+    machine._dismiss_consent = lambda: None
+
+    states = iter([
+        AuthState.EMAIL_REQUIRED,
+        AuthState.PIN_REQUIRED,
+        AuthState.OTP_SEND_REQUIRED,
+        AuthState.CAPTCHA_REQUIRED,
+        AuthState.OTP_ENTRY_REQUIRED,
+        AuthState.AUTHENTICATED,
+    ])
+    machine.detector.detect_state = lambda: next(states)
+    transitions = []
+    machine._transition_to_next = lambda: transitions.append(machine.state) or True
+
+    assert machine.run("https://hiring.amazon.ca") is AuthState.AUTHENTICATED
+    assert transitions == [
+        AuthState.EMAIL_REQUIRED,
+        AuthState.PIN_REQUIRED,
+        AuthState.OTP_SEND_REQUIRED,
+        AuthState.CAPTCHA_REQUIRED,
+        AuthState.OTP_ENTRY_REQUIRED,
+    ]
+
+
+def test_captcha_confirm_after_send_waits_for_otp_without_sending_again(monkeypatch):
+    class Solver:
+        def solve(self, *_args, **_kwargs):
+            return True
+
+    page = FakePage()
+    machine = relogin.AuthenticationStateMachine(page, Solver())
+    machine.otp_requested_at = 123.0
+    expected = []
+    machine._wait_for_state = (
+        lambda states, **_kwargs: expected.extend(states) or True
+    )
+
+    assert machine._solve_captcha() is True
+    assert AuthState.OTP_ENTRY_REQUIRED in expected
+    assert AuthState.OTP_SEND_REQUIRED not in expected
+
+
+class ConfirmedOtpPage:
+    """Verify -> accepted Continue -> brief auth-return -> Canadian app."""
+
+    def __init__(self):
+        self.phase = "otp"
+        self.url = "https://auth.hiring.amazon.com/#/login"
+        self.clicked = []
+
+    def inner_text(self, _selector):
+        if self.phase == "otp":
+            return "A verification code has been sent. Enter the verification code."
+        if self.phase == "accepted":
+            return "Verification successful"
+        if self.phase == "authenticated":
+            return "My account Sign out"
+        return ""
+
+    def wait_for_timeout(self, _ms):
+        if self.phase == "auth_return":
+            self.phase = "authenticated"
+            self.url = "https://hiring.amazon.ca/application/ca/#/consent"
+
+    def locator(self, selector):
+        page = self
+
+        class L:
+            @property
+            def first(self):
+                return self
+
+            def _present(self):
+                if "verifyAccount" in selector or "has-text('Verify')" in selector:
+                    return page.phase == "otp"
+                if "has-text('Continue')" in selector:
+                    return page.phase == "accepted"
+                if "confirmOtp" in selector:
+                    return page.phase == "otp"
+                return False
+
+            def count(self):
+                return int(self._present())
+
+            def is_visible(self):
+                return self._present()
+
+            def is_enabled(self):
+                return self._present()
+
+            def wait_for(self, **_kw):
+                if not self._present():
+                    raise RuntimeError("not visible")
+
+            def click(self, **_kw):
+                if "verifyAccount" in selector or "has-text('Verify')" in selector:
+                    page.clicked.append("Verify")
+                    page.phase = "accepted"
+                elif "has-text('Continue')" in selector:
+                    page.clicked.append("Continue")
+                    page.phase = "auth_return"
+                    page.url = "https://hiring.amazon.ca/app#/auth-return"
+
+            def fill(self, _value):
+                pass
+
+        return L()
+
+
+def test_otp_clicks_verify_then_one_continue_and_tolerates_auth_return(monkeypatch):
+    import login_flow
+
+    page = ConfirmedOtpPage()
+    machine = relogin.AuthenticationStateMachine(page, relogin.MockCaptchaSolver())
+    machine.otp_requested_at = 100.0
+    monkeypatch.setattr(relogin.otp_mail, "fetch_code", lambda _since: "123456")
+    monkeypatch.setattr(login_flow, "enter_code", lambda _page, _code: True)
+
+    assert machine._submit_otp() is True
+    assert page.clicked == ["Verify", "Continue"]
+    assert page.url == "https://hiring.amazon.ca/application/ca/#/consent"
+    assert machine.state is AuthState.AUTHENTICATED

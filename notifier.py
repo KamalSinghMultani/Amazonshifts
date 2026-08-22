@@ -128,6 +128,17 @@ class TelegramNotifier:
             bits.append(f"💵 ${shift.pay_rate:.2f}/hr")
         return chr(10).join(bits)
 
+    @staticmethod
+    def _shift_url(shift) -> str:
+        raw = getattr(shift, "raw", None) or {}
+        return str(getattr(shift, "url", None) or raw.get("manualUrl") or "")
+
+    @staticmethod
+    def _link(url: str, label: str = "Open this application") -> str:
+        if not url:
+            return ""
+        return f'<a href="{html.escape(str(url), quote=True)}">{html.escape(label)}</a>'
+
     def notify_shift(self, shift, dry_run: bool = True) -> bool:
         """The alert that matters. Sent as early as possible — before any page
         load or click — so the user hears about it at the same moment the bot
@@ -143,8 +154,9 @@ class TelegramNotifier:
             lines.append(f"🕒 {esc(shift.schedule)}")
         if shift.pay_rate is not None:
             lines.append(f"💵 ${shift.pay_rate:.2f}/hr")
-        if shift.url:
-            lines.append(f'\n<a href="{esc(shift.url)}">Open listing</a>')
+        link = self._link(self._shift_url(shift), "Open this shift")
+        if link:
+            lines.append(f"\n{link}")
         lines.append(
             "\n<i>dry run — no clicks made</i>"
             if dry_run
@@ -185,7 +197,68 @@ class TelegramNotifier:
         lines.append(tail)
         if detail:
             lines.append(f"\n<pre>{html.escape(detail[:500])}</pre>")
+        link = self._link(self._shift_url(shift), "Open held application")
+        if link:
+            lines.append(f"\n{link}")
         return self.send_text("\n".join(lines))
+
+    def notify_identity_verification(self, shift, manual_url: str, detail: str = "") -> bool:
+        """Urgent manual handoff with a clickable, non-tracking Amazon URL."""
+        lines = [
+            "🚨 <b>IDENTITY VERIFICATION REQUIRED</b>",
+            self.describe(shift),
+            "Amazon stopped at the identity check. Open it now and complete it manually.",
+        ]
+        if manual_url:
+            lines.append(
+                f'\n<a href="{html.escape(manual_url, quote=True)}">'
+                "Open Amazon identity verification</a>"
+            )
+        if detail:
+            lines.append(f"\n<i>{html.escape(detail[:500])}</i>")
+        lines.append(
+            "\nThe watcher will not accept consent, capture a selfie, upload ID, or submit KYC."
+        )
+        return self.send_text("\n".join(lines))
+
+    def notify_hold_attention(
+        self, shift, heading: str, message: str, manual_url: str = ""
+    ) -> bool:
+        """Failed/uncertain/session-gated hold alert with an explicit safe link."""
+        lines = [heading, self.describe(shift), html.escape(message[:700])]
+        link = self._link(manual_url or self._shift_url(shift), "Open this application")
+        if link:
+            lines.append(f"\n{link}")
+        return self.send_text("\n".join(lines))
+
+    def notify_job_unposted(
+        self, job, duration_seconds: float | None = None, manual_url: str = ""
+    ) -> bool:
+        """Record the end of a short POSTED window without implying a hold."""
+        duration = (
+            "unknown duration" if duration_seconds is None
+            else f"observed POSTED for {duration_seconds:.1f}s"
+        )
+        text = (
+            "⚫ <b>Known Amazon job became UNPOSTED</b>\n"
+            f"{html.escape(job.site_code or job.job_id)} — "
+            f"{html.escape(job.location or 'location unknown')}\n"
+            f"<i>{html.escape(duration)}</i>"
+        )
+        link = self._link(manual_url, "Open Amazon job")
+        return self.send_text(text + (f"\n\n{link}" if link else ""))
+
+    def notify_job_posted_without_capacity(self, job, manual_url: str = "") -> bool:
+        """Early lifecycle signal; explicitly not a reservable-shift claim."""
+        text = (
+            "🟡 <b>Known Amazon job became POSTED</b>\n"
+            f"{html.escape(job.site_code or job.job_id)} — "
+            f"{html.escape(job.location or 'location unknown')}\n"
+            "<i>No exact schedule with positive capacity is confirmed yet. "
+            "Alert only; no hold was attempted.</i>"
+        )
+        link = self._link(manual_url, "Open Amazon job")
+        return self.send_text(text + (f"\n\n{link}" if link else ""))
 
     def notify_error(self, message: str) -> bool:
         return self.send_text(f"⚠️ <b>Watcher error</b>\n<pre>{html.escape(message[:600])}</pre>")

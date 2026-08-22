@@ -1,0 +1,258 @@
+"""Known-job lifecycle detection attached to the proven v6 hold pipeline.
+
+Both public schedule expansion and the known-job lifecycle path use the same
+CA validity rule: laborDemandHardMatchCount must be strictly positive.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+
+import job_lifecycle
+import schedules as schedules_mod
+import watcher as base
+import watcher_v6
+
+log = logging.getLogger("watcher")
+
+
+class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
+    def __init__(self, cfg: dict, live_override: bool = False) -> None:
+        super().__init__(cfg, live_override=live_override)
+        lifecycle = cfg.get("lifecycle_monitor") or {}
+        self.lifecycle_enabled = bool(
+            lifecycle.get("enabled", False)
+            and lifecycle.get("known_jobs")
+            and self.mode == "api"
+        )
+        self.lifecycle_interval = float(lifecycle.get("interval_seconds", 2.0))
+        self.lifecycle_jobs_per_poll = max(1, int(lifecycle.get("jobs_per_poll", 1)))
+        self.lifecycle_health_log_interval = max(
+            0.0, float(lifecycle.get("health_log_interval_seconds", 60.0))
+        )
+        self.lifecycle_next_poll = 0.0
+        # Public search and known-job detail share Amazon's catalog edge. Do
+        # not send both requests in one visible watcher poll: live evidence
+        # showed that the former arrangement reached a repeatable HTTP 403
+        # immediately after poll 38 (roughly 76 aggregate requests). Healthy
+        # cycles alternate sources, preserving one upstream request per loop.
+        self.lifecycle_request_turn = True
+        self.lifecycle_next_health_log = 0.0
+        self.lifecycle_candidates = []
+        self.lifecycle_failures = 0
+        self.lifecycle_backoff_until = 0.0
+        self.lifecycle_ever_succeeded = False
+        self.lifecycle_recovery_pending = False
+        self.lifecycle_last_success_at = None
+        self.lifecycle_last_poll_ms = None
+        self.lifecycle_notify_unposted = bool(lifecycle.get("notify_unposted", True))
+        self.lifecycle_notify_unconfirmed_posted = bool(
+            lifecycle.get("notify_posted_without_capacity", True)
+        )
+        self.lifecycle_monitor = job_lifecycle.LifecycleMonitor(
+            lifecycle.get("known_jobs") or [],
+            state_path=lifecycle.get("state_path", "state/job_lifecycle.json"),
+            events_path=lifecycle.get("events_path", "state/job_lifecycle_events.jsonl"),
+        ) if self.lifecycle_enabled else None
+        if self.lifecycle_enabled:
+            log.info(
+                "known-job lifecycle detector armed for %d job id(s); alternating "
+                "with public search at one upstream request per %.2fs watcher cycle",
+                len(self.lifecycle_monitor.known_jobs),
+                float(self.cfg["polling"]["interval_seconds"]),
+            )
+
+    def _record_lifecycle_success(self, completed_at: float, duration_ms: float) -> None:
+        """Publish sparse proof that the otherwise-silent detector is alive."""
+        recovered = self.lifecycle_recovery_pending
+        self.lifecycle_failures = 0
+        self.lifecycle_backoff_until = 0.0
+        self.lifecycle_recovery_pending = False
+        self.lifecycle_last_success_at = completed_at
+        self.lifecycle_last_poll_ms = duration_ms
+
+        observed = self.lifecycle_monitor.last_observed_jobs
+        attempted = self.lifecycle_monitor.last_attempted_jobs
+        configured = len(self.lifecycle_monitor.known_jobs)
+        if not self.lifecycle_ever_succeeded:
+            self.lifecycle_ever_succeeded = True
+            log.info(
+                "known-job lifecycle poll succeeded: %d/%d sampled job id(s) observed (%d configured)",
+                observed, attempted, configured,
+            )
+            self.lifecycle_next_health_log = completed_at + self.lifecycle_health_log_interval
+            return
+
+        if recovered:
+            log.info(
+                "LIFECYCLE RESTORED: %d/%d known job IDs responding; latest pass completed in %.0fms",
+                observed, attempted, duration_ms,
+            )
+            self.lifecycle_next_health_log = completed_at + self.lifecycle_health_log_interval
+            return
+
+        if (
+            self.lifecycle_health_log_interval > 0
+            and completed_at >= self.lifecycle_next_health_log
+        ):
+            log.info(
+                "LIFECYCLE HEALTHY: %d/%d known job IDs checked; latest pass completed in %.0fms",
+                observed, attempted, duration_ms,
+            )
+            self.lifecycle_next_health_log = completed_at + self.lifecycle_health_log_interval
+
+    def _lifecycle_tick(self) -> bool:
+        """Run a due lifecycle request and report whether one was attempted."""
+        if not self.lifecycle_enabled or self.lifecycle_monitor is None or self.api_client is None:
+            return False
+        now = time.monotonic()
+        if now < self.lifecycle_next_poll or now < self.lifecycle_backoff_until:
+            return False
+        self.lifecycle_next_poll = now + self.lifecycle_interval
+        try:
+            candidates, events = self.lifecycle_monitor.poll(
+                self.api_client,
+                max_jobs=self.lifecycle_jobs_per_poll,
+            )
+            for candidate in candidates:
+                raw = candidate.raw or {}
+                candidate.url = schedules_mod.application_url(
+                    self.cfg["site"]["base_url"],
+                    str(raw.get("jobId") or raw.get("parentJobId")),
+                    str(raw.get("scheduleId")),
+                )
+            self.lifecycle_candidates = candidates
+            completed_at = time.monotonic()
+            self._record_lifecycle_success(completed_at, (completed_at - now) * 1000)
+            valid_jobs = {
+                event["job"].job_id
+                for event in events
+                if event.get("event") == "SCHEDULE_CAPACITY_AVAILABLE"
+            }
+            for event in events:
+                kind = event.get("event")
+                job = event.get("job")
+                if kind == "JOB_POSTED":
+                    log.info("LIFECYCLE POSTED: %s %s", job.site_code, job.job_id)
+                    if (
+                        self.lifecycle_notify_unconfirmed_posted
+                        and job.job_id not in valid_jobs
+                    ):
+                        self.notify_async(
+                            self.notifier.notify_job_posted_without_capacity,
+                            job,
+                            self._known_job_url(job.job_id),
+                        )
+                elif kind == "JOB_UNPOSTED":
+                    duration = event.get("postedDurationSeconds")
+                    log.info(
+                        "LIFECYCLE UNPOSTED: %s %s after %ss",
+                        job.site_code, job.job_id,
+                        "unknown" if duration is None else f"{duration:.1f}",
+                    )
+                    if self.lifecycle_notify_unposted:
+                        self.notify_async(
+                            self.notifier.notify_job_unposted,
+                            job, duration, self._known_job_url(job.job_id),
+                        )
+                elif kind == "SCHEDULE_CAPACITY_AVAILABLE":
+                    schedule = event.get("schedule")
+                    log.info(
+                        "LIFECYCLE HARD-MATCH VALID: job=%s schedule=%s hard_match=%s available=%s",
+                        job.job_id,
+                        schedule.id,
+                        event.get("hardMatchCount", event.get("capacity")),
+                        event.get("availableCount"),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            # Never include the request exception text: a transport's call log
+            # can contain headers. Public search and holding keep running.
+            self.lifecycle_failures += 1
+            self.lifecycle_recovery_pending = True
+            log.warning(
+                "known-job lifecycle poll failed (%s, %d consecutive); public search continues",
+                type(exc).__name__, self.lifecycle_failures,
+            )
+            if self.lifecycle_failures >= 3:
+                self.lifecycle_backoff_until = now + 60.0
+                self.lifecycle_failures = 0
+                log.warning("known-job lifecycle detector backing off for 60s")
+        return True
+
+    def _known_job_url(self, job_id: str) -> str:
+        return (
+            f"{self.cfg['site']['base_url'].rstrip('/')}/app#/jobDetail"
+            f"?jobId={job_id}&locale=en-CA"
+        )
+
+    def _fetch_shifts(self):
+        if not self.lifecycle_enabled:
+            return super()._fetch_shifts()
+
+        lifecycle_turn = self.lifecycle_request_turn
+        self.lifecycle_request_turn = not self.lifecycle_request_turn
+        if lifecycle_turn and self._lifecycle_tick():
+            # _batch_expand() will still merge any origin-fresh lifecycle
+            # candidates produced by this request. Skipping public search on
+            # this cycle is what keeps aggregate traffic at one request.
+            return []
+        return super()._fetch_shifts()
+
+    def _batch_expand(self, jobs):
+        public = super()._batch_expand(jobs)
+        known = []
+        for candidate in self.lifecycle_candidates:
+            matched, reason = self.matcher.matches(candidate)
+            if not matched:
+                log.debug("skip lifecycle schedule %s (%s)", candidate.id, reason)
+                continue
+            schedule = schedules_mod.Schedule(candidate.raw)
+
+            # Defense in depth: even if a future lifecycle refactor accidentally
+            # emits a candidate too early, v7's final dispatch path still uses
+            # the same strict hard-match validity gate as public expansion.
+            if not schedules_mod.bookable([schedule]):
+                log.debug(
+                    "skip lifecycle schedule %s (laborDemandHardMatchCount=%s)",
+                    candidate.id,
+                    schedule.hard_match,
+                )
+                continue
+
+            ok, reason = self._schedule_is_acceptable(schedule)
+            if ok:
+                known.append(candidate)
+            else:
+                log.debug("skip lifecycle schedule %s (%s)", candidate.id, reason)
+
+        if public is None:
+            return known or None
+        merged = []
+        seen = set()
+        # Known-job hard-match evidence is origin-fresh, so it wins ties and is
+        # dispatched first without changing the hold implementation itself.
+        for candidate in [*known, *public]:
+            key = ((candidate.raw or {}).get("scheduleId") or candidate.id)
+            if key not in seen:
+                merged.append(candidate)
+                seen.add(key)
+        return merged
+
+    def _candidate_key(self, shift):
+        raw = shift.raw or {}
+        if raw.get("lifecycleSource") == "known_job" and raw.get("scheduleId"):
+            epoch = str(raw.get("lifecycleEpoch") or "current")
+            schedule_id = str(raw["scheduleId"])
+            return (
+                f"done:lifecycle:{schedule_id}:{epoch}",
+                f"alert:lifecycle:{schedule_id}:{epoch}",
+            )
+        return super()._candidate_key(shift)
+
+
+base.Watcher = LifecycleWatcher
+
+
+if __name__ == "__main__":
+    raise SystemExit(base.main())

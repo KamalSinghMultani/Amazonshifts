@@ -25,6 +25,23 @@ class Unauthorized(RuntimeError):
     """The endpoint rejected our token. Recoverable: mint a new one and retry."""
 
 
+class WafForbidden(RuntimeError):
+    """Amazon's WAF blocked the request; token refresh cannot repair this."""
+
+    safe_for_log = True
+
+
+class ApiTransportError(RuntimeError):
+    """Sanitized network/Playwright request failure safe to write to logs.
+
+    Playwright includes the complete request call log in transport exceptions,
+    which can contain authorization and Cookie header values. Never let that
+    raw exception escape into log.exception().
+    """
+
+    safe_for_log = True
+
+
 def dig(payload: Any, path: str) -> Any:
     """Walk a dotted path into nested dicts/lists.
 
@@ -137,25 +154,60 @@ class ApiClient:
                 log.warning("no auth token available for this poll")
         return headers
 
+    def _safe_transport_error(self, exc: Exception) -> None:
+        """Raise a secret-free wrapper for a Playwright/network exception."""
+        kind = type(exc).__name__
+        if kind == "TimeoutError":
+            raise ApiTransportError(
+                f"API request timed out after {self.timeout_ms}ms"
+            ) from None
+        raise ApiTransportError(f"API transport failed ({kind})") from None
+
+    def _post(self, payload: dict, headers: dict | None = None):
+        """POST while preventing Playwright's header-rich call log from escaping."""
+        try:
+            return self.request.post(
+                self.endpoint_url,
+                data=payload,
+                headers={"content-type": "application/json", **(headers or self._headers())},
+                timeout=self.timeout_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - deliberately sanitize all transports
+            self._safe_transport_error(exc)
+
+    def _get(self, params: dict, headers: dict):
+        """GET while preventing Playwright's header-rich call log from escaping."""
+        try:
+            return self.request.get(
+                self.endpoint_url,
+                params=params,
+                headers=headers,
+                timeout=self.timeout_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - deliberately sanitize all transports
+            self._safe_transport_error(exc)
+
     def _post_json(self, payload: dict) -> dict:
         """POST a GraphQL document, refreshing the token once on a 401."""
         def send() -> Any:
-            response = self.request.post(
-                self.endpoint_url,
-                data=payload,
-                headers={"content-type": "application/json", **self._headers()},
-                timeout=self.timeout_ms,
-            )
+            response = self._post(payload)
             if not response.ok:
                 body = ""
                 try:
                     body = response.text()[:300]
                 except Exception:  # noqa: BLE001
                     pass
-                if response.status in (401, 403):
-                    raise Unauthorized(f"API returned {response.status}: {body}")
+                if response.status == 401:
+                    raise Unauthorized(f"API returned 401: {body}")
+                if response.status == 403:
+                    raise WafForbidden("API returned 403 (WAF/forbidden)")
                 raise RuntimeError(f"API returned {response.status}: {body}")
-            return response.json()
+            try:
+                return response.json()
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"API response was not JSON ({type(exc).__name__})"
+                ) from None
 
         try:
             return send()
@@ -201,19 +253,9 @@ class ApiClient:
         headers = self._headers()
 
         if self.method == "GET":
-            response = self.request.get(
-                self.endpoint_url,
-                params=self.payload or {},
-                headers=headers,
-                timeout=self.timeout_ms,
-            )
+            response = self._get(self.payload or {}, headers)
         else:
-            response = self.request.post(
-                self.endpoint_url,
-                data=self.payload or {},
-                headers={"content-type": "application/json", **headers},
-                timeout=self.timeout_ms,
-            )
+            response = self._post(self.payload or {}, headers)
 
         if not response.ok:
             body = ""
@@ -221,13 +263,17 @@ class ApiClient:
                 body = response.text()[:300]
             except Exception:  # noqa: BLE001 - body is diagnostics only
                 pass
-            if response.status in (401, 403):
-                raise Unauthorized(f"API returned {response.status}: {body}")
+            if response.status == 401:
+                raise Unauthorized(f"API returned 401: {body}")
+            if response.status == 403:
+                raise WafForbidden("API returned 403 (WAF/forbidden)")
             raise RuntimeError(f"API returned {response.status}: {body}")
 
         try:
             payload = response.json()
-        except Exception as exc:  # noqa: BLE001 - playwright raises a bare Error
-            raise RuntimeError(f"API response was not JSON: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - keep exception text out of logs
+            raise RuntimeError(
+                f"API response was not JSON ({type(exc).__name__})"
+            ) from None
 
         return parse_shifts(payload, self.shifts_path, self.field_map, self.url_template)
