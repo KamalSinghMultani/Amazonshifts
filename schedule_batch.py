@@ -2,7 +2,7 @@
 
 Amazon requires a jobId for searchScheduleCards, but GraphQL aliases let one
 HTTP request ask for several jobIds. This avoids an N+1 burst when a large job
-batch lands while preserving schedule-level availability checks.
+batch lands while preserving schedule-level validity checks.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ SCHEDULE_FIELDS = """
       totalPayRate
       firstDayOnSite
       laborDemandAvailableCount
+      laborDemandHardMatchCount
       __typename
 """
 
