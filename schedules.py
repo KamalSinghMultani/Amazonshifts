@@ -48,6 +48,7 @@ SCHEDULE_QUERY = """query searchScheduleCards($searchScheduleRequest: SearchSche
       totalPayRate
       firstDayOnSite
       laborDemandAvailableCount
+      laborDemandHardMatchCount
       __typename
     }
     __typename
@@ -103,6 +104,7 @@ class Schedule:
         self.pay_rate = self.raw.get("totalPayRate")
         self.first_day = self.raw.get("firstDayOnSite") or ""
         self.available = self.raw.get("laborDemandAvailableCount")
+        self.hard_match = self.raw.get("laborDemandHardMatchCount")
 
     @property
     def location(self) -> str:
@@ -138,18 +140,25 @@ def parse(payload: Any) -> list[Schedule]:
 
 
 def bookable(schedules: list[Schedule]) -> list[Schedule]:
-    """Drop schedules with no capacity left.
+    """Keep only schedules that have at least one hard labor-demand match.
 
-    laborDemandAvailableCount is the site's own count of remaining places.
-    Zero means the shift is visible but already gone — attempting it would
-    spend the seconds that matter on something unwinnable.
+    Based on the observed Canada schedule data used for this watcher, a
+    positive laborDemandHardMatchCount is the validity signal. Schedules with
+    hard-match count 0 are ignored even when other labor-demand counters are
+    positive. laborDemandAvailableCount is retained as metadata/ranking input,
+    but it is not required for this validity gate.
     """
     out = []
     for schedule in schedules:
-        if schedule.available is None or schedule.available > 0:
+        hard_match = schedule.hard_match or 0
+        if hard_match > 0:
             out.append(schedule)
         else:
-            log.debug("skipping %s — no places left", schedule.id)
+            log.debug(
+                "skipping %s — laborDemandHardMatchCount=%s",
+                schedule.id,
+                hard_match,
+            )
     return out
 
 
@@ -290,6 +299,7 @@ def choose_card(cards: list[dict], prefs: dict | None = None) -> tuple[int | Non
         f"{', '.join(card.get('days') or []) or 'days unknown'}"
     )
 
+
 def rank_cards(cards: list[dict], prefs: dict | None = None) -> list[int]:
     """Every acceptable schedule, best first, as flyout indexes.
 
@@ -322,4 +332,3 @@ def describe_card(card: dict, index: int, total: int) -> str:
         f"{card.get('hours_per_week') or '?'}h/week, "
         f"{', '.join(card.get('days') or []) or 'days unknown'}"
     )
-
