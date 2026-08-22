@@ -1,4 +1,8 @@
-"""Known-job lifecycle detection attached to the proven v6 hold pipeline."""
+"""Known-job lifecycle detection attached to the proven v6 hold pipeline.
+
+Both public schedule expansion and the known-job lifecycle path use the same
+CA validity rule: laborDemandHardMatchCount must be strictly positive.
+"""
 
 from __future__ import annotations
 
@@ -28,10 +32,10 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
             0.0, float(lifecycle.get("health_log_interval_seconds", 60.0))
         )
         self.lifecycle_next_poll = 0.0
-        # Public search and known-job detail share Amazon's catalog edge.  Do
+        # Public search and known-job detail share Amazon's catalog edge. Do
         # not send both requests in one visible watcher poll: live evidence
         # showed that the former arrangement reached a repeatable HTTP 403
-        # immediately after poll 38 (roughly 76 aggregate requests).  Healthy
+        # immediately after poll 38 (roughly 76 aggregate requests). Healthy
         # cycles alternate sources, preserving one upstream request per loop.
         self.lifecycle_request_turn = True
         self.lifecycle_next_health_log = 0.0
@@ -121,7 +125,7 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
             self.lifecycle_candidates = candidates
             completed_at = time.monotonic()
             self._record_lifecycle_success(completed_at, (completed_at - now) * 1000)
-            capacity_jobs = {
+            valid_jobs = {
                 event["job"].job_id
                 for event in events
                 if event.get("event") == "SCHEDULE_CAPACITY_AVAILABLE"
@@ -133,7 +137,7 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
                     log.info("LIFECYCLE POSTED: %s %s", job.site_code, job.job_id)
                     if (
                         self.lifecycle_notify_unconfirmed_posted
-                        and job.job_id not in capacity_jobs
+                        and job.job_id not in valid_jobs
                     ):
                         self.notify_async(
                             self.notifier.notify_job_posted_without_capacity,
@@ -155,12 +159,15 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
                 elif kind == "SCHEDULE_CAPACITY_AVAILABLE":
                     schedule = event.get("schedule")
                     log.info(
-                        "LIFECYCLE CAPACITY: job=%s schedule=%s available=%s",
-                        job.job_id, schedule.id, event.get("capacity"),
+                        "LIFECYCLE HARD-MATCH VALID: job=%s schedule=%s hard_match=%s available=%s",
+                        job.job_id,
+                        schedule.id,
+                        event.get("hardMatchCount", event.get("capacity")),
+                        event.get("availableCount"),
                     )
         except Exception as exc:  # noqa: BLE001
             # Never include the request exception text: a transport's call log
-            # can contain headers.  Public search and holding keep running.
+            # can contain headers. Public search and holding keep running.
             self.lifecycle_failures += 1
             self.lifecycle_recovery_pending = True
             log.warning(
@@ -187,7 +194,7 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
         self.lifecycle_request_turn = not self.lifecycle_request_turn
         if lifecycle_turn and self._lifecycle_tick():
             # _batch_expand() will still merge any origin-fresh lifecycle
-            # candidates produced by this request.  Skipping public search on
+            # candidates produced by this request. Skipping public search on
             # this cycle is what keeps aggregate traffic at one request.
             return []
         return super()._fetch_shifts()
@@ -201,6 +208,18 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
                 log.debug("skip lifecycle schedule %s (%s)", candidate.id, reason)
                 continue
             schedule = schedules_mod.Schedule(candidate.raw)
+
+            # Defense in depth: even if a future lifecycle refactor accidentally
+            # emits a candidate too early, v7's final dispatch path still uses
+            # the same strict hard-match validity gate as public expansion.
+            if not schedules_mod.bookable([schedule]):
+                log.debug(
+                    "skip lifecycle schedule %s (laborDemandHardMatchCount=%s)",
+                    candidate.id,
+                    schedule.hard_match,
+                )
+                continue
+
             ok, reason = self._schedule_is_acceptable(schedule)
             if ok:
                 known.append(candidate)
@@ -211,7 +230,7 @@ class LifecycleWatcher(watcher_v6.HoldReadyWatcher):
             return known or None
         merged = []
         seen = set()
-        # Known-job capacity is origin-fresh evidence, so it wins ties and is
+        # Known-job hard-match evidence is origin-fresh, so it wins ties and is
         # dispatched first without changing the hold implementation itself.
         for candidate in [*known, *public]:
             key = ((candidate.raw or {}).get("scheduleId") or candidate.id)
